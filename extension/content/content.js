@@ -713,7 +713,7 @@
     if (rowMemory.size > 20000) rowMemory.clear();
 
     if (settings.saveMessages && settings.captureDom && (items.length || unsentNow.length)) {
-      const maxBytes = Math.min(settings.maxMediaMB || 15, 15) * 1024 * 1024;
+      const maxBytes = Math.min(settings.maxMediaMB || 15, 12) * 1024 * 1024;
       const outItems = [];
       for (const r of items) {
         const images = [];
@@ -728,14 +728,30 @@
         outItems.push({ domId: r.domId, text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ts, prev: r.prev, next: r.next, stamp: r.stamp, images, extras: r.extras, edited: r.edited });
       }
       domStats.saved += outItems.length;
-      const sigs = items.map((r) => r.sig);
-      send({
-        type: 'ingest-dom',
-        batch: { thread: { id: thread.id, name: thread.name, e2ee: !!thread.e2ee, url: thread.url, altIds: thread.altIds || [] }, items: outItems, unsentNow },
-        ctx: { selfId: selfId() },
-      }).then((res) => {
-        // not stored (e.g. the background worker was restarting): try again on the next pass
-        if (!res || res.error) for (const sig of sigs) sentSignatures.delete(sig);
+      // Chrome limits one message to 64 MB: send photos in chunks of about 16 MB.
+      const threadInfo = { id: thread.id, name: thread.name, e2ee: !!thread.e2ee, url: thread.url, altIds: thread.altIds || [] };
+      const chunks = [];
+      let cur = { items: [], sigs: [], size: 0 };
+      outItems.forEach((it, idx) => {
+        const size = (it.text || '').length + it.images.reduce((n, im) => n + (im.dataUrl ? im.dataUrl.length : 200), 0) + 500;
+        if (cur.items.length && cur.size + size > 16 * 1024 * 1024) {
+          chunks.push(cur);
+          cur = { items: [], sigs: [], size: 0 };
+        }
+        cur.items.push(it);
+        cur.sigs.push(items[idx].sig);
+        cur.size += size;
+      });
+      if (cur.items.length || unsentNow.length) chunks.push(cur);
+      chunks.forEach((chunk, i) => {
+        send({
+          type: 'ingest-dom',
+          batch: { thread: threadInfo, items: chunk.items, unsentNow: i === 0 ? unsentNow : [] },
+          ctx: { selfId: selfId() },
+        }).then((res) => {
+          // not stored (e.g. the background worker was restarting): try again on the next pass
+          if (!res || res.error) for (const sig of chunk.sigs) sentSignatures.delete(sig);
+        });
       });
     }
 

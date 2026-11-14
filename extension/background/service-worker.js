@@ -541,13 +541,15 @@ function neighbourTexts(sorted) {
   return map;
 }
 
-async function mediaPreview(rec, maxItems = 4) {
+/** Photos for the in-chat box; budget.bytes keeps one reply well under Chrome's 64 MB message limit. */
+async function mediaPreview(rec, budget = { bytes: 16 * 1024 * 1024 }, maxItems = 4) {
   const out = [];
   for (const a of rec.attachments || []) {
     if (out.length >= maxItems) break;
     if (a.mediaKey) {
       const m = await db.getMedia(a.mediaKey);
-      if (m && m.blob && m.blob.size <= 3 * 1024 * 1024) {
+      if (m && m.blob && m.blob.size <= 3 * 1024 * 1024 && m.blob.size * 1.4 <= budget.bytes) {
+        budget.bytes -= m.blob.size * 1.4;
         out.push({ dataUrl: await blobToDataUrl(m.blob), title: a.title || a.filename || '' });
         continue;
       }
@@ -577,6 +579,7 @@ async function lookupPlaceholders(req) {
   const results = [];
   const discovered = [];
   const usedKeys = new Set();
+  const budget = { bytes: 16 * 1024 * 1024 };
 
   const describe = async (c, confidence) => ({
     key: c.key,
@@ -585,7 +588,7 @@ async function lookupPlaceholders(req) {
     approxTime: !!c.approxTime,
     unsentAt: c.unsentAt || 0,
     senderName: c.senderName || (contacts.get(c.senderId) || {}).name || '',
-    media: await mediaPreview(c),
+    media: await mediaPreview(c, budget),
     confidence,
   });
 
