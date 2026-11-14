@@ -29,7 +29,7 @@ async function loadBasics() {
 
 function threadInfo(threadKey) {
   const stored = state.threads.get(threadKey) || { threadKey };
-  if (stored.aliasFor && state.threads.has(stored.aliasFor)) return state.threads.get(stored.aliasFor);
+  if (stored.aliasFor && !stored.ambiguous && state.threads.has(stored.aliasFor)) return state.threads.get(stored.aliasFor);
   return stored;
 }
 
@@ -261,7 +261,7 @@ async function renderThread(focusKey) {
 
 async function openThread(threadKey, focusKey) {
   const info = state.threads.get(threadKey);
-  if (info && info.aliasFor) threadKey = info.aliasFor;
+  if (info && info.aliasFor && !info.ambiguous) threadKey = info.aliasFor;
   state.currentThread = threadKey;
   showView('chats', false);
   history.replaceState(null, '', '#thread=' + encodeURIComponent(threadKey));

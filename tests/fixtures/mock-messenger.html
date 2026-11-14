@@ -23,15 +23,17 @@
     -->
     <main class="page" id="page-main"></main>
 
+    <!-- like the live pop-up: the chat title is in the header, the heading inside the
+         message area is a generic "Messages" -->
     <div class="popup" id="popup">
       <div class="popup-head">
-        <div role="button"><a href="/100012345678901/" role="link"><span>Khondoker Aurthe</span></a></div>
+        <div role="button"><a href="/100012345678901/" role="link"><h2 dir="auto"><span>Khondoker Aurthe</span></h2></a></div>
         <span>Active 1h ago</span>
       </div>
       <div data-mw-file-dropzone="1" style="display: flex; flex-direction: column; flex: 1; min-height: 0">
-        <h2 dir="auto">Khondoker Aurthe</h2>
+        <h2 dir="auto">Messages</h2>
         <div role="status"></div>
-        <div role="log" id="log"></div>
+        <div role="log" id="log" aria-label="Messages in conversation with Khondoker Aurthe"></div>
       </div>
       <div role="textbox" contenteditable="true" aria-label="Message">Aa</div>
     </div>
@@ -39,13 +41,18 @@
     <script>
       (function () {
         'use strict';
-        const log = document.getElementById('log');
+        const mainLog = document.getElementById('log');
+        let log = mainLog;
         const state = { ws: null, received: [], streamId: 1 };
 
         function rowHtml(m) {
           const label = m.placeholder
             ? `At ${m.time}, ${m.sender}`
-            : `At ${m.time}, ${m.sender}: ${m.text}`;
+            : m.like
+            ? `At ${m.time}, ${m.sender}: 👍`
+            : m.text
+            ? `At ${m.time}, ${m.sender}: ${m.text}`
+            : `At ${m.time}, ${m.sender}`;
           const avatar = m.mine
             ? ''
             : `<div role="presentation"><div aria-hidden="true"><span><div aria-expanded="false" aria-haspopup="dialog" role="button" tabindex="-1"><img alt="${m.sender}" src="https://scontent.xx.fbcdn.net/v/t1.6435-1/avatar.jpg?stp=dst-jpg_s100x100_tt6" width="28" height="28"></div></span></div></div>`;
@@ -55,7 +62,9 @@
             : m.text
             ? `<span dir="auto"><div dir="auto">${m.text}</div></span>`
             : '';
-          const photo = m.photo ? `<div role="presentation"><img alt="Open photo" width="480" height="360" src="${m.photo}"></div>` : '';
+          const photo = m.photo ? `<div role="presentation"><div role="button" tabindex="-1"><img alt="Open photo" width="480" height="360" src="${m.photo}"></div></div>` : '';
+          const quote = m.quotePhoto ? `<div role="presentation"><div aria-label="Go to replied message" role="button" tabindex="-1"><div tabindex="-1">Original message:</div><img alt="Original image" width="720" height="469" src="${m.quotePhoto}"></div></div>` : '';
+          const like = m.like ? `<div role="presentation"><div aria-label="Like, thumbs up" role="img"><div><svg width="40" height="40"></svg></div></div></div>` : '';
           const sticker = m.sticker ? `<div role="presentation"><div role="img" tabindex="-1" aria-label="Heart sticker" style="background-image: url(&quot;${m.sticker}&quot;); width: 96px; height: 96px"></div></div>` : '';
           const edited = m.edited ? (m.editedButton ? '' : `<div role="presentation"><span>Edited</span></div>`) : '';
           const editedHeading = m.edited && m.editedButton ? `<div role="presentation"><h4 dir="auto"><span>${m.sender}</span><div role="button" aria-label="Edited" tabindex="0"></div></h4></div>` : '';
@@ -63,7 +72,7 @@
               <div aria-label="${label.replace(/"/g, '&quot;')}" aria-roledescription="message" data-message-id="${m.domId}" data-scope="messages_table" tabindex="-1" class="${m.mine ? 'row-out' : 'row-in'}">
                 ${heading}${editedHeading}
                 ${avatar}
-                <div role="presentation" class="bubble"><div><span><div role="none"><div><div role="presentation">${textPart}</div></div></div></span></div>${photo}${sticker}${edited}</div>
+                <div role="presentation" class="bubble">${quote}<div><span><div role="none"><div><div role="presentation">${textPart}</div></div></div></span></div>${photo}${sticker}${like}${edited}</div>
                 <div role="presentation"><div aria-hidden="true" aria-label="Message actions" role="toolbar"></div></div>
               </div>
             </div></div>
@@ -77,7 +86,29 @@
 
         const rows = new Map();
 
+        function withLog(logId, fn) {
+          const prev = log;
+          log = logId ? document.getElementById(logId) : mainLog;
+          try {
+            return fn();
+          } finally {
+            log = prev;
+          }
+        }
+
         window.fb = {
+          // another chat pop-up; `label` is the list's aria-label (other UI languages translate it)
+          openPopup({ logId, title, profileId, label, generic = 'Messages' }) {
+            const div = document.createElement('div');
+            div.className = 'popup';
+            div.style.right = 380 + document.querySelectorAll('.popup').length * 10 + 'px';
+            div.innerHTML = `<div class="popup-head"><div role="button">${profileId ? `<a href="/${profileId}/" role="link">` : ''}<h2 dir="auto"><span>${title}</span></h2>${profileId ? '</a>' : ''}</div></div>
+              <div data-mw-file-dropzone="1" style="display:flex;flex-direction:column;flex:1;min-height:0"><h2 dir="auto">${generic}</h2><div role="status"></div><div role="log" id="${logId}" aria-label="${label}"></div></div>`;
+            document.body.appendChild(div);
+          },
+          inLog(logId, fn) {
+            return withLog(logId, () => fn(window.fb));
+          },
           dateBreak(text) {
             log.insertAdjacentHTML('beforeend', dateBreak(text));
           },

@@ -323,6 +323,10 @@
       if (/\/images\/emoji\.php\//.test(src) || /static\.xx\.fbcdn\.net\/images\/emoji/.test(src)) continue;
       const hidden = img.closest('[aria-hidden="true"]');
       if (hidden && row.contains(hidden) && img.closest('[role="button"]')) continue; // avatar
+      // the quote of a reply ("Go to replied message") shows the other message's photo
+      const labelled = img.closest('[role="button"][aria-label]');
+      if (labelled && row.contains(labelled) && !/^open\b/i.test(labelled.getAttribute('aria-label') || '')) continue;
+      if (/^original image$/i.test(img.getAttribute('alt') || '')) continue;
       if (/[?&]stp=[^&]*_s(?:\d{1,2}|1[0-4]\d)x/.test(src)) continue; // tiny avatar thumbnails
       const w = Number(img.getAttribute('width')) || img.naturalWidth || 0;
       const h = Number(img.getAttribute('height')) || img.naturalHeight || 0;
@@ -474,7 +478,8 @@
   }
 
   function chatWindowOf(log) {
-    return log.closest('[data-mw-file-dropzone]') || log.parentElement;
+    const zone = log.closest('[data-mw-file-dropzone]');
+    return zone ? zone.parentElement || zone : log.parentElement;
   }
 
   function headingName(el) {
@@ -483,44 +488,48 @@
     return t.replace(/^(?:messages in )?conversation (?:with|titled) /i, '').slice(0, 120);
   }
 
+  /** First heading in `scope` that is not inside the message area (that one is a generic "Messages"). */
+  function titleOutside(scope, log) {
+    if (!scope) return '';
+    const zone = log.closest('[data-mw-file-dropzone]');
+    for (const h of scope.querySelectorAll('h1, h2, h3, h4, [role="heading"]')) {
+      if (log.contains(h) || (zone && zone.contains(h))) continue;
+      const name = headingName(h);
+      if (name) return name;
+    }
+    return '';
+  }
+
+  function profileIdsIn(scope, log) {
+    const ids = [];
+    if (!scope) return ids;
+    for (const a of scope.querySelectorAll('a[href]')) {
+      if (log.contains(a)) continue;
+      const href = a.getAttribute('href') || '';
+      const pm = /^(?:https:\/\/(?:www|web)\.facebook\.com)?\/(?:profile\.php\?id=)?(\d{5,})\/?(?:[?#].*)?$/.exec(href);
+      if (pm) ids.push(pm[1]);
+    }
+    return [...new Set(ids)];
+  }
+
   function identifyThread(log) {
     const win = chatWindowOf(log);
     let name = '';
-    const listLabel = norm(log.getAttribute('aria-label'));
-    const lm = /^messages in conversation (?:with|titled) (.+)$/i.exec(listLabel);
+    const lm = /^messages in conversation (?:with|titled) (.+)$/i.exec(norm(log.getAttribute('aria-label')));
     if (lm) name = lm[1].slice(0, 120);
-    if (!name && win) {
-      for (const h of win.querySelectorAll('h1, h2, h3')) {
-        if (log.contains(h)) continue;
-        name = headingName(h);
-        if (name) break;
-      }
-    }
-    const inMain = !!log.closest('[role="main"]');
+    const main = log.closest('[role="main"]');
     const fromUrl = threadFromUrl();
     const isMessagesPage = /^\/(?:messages\/)?(?:e2ee\/)?t\//.test(location.pathname) || location.hostname.endsWith('messenger.com');
-    if (inMain && fromUrl && isMessagesPage) {
+    if (main && fromUrl && isMessagesPage) {
       if (!name) {
-        const main = log.closest('[role="main"]');
-        const h = main && [...main.querySelectorAll('h1, h2, h3')].find((x) => !log.contains(x) && norm(x.textContent));
-        name = headingName(h);
+        const header = main.querySelector('[data-pagelet="MWInboxDetail_MessageList_Header"]');
+        name = titleOutside(header, log) || titleOutside(main, log);
       }
       return { id: fromUrl.id, e2ee: fromUrl.e2ee, name, surface: 'page', url: location.href };
     }
-    // Chat pop-up: identify by its title and the profile link in its header.
-    const altIds = [];
-    const box = (win && win.parentElement && win.parentElement.parentElement) || win;
-    if (box) {
-      for (const a of box.querySelectorAll('a[href]')) {
-        if (log.contains(a)) continue;
-        const href = a.getAttribute('href') || '';
-        const pm = /^(?:https:\/\/www\.facebook\.com)?\/(?:profile\.php\?id=)?(\d{5,})\/?(?:[?#].*)?$/.exec(href);
-        if (pm) altIds.push(pm[1]);
-        const tm = /\/(?:messages\/)?(?:e2ee\/)?t\/(\d+)/.exec(href);
-        if (tm) altIds.push(tm[1]);
-      }
-    }
-    return { id: '', name: name || 'Unknown chat', altIds: [...new Set(altIds)], surface: 'popup', url: location.href };
+    // Chat pop-up: title in its header (outside the message area) and the profile link there.
+    if (!name) name = titleOutside(win, log);
+    return { id: '', name, altIds: profileIdsIn(win, log), surface: 'popup', url: location.href };
   }
 
   /* ---------------- reading one message list ---------------- */
@@ -573,13 +582,20 @@
 
   function readRow(row, log) {
     const domId = canonId(row.getAttribute('data-message-id'));
-    const text = messageText(row);
-    const placeholder = isPlaceholderText(text);
+    let text = messageText(row);
     const label = norm(row.getAttribute('aria-label'));
+    // A real "X unsent a message" row has no text in its label ("At 7:54pm, Alpha");
+    // a message someone typed with those words does ("At 7:54pm, Bob: Alice deleted a message").
+    const placeholder = isPlaceholderText(text) && !(label && label.toLowerCase().includes(norm(text).toLowerCase()));
     const { sender, timeLabel } = parseRowLabel(row, placeholder ? '' : text);
     const isMine = rowDirection(row, log, sender);
     const images = placeholder ? [] : messageImages(row);
     const extras = placeholder ? [] : messageExtras(row);
+    if (!placeholder && !text && !images.length && !extras.length) {
+      // e.g. the big like: <div role="img" aria-label="Like, thumbs up"><svg/></div>
+      const like = row.querySelector('[role="img"][aria-label]');
+      if (like && !/url\(/.test(like.style.backgroundImage || '')) text = /thumbs up/i.test(like.getAttribute('aria-label')) ? '👍' : '[' + norm(like.getAttribute('aria-label')).slice(0, 60) + ']';
+    }
     const when = timeLabel || dateBreakBefore(row, log);
     return {
       row,
@@ -595,6 +611,7 @@
       isMine,
       timeLabel: when,
       ts: parseTimeLabel(when),
+      ownTs: timeLabel ? parseTimeLabel(timeLabel) : 0, // from this row's own label, not a date separator
       images,
       extras,
       edited: !placeholder && hasEditedMarker(row),
@@ -691,7 +708,7 @@
         const checkedAt = box ? Number(box.getAttribute('data-mms-checked') || 0) : 0;
         const retry = box && box.getAttribute('data-mms-state') === 'missing' && tries < 4 && Date.now() - checkedAt > 4000;
         if (!box || retry) {
-          placeholders.push({ pid: placeholders.length, domId: r.domId, senderName: r.senderName, isMine: r.isMine, prev: r.prev, next: r.next, stamp: r.stamp, row: r.row, local: before && before.text ? before : null });
+          placeholders.push({ pid: placeholders.length, domId: r.domId, senderName: r.senderName, isMine: r.isMine, prev: r.prev, next: r.next, stamp: r.stamp, ts: r.ownTs, row: r.row, local: before && before.text ? before : null });
         } else if (box && box.getAttribute('data-mms-state') === 'missing' && tries < 4) state.retryNeeded = true;
         return;
       }
@@ -725,7 +742,7 @@
             if (settings.saveMedia && im.src.length < maxBytes * 1.4) images.push({ dataUrl: im.src, w: im.w, h: im.h, alt: im.alt, key: '' });
           } else images.push({ src: im.src, w: im.w, h: im.h, alt: im.alt, key: im.key });
         }
-        outItems.push({ domId: r.domId, text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ts, prev: r.prev, next: r.next, stamp: r.stamp, images, extras: r.extras, edited: r.edited });
+        outItems.push({ domId: r.domId, text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ownTs || r.ts, exactTime: !!r.ownTs, prev: r.prev, next: r.next, stamp: r.stamp, images, extras: r.extras, edited: r.edited });
       }
       domStats.saved += outItems.length;
       // Chrome limits one message to 64 MB: send photos in chunks of about 16 MB.
@@ -765,7 +782,7 @@
         const res = await send({
           type: 'lookup-placeholders',
           thread: { id: thread.id, name: thread.name, altIds: thread.altIds || [] },
-          placeholders: ask.map(({ pid, domId, senderName, isMine, prev, next, stamp }) => ({ pid, domId, senderName, isMine, prev, next, stamp })),
+          placeholders: ask.map(({ pid, domId, senderName, isMine, prev, next, stamp, ts }) => ({ pid, domId, senderName, isMine, prev, next, stamp, ts })),
           visibleTexts,
           visibleDomIds,
         });

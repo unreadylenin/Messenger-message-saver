@@ -141,11 +141,12 @@ export async function messagesByThread(threadKey) {
 export async function threadKeysFor(threadKey) {
   const threads = await getAll('threads');
   const keys = new Set([threadKey]);
-  for (const t of threads) if (t.aliasFor === threadKey) keys.add(t.threadKey);
+  const linked = (t) => t.aliasFor && !t.ambiguous;
+  for (const t of threads) if (linked(t) && t.aliasFor === threadKey) keys.add(t.threadKey);
   const self = threads.find((t) => t.threadKey === threadKey);
-  if (self && self.aliasFor) {
+  if (self && linked(self)) {
     keys.add(self.aliasFor);
-    for (const t of threads) if (t.aliasFor === self.aliasFor) keys.add(t.threadKey);
+    for (const t of threads) if (linked(t) && t.aliasFor === self.aliasFor) keys.add(t.threadKey);
   }
   return [...keys];
 }
@@ -231,7 +232,7 @@ export async function summarize() {
   // fold chats saved under a pop-up name into the chat id they belong to
   for (const [key, t] of [...byThread.entries()]) {
     const info = threadMap.get(key);
-    if (!info || !info.aliasFor || info.aliasFor === key) continue;
+    if (!info || !info.aliasFor || info.ambiguous || info.aliasFor === key) continue;
     let target = byThread.get(info.aliasFor);
     if (!target) {
       target = { threadKey: info.aliasFor, total: 0, unsent: 0, edited: 0, deleted: 0, lastTs: 0 };

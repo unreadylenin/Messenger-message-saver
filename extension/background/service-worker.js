@@ -316,6 +316,11 @@ async function ingestLs(ev, ctx) {
 
 /* ---------------- on-screen (DOM) ingest ---------------- */
 
+/** Record key for a message seen on screen; normal chats share the network record's key. */
+function domKeyFor(domId) {
+  return /^mid\./.test(domId) ? 'fb:' + domId : 'dm:' + domId;
+}
+
 function nameKey(name) {
   const n = normalizeText(name).toLowerCase();
   return n ? 'name:' + n : '';
@@ -323,37 +328,58 @@ function nameKey(name) {
 
 function domThreadKey(thread) {
   if (thread && thread.id) return String(thread.id);
+  // a 1:1 pop-up links to the person's profile: a stable key (for normal chats it is the chat id)
+  if (thread && thread.altIds && thread.altIds.length) return String(thread.altIds[0]);
   return nameKey(thread && thread.name) || 'name:unknown';
 }
 
-/** Remembers the chat; a full-page visit (id + name) links the pop-up name to the id. */
+/**
+ * Remembers the chat and links the keys one chat can be saved under (page id, profile id,
+ * pop-up name). A name seen for two different chats is marked ambiguous and never linked.
+ */
 async function rememberDomThread(thread) {
   const threadKey = domThreadKey(thread);
   const now = Date.now();
+  const nk = nameKey(thread.name);
   await db.withStores(['threads'], 'readwrite', async (st) => {
     const old = (await reqP(st.threads.get(threadKey))) || { threadKey };
-    st.threads.put({
+    const rec = {
       ...old,
       domName: thread.name || old.domName || '',
       e2ee: old.e2ee || !!thread.e2ee,
       url: thread.url || old.url || '',
       altIds: [...new Set([...(old.altIds || []), ...(thread.altIds || [])])],
       updatedAt: now,
-    });
-    const nk = nameKey(thread.name);
-    if (thread.id && nk && nk !== 'name:unknown chat') {
-      const alias = (await reqP(st.threads.get(nk))) || { threadKey: nk, domName: thread.name };
-      if (alias.aliasFor !== threadKey) st.threads.put({ ...alias, aliasFor: threadKey, updatedAt: now });
-    } else if (!thread.id && threadKey.startsWith('name:') && !old.aliasFor) {
-      // a 1:1 pop-up links to the person's profile; for normal chats that id is the chat id
-      for (const id of thread.altIds || []) {
-        const known = await reqP(st.threads.get(String(id)));
-        if (known && !known.aliasFor) {
-          st.threads.put({ ...old, domName: thread.name || old.domName || '', aliasFor: String(id), updatedAt: now });
-          break;
+    };
+    if (!nk || nk === threadKey) {
+      st.threads.put(rec);
+      return;
+    }
+    const nameRec = (await reqP(st.threads.get(nk))) || { threadKey: nk, domName: thread.name, pageIds: [], profileIds: [] };
+    const pageIds = new Set(nameRec.pageIds || []);
+    const profileIds = new Set(nameRec.profileIds || []);
+    if (thread.id) pageIds.add(String(thread.id));
+    else if (thread.altIds && thread.altIds.length) profileIds.add(String(thread.altIds[0]));
+    const ambiguous = pageIds.size > 1 || profileIds.size > 1;
+    const nameNext = { ...nameRec, pageIds: [...pageIds], profileIds: [...profileIds], ambiguous, updatedAt: now };
+    if (ambiguous) delete nameNext.aliasFor;
+    else if (thread.id) nameNext.aliasFor = String(thread.id);
+    else if (!nameNext.aliasFor && profileIds.size === 1) nameNext.aliasFor = [...profileIds][0];
+    st.threads.put(nameNext);
+    // the same person's pop-up (profile id) and chat page (encrypted chat id): link them
+    if (!ambiguous && pageIds.size === 1 && profileIds.size === 1) {
+      const pageId = [...pageIds][0];
+      const profileId = [...profileIds][0];
+      if (pageId !== profileId) {
+        const prof = profileId === threadKey ? rec : (await reqP(st.threads.get(profileId))) || { threadKey: profileId };
+        if (prof.aliasFor !== pageId) {
+          prof.aliasFor = pageId;
+          prof.updatedAt = now;
+          if (profileId !== threadKey) st.threads.put(prof);
         }
       }
     }
+    st.threads.put(rec);
   });
   return threadKey;
 }
@@ -374,6 +400,11 @@ async function ingestDom(batch, ctx) {
     const byDomId = async (domId) => {
       if (!domId) return null;
       for (const r of touched.values()) if (r.domId === domId) return r;
+      // normal chats show Messenger's own message id ("mid.$...") on screen
+      if (/^mid\./.test(domId)) {
+        const net = touched.get('fb:' + domId) || (await reqP(st.messages.get('fb:' + domId)));
+        if (net) return net;
+      }
       const direct = await reqP(st.messages.index('domId').get(domId));
       if (direct) return direct;
       const alias = await reqP(st.aliases.get(domId));
@@ -400,14 +431,14 @@ async function ingestDom(batch, ctx) {
       const fallbackKey = 'dom:' + hash53([threadKey, isMine ? 'me' : normalizeText(it.senderName).toLowerCase(), text, images.map((i) => i.key || '').join(',')].join('|'));
       if (!rec) rec = touched.get(fallbackKey) || (await reqP(st.messages.get(fallbackKey))) || null;
       if (!rec) {
-        rec = newRecord(it.domId ? 'dm:' + it.domId : fallbackKey, {
+        rec = newRecord(it.domId ? domKeyFor(it.domId) : fallbackKey, {
           threadKey,
           domId: it.domId || '',
           senderName: isMine ? 'You' : it.senderName || '',
           isMine: it.isMine === null || it.isMine === undefined ? undefined : isMine,
           text,
           ts: it.ts || now,
-          approxTime: !it.ts,
+          approxTime: !(it.ts && it.exactTime),
           domContext: { prev: it.prev || '', next: it.next || '' },
           stamp: it.stamp || '',
           e2ee: !!thread.e2ee,
@@ -422,7 +453,7 @@ async function ingestDom(batch, ctx) {
           if (!rec.domContext.prev && it.prev) rec.domContext.prev = it.prev;
           if (!rec.domContext.next && it.next) rec.domContext.next = it.next;
         }
-        if (it.ts && rec.approxTime) {
+        if (it.ts && it.exactTime && rec.approxTime) {
           rec.ts = it.ts;
           rec.approxTime = false;
         }
@@ -480,7 +511,7 @@ async function ingestDom(batch, ctx) {
       }
       if (!rec) {
         if (!text) continue;
-        rec = newRecord(u.domId ? 'dm:' + u.domId : 'dom:' + hash53([threadKey, u.isMine ? 'me' : normalizeText(u.senderName).toLowerCase(), text, ''].join('|')), {
+        rec = newRecord(u.domId ? domKeyFor(u.domId) : 'dom:' + hash53([threadKey, u.isMine ? 'me' : normalizeText(u.senderName).toLowerCase(), text, ''].join('|')), {
           threadKey,
           domId: u.domId || '',
           senderName: u.isMine ? 'You' : u.senderName || '',
@@ -560,13 +591,34 @@ async function mediaPreview(rec, budget = { bytes: 16 * 1024 * 1024 }, maxItems 
   return out;
 }
 
+const COMMON_TEXTS = new Set(['ok', 'okay', 'k', 'kk', 'yes', 'no', 'yeah', 'yep', 'ya', 'haha', 'hahaha', 'lol', 'hmm', 'hi', 'hello', 'hey', 'thanks', 'thank you', 'ty', 'oh', 'ah', 'acha', 'hmm ok', 'ki', 'na', 'ha']);
+
+/** A neighbouring text that can identify a position (not "ok", "haha" or a lone emoji). */
+function distinctive(t) {
+  const n = normalizeText(t).toLowerCase();
+  return n.length >= 4 && !COMMON_TEXTS.has(n) && !/^[\p{Extended_Pictographic}\p{Emoji_Component}\u200d\ufe0f\s\p{P}]+$/u.test(n);
+}
+
+/** true / false when both names are known, null when one is missing. Accepts "Alpha" vs "Alpha Smith". */
+function sameSender(a, b) {
+  const x = normalizeText(a).toLowerCase();
+  const y = normalizeText(b).toLowerCase();
+  if (!x || !y) return null;
+  if (x === y || x.startsWith(y + ' ') || y.startsWith(x + ' ')) return true;
+  return x.split(' ')[0] === y.split(' ')[0];
+}
+
 async function lookupPlaceholders(req) {
   const thread = req.thread || {};
   const keys = new Set();
   const base = domThreadKey(thread);
   for (const k of await db.threadKeysFor(base)) keys.add(k);
   const nk = nameKey(thread.name);
-  if (nk) for (const k of await db.threadKeysFor(nk)) keys.add(k);
+  if (nk && nk !== base) {
+    // a pop-up's name only helps when no other chat uses the same name
+    const nameRec = await db.withStores(['threads'], 'readonly', (st) => reqP(st.threads.get(nk)));
+    if (!nameRec || !nameRec.ambiguous) for (const k of await db.threadKeysFor(nk)) keys.add(k);
+  }
   for (const id of thread.altIds || []) if (id) for (const k of await db.threadKeysFor(String(id))) keys.add(k);
   let msgs = [];
   for (const k of keys) msgs = msgs.concat(await db.messagesByThread(k));
@@ -611,7 +663,8 @@ async function lookupPlaceholders(req) {
     } else rest.push(ph);
   }
 
-  // 2) by position: same sender, same neighbouring messages
+  // 2) by position - only with positive evidence: the same time, the same "At <time>, <Sender>"
+  //    label, or distinctive neighbouring messages. Senders and directions must not disagree.
   const candidates = msgs.filter(
     (m) =>
       hasContent(m) &&
@@ -624,21 +677,25 @@ async function lookupPlaceholders(req) {
     const pPrev = normalizeText(ph.prev).toLowerCase();
     const pNext = normalizeText(ph.next).toLowerCase();
     candidates.forEach((c, ci) => {
-      let score = c.unsent ? 4 : c.deleted ? 2 : 0;
-      if (typeof ph.isMine === 'boolean' && typeof c.isMine === 'boolean') score += ph.isMine === c.isMine ? 3 : -6;
-      const cName = normalizeText(c.senderName || (contacts.get(c.senderId) || {}).name).toLowerCase();
-      const phName = normalizeText(ph.senderName).toLowerCase();
-      if (phName && cName && (cName === phName || cName.startsWith(phName) || phName.startsWith(cName.split(' ')[0]))) score += 2;
+      if (typeof ph.isMine === 'boolean' && typeof c.isMine === 'boolean' && ph.isMine !== c.isMine) return;
+      const nameMatch = sameSender(ph.senderName, c.senderName || (contacts.get(c.senderId) || {}).name);
+      if (nameMatch === false) return;
+      let timeMatch = false;
+      if (ph.ts && c.ts && !c.approxTime) {
+        const d = Math.abs(ph.ts - c.ts);
+        if (d > 3 * 60000) return; // a different minute: a different message
+        timeMatch = d <= 90000;
+      }
+      const stampMatch = !!(ph.stamp && c.stamp && normalizeText(ph.stamp) === normalizeText(c.stamp));
       const ctx = c.domContext ? { prev: normalizeText(c.domContext.prev).toLowerCase(), next: normalizeText(c.domContext.next).toLowerCase() } : neighbours.get(c.key) || { prev: '', next: '' };
       let near = 0;
-      if (pPrev && ctx.prev && pPrev === ctx.prev) near += 4;
-      if (pNext && ctx.next && pNext === ctx.next) near += 4;
-      // same "At <time>, <Sender>" label: the unsent row keeps it
-      if (ph.stamp && c.stamp && normalizeText(ph.stamp) === normalizeText(c.stamp)) near += 5;
-      score += near;
-      // a message that is not known to be unsent must at least sit between the same neighbours
-      if (!c.unsent && !c.deleted && !near) return;
-      if (score >= 6) pairs.push({ pi, ci, score, ts: c.ts });
+      if (distinctive(pPrev) && pPrev === ctx.prev) near++;
+      if (distinctive(pNext) && pNext === ctx.next) near++;
+      const identity = (timeMatch || stampMatch ? 1 : 0) + near;
+      if (!identity) return;
+      if (!c.unsent && !c.deleted && identity < 2) return; // not known to be unsent: need two signals
+      const score = (c.unsent ? 4 : c.deleted ? 2 : 0) + (timeMatch ? 5 : 0) + (stampMatch ? 5 : 0) + 4 * near + (nameMatch ? 1 : 0);
+      if (score >= 8) pairs.push({ pi, ci, score, ts: c.ts, strong: (timeMatch || stampMatch) && (near > 0 || c.unsent) });
     });
   });
   pairs.sort((a, b) => b.score - a.score || a.pi - b.pi || a.ts - b.ts);
@@ -648,9 +705,8 @@ async function lookupPlaceholders(req) {
     if (usedP.has(p.pi) || usedC.has(p.ci)) continue;
     usedP.add(p.pi);
     usedC.add(p.ci);
-    const c = candidates[p.ci];
-    if (!c.unsent && !c.deleted && p.score >= 10) discovered.push(c.key);
-    results.push({ pid: rest[p.pi].pid, ...(await describe(c, p.score >= 10 ? 'high' : 'medium')) });
+    // a positional match is only shown, never written back as "unsent"
+    results.push({ pid: rest[p.pi].pid, ...(await describe(candidates[p.ci], p.strong ? 'high' : 'medium')) });
   }
   if (discovered.length) serial(() => markDiscoveredUnsent(discovered));
   return { results };

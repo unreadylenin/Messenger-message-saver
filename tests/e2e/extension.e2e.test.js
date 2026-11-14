@@ -204,7 +204,8 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     assert.deepEqual(merged.sources.sort(), ['network', 'screen']);
     assert.equal((await dbAll('messages')).filter((m) => m.text === 'dedupe me').length, 1);
     const threads = await dbAll('threads');
-    assert.ok(threads.some((t) => t.threadKey === 'name:khondoker aurthe' && t.aliasFor === THREAD), 'pop-up name linked to the chat id');
+    const popupThread = threads.find((t) => t.threadKey === THREAD);
+    assert.equal(popupThread && popupThread.domName, 'Khondoker Aurthe', 'pop-up keyed by the profile id and named from its header');
   });
 
   await t.test('screen: live unsend shows the original under "unsent a message"', async () => {
@@ -323,6 +324,52 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
       const b = document.querySelector('[data-message-id="100012345678901@msgr.9999"] .mms-recovered');
       return b && b.textContent.includes('beta two');
     }), { what: 'match by neighbouring messages' });
+  });
+
+  await t.test('review fixes: no wrong matches, no chat mix-ups, typed text, reply photos, likes', async () => {
+    // other UI language: list label translated, generic heading "Tin nhắn" above every log
+    await page.evaluate(() => {
+      fb.openPopup({ logId: 'log-bob', title: 'Bob Smith', profileId: '200000000000001', label: 'Tin nhắn trong cuộc trò chuyện với Bob Smith', generic: 'Tin nhắn' });
+      fb.openPopup({ logId: 'log-carol', title: 'Carol Jones', profileId: '300000000000001', label: 'Tin nhắn trong cuộc trò chuyện với Carol Jones', generic: 'Tin nhắn' });
+      fb.inLog('log-bob', (f) => f.addMessage({ domId: '200000000000001@msgr.7460000000000006001', sender: 'Bob Smith', time: '9:00 AM', text: 'my bank PIN is 4321' }));
+    });
+    const bob = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000006001'), { what: 'Bob message saved' });
+    assert.equal(bob.threadKey, '200000000000001', 'Bob pop-up keyed by his profile id, not by the generic heading');
+    await page.evaluate(() => fb.inLog('log-bob', (f) => f.unsendInPlace('200000000000001@msgr.7460000000000006001', '200000000000001@msgr.7460000000000006001', 'Bob Smith deleted a message')));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000006001' && m.unsent), { what: 'Bob unsend saved' });
+    // Carol's chat: an uncaptured placeholder must not show Bob's (or anyone's) message
+    await page.evaluate(() => fb.inLog('log-carol', (f) => f.addMessage({ domId: '300000000000001@msgr.7460000000000006101', sender: 'Carol Jones', time: '11:05 AM', placeholder: 'Carol Jones deleted a message' })));
+    const carolBox = await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="300000000000001@msgr.7460000000000006101"] .mms-recovered');
+      return b && b.textContent;
+    }), { what: 'Carol placeholder box' });
+    assert.match(carolBox, /No saved copy/);
+    assert.ok(!carolBox.includes('4321'));
+    const names = (await dbAll('threads')).map((t) => t.domName);
+    assert.ok(!names.includes('Tin nhắn'), 'generic heading never used as a chat name');
+
+    // same chat, same sender, but an older unsent message at another time: not offered as the original
+    await page.evaluate(() => fb.inLog('log-bob', (f) => f.addMessage({ domId: '200000000000001@msgr.7460000000000006002', sender: 'Bob Smith', time: '11:05 AM', placeholder: 'Bob Smith deleted a message' })));
+    const otherBox = await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="200000000000001@msgr.7460000000000006002"] .mms-recovered');
+      return b && b.textContent;
+    }), { what: 'second Bob placeholder box' });
+    assert.match(otherBox, /No saved copy/);
+
+    // a typed sentence that looks like a placeholder is a normal message
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006201', sender: 'Khondoker Aurthe', time: '3:30 PM', text: 'wait, Alice deleted a message' }));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000006201' && m.text === 'wait, Alice deleted a message'), { what: 'typed look-alike saved' });
+    assert.equal(await page.evaluate(() => !!document.querySelector('[data-message-id="100012345678901@msgr.7460000000000006201"] .mms-recovered')), false);
+
+    // the photo in a reply's quote belongs to the quoted message
+    await page.evaluate((png) => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006301', sender: 'Khondoker Aurthe', time: '3:31 PM', text: 'reply with quote', quotePhoto: 'data:image/png;base64,' + png }), PNG_1x1);
+    const reply = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000006301'), { what: 'reply saved' });
+    assert.equal(reply.attachments.length, 0, 'quoted photo not attached to the reply');
+
+    // the big thumbs-up "like"
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006401', sender: 'Khondoker Aurthe', time: '3:32 PM', like: true }));
+    const like = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000006401'), { what: 'like saved' });
+    assert.equal(like.text, '👍');
   });
 
   await t.test('Messenger notifications are kept as a backup copy', async () => {
