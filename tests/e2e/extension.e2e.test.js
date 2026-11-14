@@ -170,6 +170,11 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     assert.ok(rec.ts > 0);
     const mine = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100099999999999@msgr.7002'), { what: 'own message saved' });
     assert.equal(mine.isMine, true);
+    // Messenger puts the same number before "@msgr" on everyone's messages: it must not decide direction
+    await page.evaluate(() => fb.addMessage({ domId: '100099999999999@msgr.7005', sender: 'Khondoker Aurthe', time: '3:13 PM', text: 'same prefix, still incoming' }));
+    const incoming = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100099999999999@msgr.7005'), { what: 'prefixed incoming saved' });
+    assert.equal(incoming.isMine, false);
+    assert.equal(incoming.senderName, 'Khondoker Aurthe');
   });
 
   await t.test('screen: live unsend shows the original under "unsent a message"', async () => {

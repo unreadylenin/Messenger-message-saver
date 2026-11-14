@@ -385,12 +385,11 @@
     return { sender, timeLabel };
   }
 
-  function rowDirection(row, log, sender, domId) {
+  function rowDirection(row, log, sender) {
     const lower = norm(sender).toLowerCase();
     if (YOU_LABELS.has(lower)) return true;
-    const me = selfId();
-    if (me && domId && domId.split('@')[0] === me) return true;
-    if (lower && !YOU_LABELS.has(lower) && /^at /i.test(row.getAttribute('aria-label') || '')) return false;
+    // (the number before "@msgr" in data-message-id is NOT the sender, so it is not used here)
+    if (lower && /^at /i.test(row.getAttribute('aria-label') || '')) return false;
     // Fall back to layout: your own bubbles sit on the right.
     const textEl = messageTextNodes(row)[0] || row.querySelector('img[alt]') || row;
     const r = textEl.getBoundingClientRect();
@@ -489,7 +488,7 @@
     const text = messageText(row);
     const placeholder = isPlaceholderText(text);
     const { sender, timeLabel } = parseRowLabel(row, placeholder ? '' : text);
-    const isMine = rowDirection(row, log, sender, domId);
+    const isMine = rowDirection(row, log, sender);
     const images = placeholder ? [] : messageImages(row);
     const extras = placeholder ? [] : messageExtras(row);
     const label = timeLabel || dateBreakBefore(row, log);
@@ -572,15 +571,19 @@
           unsentNow.push({ domId: r.domId, text: before.text, senderName: before.senderName, isMine: before.isMine, prev: r.prev, next: r.next, ts: before.ts });
           rowMemory.set(memKey, { ...before, unsent: true });
         }
-        if (!r.row.querySelector('.mms-recovered') || r.row.querySelector('.mms-recovered[data-mms-state="pending"]')) {
+        const box = r.row.querySelector('.mms-recovered');
+        const tries = box ? Number(box.getAttribute('data-mms-tries') || 0) : 0;
+        const checkedAt = box ? Number(box.getAttribute('data-mms-checked') || 0) : 0;
+        const retry = box && box.getAttribute('data-mms-state') === 'missing' && tries < 4 && Date.now() - checkedAt > 4000;
+        if (!box || retry) {
           placeholders.push({ pid: placeholders.length, domId: r.domId, senderName: r.senderName, isMine: r.isMine, prev: r.prev, next: r.next, row: r.row, local: before });
-        }
+        } else if (box && box.getAttribute('data-mms-state') === 'missing' && tries < 4) state.retryNeeded = true;
         return;
       }
       if (r.text) visibleTexts.push(r.text);
       if (r.domId) visibleDomIds.push(r.domId);
       if (!r.text && !r.images.length && !r.extras.length) return;
-      if (memKey) rowMemory.set(memKey, { text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ts });
+      if (memKey) rowMemory.set(memKey, { text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ts, media: r.images.length + r.extras.length > 0 });
       if (r.edited) edited.push(r);
       const sig = [r.domId, r.text, r.images.map((x) => x.key || x.src.slice(0, 80)).join(','), r.extras.map((x) => x.kind + x.title).join(',')].join('|');
       if (!sentSignatures.has(sig)) {
@@ -615,10 +618,11 @@
     }
 
     if (settings.showRecoveredInline && placeholders.length) {
+      const localOnly = (ph) => ph.local && ph.local.text && !ph.local.media;
       for (const ph of placeholders) {
-        if (ph.local && ph.local.text) renderRecovered(ph.row, { text: ph.local.text, media: [], senderName: ph.local.senderName, ts: ph.local.ts, confidence: 'high', live: true });
+        if (localOnly(ph)) renderRecovered(ph.row, { text: ph.local.text, media: [], senderName: ph.local.senderName, ts: ph.local.ts, confidence: 'high', live: true });
       }
-      const ask = placeholders.filter((ph) => !(ph.local && ph.local.text));
+      const ask = placeholders.filter((ph) => !localOnly(ph));
       if (ask.length) {
         const res = await send({
           type: 'lookup-placeholders',
@@ -633,9 +637,18 @@
           if (hit) {
             domStats.recovered++;
             renderRecovered(ph.row, hit);
-          } else renderNotCaptured(ph.row);
+          } else if (ph.local && ph.local.text) {
+            renderRecovered(ph.row, { text: ph.local.text, media: [], senderName: ph.local.senderName, ts: ph.local.ts, confidence: 'high', live: true });
+          } else {
+            renderNotCaptured(ph.row);
+            state.retryNeeded = true;
+          }
         }
       }
+    }
+    if (state.retryNeeded && !state.timer) {
+      state.retryNeeded = false;
+      state.timer = setTimeout(() => processLog(log, state).catch(() => {}), 4500);
     }
 
     if (settings.showEditHistoryInline && edited.length) {
@@ -724,9 +737,17 @@
   }
 
   function renderNotCaptured(row) {
-    if (row.querySelector('.mms-recovered')) return;
+    const old = row.querySelector('.mms-recovered');
+    if (old && old.getAttribute('data-mms-state') === 'missing') {
+      old.setAttribute('data-mms-tries', String(Number(old.getAttribute('data-mms-tries') || 0) + 1));
+      old.setAttribute('data-mms-checked', String(Date.now()));
+      return;
+    }
+    if (old) return;
     const box = makeBox('mms-recovered mms-missing');
     box.setAttribute('data-mms-state', 'missing');
+    box.setAttribute('data-mms-tries', '1');
+    box.setAttribute('data-mms-checked', String(Date.now()));
     box.textContent = '🛡️ No saved copy: this message was unsent before Messenger Message Saver could see it.';
     insertBox(row, box);
   }
