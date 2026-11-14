@@ -23,14 +23,14 @@ chrome.storage.onChanged.addListener((changes, area) => {
     settingsCache = { ...DEFAULT_SETTINGS, ...(changes.settings.newValue || {}) };
     updateBadge();
     // a new "delete older than N days" applies now, not at the next 6-hourly run
-    if (settingsCache.retentionDays > 0 && settingsCache.retentionDays !== before.retentionDays) serial(() => db.prune(settingsCache.retentionDays));
+    if (settingsCache.retentionDays > 0 && settingsCache.retentionDays !== before.retentionDays) pruneNow(settingsCache.retentionDays);
   }
 });
 
 // once per worker start: apply the retention setting and make sure the 6-hourly run exists
 (async () => {
   const s = await settings();
-  if (s.retentionDays > 0) serial(() => db.prune(s.retentionDays));
+  if (s.retentionDays > 0) pruneNow(s.retentionDays);
   const alarm = await chrome.alarms.get('mms-prune');
   if (!alarm) chrome.alarms.create('mms-prune', { periodInMinutes: 360 });
 })().catch(() => {});
@@ -47,11 +47,18 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 
 chrome.runtime.onStartup.addListener(() => updateBadge());
 
+/** Old messages removed by the retention setting: tell open Saved Messages tabs to refresh. */
+async function pruneNow(days) {
+  const removed = await serial(() => db.prune(days));
+  if (removed) new BroadcastChannel('mms-data').postMessage({ pruned: removed });
+  return removed;
+}
+
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'mms-media') return pumpMedia();
   if (alarm.name !== 'mms-prune') return;
   const s = await settings();
-  if (s.retentionDays > 0) await serial(() => db.prune(s.retentionDays));
+  if (s.retentionDays > 0) await pruneNow(s.retentionDays);
 });
 
 /* ---------------- tabs opened before an install, update or re-enable ---------------- */

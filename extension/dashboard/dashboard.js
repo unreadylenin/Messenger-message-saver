@@ -4,6 +4,9 @@ import { el, fmtTime, fmtAgo, senderOf, threadTitle } from '../lib/format.js';
 
 const $ = (sel) => document.querySelector(sel);
 
+// every Saved Messages tab (and the background worker) announces deletions here
+const dataChannel = new BroadcastChannel('mms-data');
+
 const state = {
   contacts: new Map(),
   threads: new Map(), // threadKey -> stored thread info
@@ -526,6 +529,23 @@ function showView(name, updateHash = true) {
   }
 }
 
+/** Takes deleted data off the screen: 'all', or a list of chat keys. */
+async function forgetOnScreen(deleted) {
+  const all = deleted === 'all';
+  if (all || (state.currentThread && deleted.includes(state.currentThread))) {
+    state.currentThread = null;
+    if (location.hash.startsWith('#thread=')) history.replaceState(null, '', '#chats');
+    await renderThread();
+  }
+  if (all) {
+    revokeUrls();
+    for (const id of ['#unsent-list', '#edited-list', '#search-list', '#notification-list']) $(id).textContent = '';
+  }
+  await refreshAll();
+  const q = $('#search').value.trim();
+  if (!$('#view-search').hidden && q.length >= 2) await renderSearch(q);
+}
+
 async function refreshAll() {
   await loadBasics();
   const active = VIEWS.find((v) => !$('#view-' + v).hidden) || 'unsent';
@@ -597,7 +617,9 @@ async function init() {
     if (!state.currentThread) return;
     if (!(await confirmDialog(`Delete everything saved from “${nameOfThread(state.currentThread)}”: messages, photos, unsend and edit history, and Messenger notification copies from this chat? This cannot be undone.`))) return;
     const name = nameOfThread(state.currentThread);
-    for (const k of await db.threadKeysFor(state.currentThread)) await db.deleteThread(k, { name });
+    const keys = await db.threadKeysFor(state.currentThread);
+    for (const k of keys) await db.deleteThread(k, { name });
+    dataChannel.postMessage({ deleted: keys });
     state.currentThread = null;
     history.replaceState(null, '', '#chats');
     await renderThread(); // the deleted conversation must not stay on screen
@@ -608,13 +630,16 @@ async function init() {
     if (!(await confirmDialog('Delete ALL saved messages, photos and history? This cannot be undone. (Tip: download a backup first.)', 'Delete everything'))) return;
     await db.clearAll();
     await chrome.storage.local.set({ stats: {} });
-    state.currentThread = null;
-    revokeUrls();
-    for (const id of ['#unsent-list', '#edited-list', '#search-list', '#notification-list', '#thread-messages']) $(id).textContent = '';
-    await renderThread();
+    dataChannel.postMessage({ deleted: 'all' });
+    await forgetOnScreen('all');
     toast('Everything deleted');
-    await refreshAll();
   });
+  // deletions made in another Saved Messages tab, or old messages removed by the retention setting
+  dataChannel.onmessage = (e) => {
+    const d = e.data || {};
+    if (d.deleted) forgetOnScreen(d.deleted).catch(() => {});
+    else if (d.pruned) refreshAll().catch(() => {});
+  };
   window.addEventListener('hashchange', route);
   route();
   chrome.runtime.sendMessage({ type: 'badge-seen' }).catch(() => {});

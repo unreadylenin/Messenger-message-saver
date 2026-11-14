@@ -561,7 +561,8 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     await popup.goto(`chrome-extension://${extId}/popup/popup.html`);
     await popup.waitForTimeout(1600);
     assert.equal(await popup.isVisible('#reload-hint'), false, 'no false "reload this tab" warning');
-    assert.equal(await popup.isVisible('#open-dashboard'), true, 'main button visible within 600 px');
+    const btn = await popup.locator('#open-dashboard').boundingBox();
+    assert.ok(btn && btn.y >= 0 && btn.y + btn.height <= 600, 'main button inside the 600 px popup: ' + JSON.stringify(btn));
 
     // pause from the popup: switches lock, the note explains, Seen is no longer held back
     await popup.click('header .switch input[data-setting="enabled"]');
@@ -579,13 +580,17 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     await popup.click('input[data-setting="blockSeen"]');
     await popup.close();
 
-    // deleting a chat clears it from the screen
+    // deleting a chat clears it from the screen, also in a second Saved Messages tab
+    const dash2 = await ctx.newPage();
+    await dash2.goto(`chrome-extension://${extId}/dashboard/dashboard.html#thread=200000000000001`);
     await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#thread=200000000000001`);
     await waitFor(async () => (await dash.textContent('#thread-messages')).includes('4321'), { what: 'Bob chat open' });
-    dash.once('dialog', () => {});
+    await waitFor(async () => (await dash2.textContent('#thread-messages')).includes('4321'), { what: 'Bob chat open in a second tab' });
     await dash.click('#delete-thread');
     await dash.click('#confirm-ok');
     await waitFor(async () => !(await dash.textContent('#thread-messages')).includes('4321'), { what: 'deleted chat no longer on screen' });
+    await waitFor(async () => !(await dash2.textContent('#thread-messages')).includes('4321'), { what: 'deleted chat gone from the other tab too' });
+    await dash2.close();
 
     // Chrome's "Options" entry opens Settings
     const opt = await ctx.newPage();
