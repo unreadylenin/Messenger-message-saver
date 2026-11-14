@@ -24,7 +24,12 @@
     "service_worker": "background/service-worker.js",
     "type": "module"
   },
-  "permissions": ["storage", "unlimitedStorage", "notifications", "alarms"],
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "notifications",
+    "alarms"
+  ],
   "host_permissions": [
     "https://*.facebook.com/*",
     "https://*.messenger.com/*",
@@ -32,19 +37,41 @@
   ],
   "content_scripts": [
     {
-      "matches": ["https://www.facebook.com/*", "https://web.facebook.com/*", "https://www.messenger.com/*"],
-      "js": ["content/main-world.js"],
+      "matches": [
+        "https://www.facebook.com/*",
+        "https://web.facebook.com/*",
+        "https://www.messenger.com/*"
+      ],
+      "js": [
+        "content/main-world.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN",
       "all_frames": false
     },
     {
-      "matches": ["https://www.facebook.com/*", "https://web.facebook.com/*", "https://www.messenger.com/*"],
-      "js": ["content/content.js"],
-      "css": ["content/content.css"],
+      "matches": [
+        "https://www.facebook.com/*",
+        "https://web.facebook.com/*",
+        "https://www.messenger.com/*"
+      ],
+      "js": [
+        "content/content.js"
+      ],
+      "css": [
+        "content/content.css"
+      ],
       "run_at": "document_start",
       "all_frames": false
     }
   ],
-  "options_page": "dashboard/dashboard.html#settings"
+  "options_page": "dashboard/dashboard.html#settings",
+  "commands": {
+    "toggle-unseen": {
+      "suggested_key": {
+        "default": "Alt+Shift+U"
+      },
+      "description": "Turn Unseen mode on or off"
+    }
+  }
 }

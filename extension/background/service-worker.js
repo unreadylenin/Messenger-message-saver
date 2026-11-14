@@ -836,6 +836,26 @@ async function countUnseen(actions) {
   await chrome.storage.local.set({ stats });
 }
 
+/* ---------------- keyboard shortcut ---------------- */
+
+chrome.commands.onCommand.addListener(async (command) => {
+  if (command !== 'toggle-unseen') return;
+  const s = await settings();
+  const next = { ...s, blockSeen: !s.blockSeen };
+  await chrome.storage.local.set({ settings: next });
+  try {
+    await chrome.notifications.create('mms-unseen|' + Date.now(), {
+      type: 'basic',
+      iconUrl: chrome.runtime.getURL('icons/icon128.png'),
+      title: next.blockSeen ? 'Unseen mode is ON' : 'Unseen mode is OFF',
+      message: next.blockSeen ? 'People will not see "Seen" when you read.' : 'Messenger will show "Seen" again when you read.',
+      priority: 0,
+    });
+  } catch (e) {
+    /* notifications blocked */
+  }
+});
+
 /* ---------------- message router ---------------- */
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

@@ -50,6 +50,7 @@ Click **Remove** on the extension's card. This also deletes everything it saved 
 ## 🖱️ Using it
 
 - **Toolbar icon** → quick switches (Save, Unseen, Hide typing, alerts, photos), counts, and the latest unsent messages. The red number on the icon counts newly recovered unsent messages.
+- **Alt + Shift + U** turns Unseen mode on or off from any tab (change the key at `chrome://extensions/shortcuts`).
 - **Open saved messages** → the full page with tabs: *Unsent & deleted*, *Chats*, *Edited*, *Notifications*, *Settings*, *Help*.
 - In a chat, recovered messages appear right under Messenger's *"unsent a message"* line. Only you can see these boxes.
 
