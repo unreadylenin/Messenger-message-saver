@@ -56,12 +56,14 @@
             ? `<span dir="auto"><div dir="auto">${m.text}</div></span>`
             : '';
           const photo = m.photo ? `<div role="presentation"><img alt="Open photo" width="480" height="360" src="${m.photo}"></div>` : '';
-          const edited = m.edited ? `<div role="presentation"><span>Edited</span></div>` : '';
+          const sticker = m.sticker ? `<div role="presentation"><div role="img" tabindex="-1" aria-label="Heart sticker" style="background-image: url(&quot;${m.sticker}&quot;); width: 96px; height: 96px"></div></div>` : '';
+          const edited = m.edited ? (m.editedButton ? '' : `<div role="presentation"><span>Edited</span></div>`) : '';
+          const editedHeading = m.edited && m.editedButton ? `<div role="presentation"><h4 dir="auto"><span>${m.sender}</span><div role="button" aria-label="Edited" tabindex="0"></div></h4></div>` : '';
           return `<div data-virtualized="false"><div><div role="none"><div role="article"><div>
               <div aria-label="${label.replace(/"/g, '&quot;')}" aria-roledescription="message" data-message-id="${m.domId}" data-scope="messages_table" tabindex="-1" class="${m.mine ? 'row-out' : 'row-in'}">
-                ${heading}
+                ${heading}${editedHeading}
                 ${avatar}
-                <div role="presentation" class="bubble"><div><span><div role="none"><div><div role="presentation">${textPart}</div></div></div></span></div>${photo}${edited}</div>
+                <div role="presentation" class="bubble"><div><span><div role="none"><div><div role="presentation">${textPart}</div></div></div></span></div>${photo}${sticker}${edited}</div>
                 <div role="presentation"><div aria-hidden="true" aria-label="Message actions" role="toolbar"></div></div>
               </div>
             </div></div>
@@ -96,9 +98,25 @@
             r.node.replaceWith(node);
             rows.set(domId, { node, m });
           },
-          edit(domId, text) {
+          // what end-to-end encrypted chats do: same row element, NEW data-message-id, label loses its text
+          unsendInPlace(domId, newDomId, placeholder) {
             const r = rows.get(domId);
-            const m = { ...r.m, text, edited: true };
+            const msg = r.node.querySelector('[data-scope="messages_table"]');
+            msg.setAttribute('data-message-id', newDomId);
+            msg.setAttribute('aria-label', `At ${r.m.time}, ${r.m.sender}`);
+            const bubble = msg.querySelector('.bubble');
+            bubble.innerHTML = `<div><span><div role="none"><div><div role="presentation"><span dir="auto"><div dir="auto">${placeholder}</div></span></div></div></div></span></div>`;
+            rows.set(newDomId, { node: r.node, m: { ...r.m, domId: newDomId, placeholder, text: '' } });
+          },
+          blobPng(b64) {
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            return URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
+          },
+          edit(domId, text, editedButton) {
+            const r = rows.get(domId);
+            const m = { ...r.m, text, edited: true, editedButton: !!editedButton };
             const wrap = document.createElement('div');
             wrap.innerHTML = rowHtml(m);
             const node = wrap.firstElementChild;

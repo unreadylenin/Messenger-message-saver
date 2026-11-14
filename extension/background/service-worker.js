@@ -358,12 +358,15 @@ async function ingestDom(batch, ctx) {
   const notices = [];
   const mediaJobs = [];
 
-  await db.withStores(['messages', 'events'], 'readwrite', async (st) => {
+  await db.withStores(['messages', 'events', 'aliases'], 'readwrite', async (st) => {
     const touched = new Map();
     const byDomId = async (domId) => {
       if (!domId) return null;
       for (const r of touched.values()) if (r.domId === domId) return r;
-      return (await reqP(st.messages.index('domId').get(domId))) || null;
+      const direct = await reqP(st.messages.index('domId').get(domId));
+      if (direct) return direct;
+      const alias = await reqP(st.aliases.get(domId));
+      return alias ? (touched.get(alias.messageKey) || (await reqP(st.messages.get(alias.messageKey))) || null) : null;
     };
     const byText = async (text, isMine) => {
       if (!text) return null;
@@ -394,10 +397,12 @@ async function ingestDom(batch, ctx) {
           ts: it.ts || now,
           approxTime: !it.ts,
           domContext: { prev: it.prev || '', next: it.next || '' },
+          stamp: it.stamp || '',
           e2ee: !!thread.e2ee,
         });
       } else {
         if (it.domId && !rec.domId) rec.domId = it.domId;
+        if (it.stamp && !rec.stamp) rec.stamp = it.stamp;
         if (!rec.senderName && it.senderName && !isMine) rec.senderName = it.senderName;
         if (rec.isMine === undefined && typeof it.isMine === 'boolean') rec.isMine = it.isMine;
         if (!rec.domContext) rec.domContext = { prev: it.prev || '', next: it.next || '' };
@@ -474,9 +479,12 @@ async function ingestDom(batch, ctx) {
           e2ee: !!thread.e2ee,
         });
       }
+      // remember the placeholder's new id so the original is found after a reload
+      if (u.newDomId && u.newDomId !== rec.domId) st.aliases.put({ domId: u.newDomId, messageKey: rec.key, at: now });
       if (rec.unsent) continue;
       rec.unsent = true;
       rec.unsentAt = now;
+      if (u.stamp && !rec.stamp) rec.stamp = u.stamp;
       addSource(rec, 'screen');
       st.events.add({ type: 'unsent', messageKey: rec.key, threadKey: rec.threadKey, at: now, text: rec.text, recovered: hasContent(rec) });
       if (hasContent(rec)) notices.push({ kind: 'unsent', rec });
@@ -572,7 +580,14 @@ async function lookupPlaceholders(req) {
   const rest = [];
   for (const ph of req.placeholders || []) {
     let exact = null;
-    if (ph.domId) exact = await db.withStores(['messages'], 'readonly', (st) => reqP(st.messages.index('domId').get(ph.domId)));
+    if (ph.domId) {
+      exact = await db.withStores(['messages', 'aliases'], 'readonly', async (st) => {
+        const direct = await reqP(st.messages.index('domId').get(ph.domId));
+        if (direct) return direct;
+        const alias = await reqP(st.aliases.get(ph.domId));
+        return alias ? (await reqP(st.messages.get(alias.messageKey))) || null : null;
+      });
+    }
     if (exact && hasContent(exact)) {
       usedKeys.add(exact.key);
       if (!exact.unsent) discovered.push(exact.key);
@@ -602,6 +617,8 @@ async function lookupPlaceholders(req) {
       let near = 0;
       if (pPrev && ctx.prev && pPrev === ctx.prev) near += 4;
       if (pNext && ctx.next && pNext === ctx.next) near += 4;
+      // same "At <time>, <Sender>" label: the unsent row keeps it
+      if (ph.stamp && c.stamp && normalizeText(ph.stamp) === normalizeText(c.stamp)) near += 5;
       score += near;
       // a message that is not known to be unsent must at least sit between the same neighbours
       if (!c.unsent && !c.deleted && !near) return;
@@ -643,15 +660,22 @@ async function markDiscoveredUnsent(keys) {
 async function lookupEdited(req) {
   const thread = req.thread || {};
   const keys = await db.threadKeysFor(domThreadKey(thread));
+  const items = req.items || (req.texts || []).map((text) => ({ text, domId: '' }));
   const out = [];
-  for (const t of req.texts || []) {
+  for (const it of items) {
     let rec = null;
-    for (const k of keys) {
-      const matches = await db.findByText(k, t);
-      rec = matches.find((m) => m.history && m.history.length);
-      if (rec) break;
+    if (it.domId) rec = await db.withStores(['messages'], 'readonly', (st) => reqP(st.messages.index('domId').get(it.domId)));
+    if (!rec || !(rec.history && rec.history.length)) {
+      rec = null;
+      for (const k of keys) {
+        const matches = await db.findByText(k, it.text);
+        rec = matches.find((m) => m.history && m.history.length);
+        if (rec) break;
+      }
     }
-    if (rec) out.push({ text: t, history: rec.history.map((h) => h.text).filter((x) => normalizeText(x) && !sameText(x, t)) });
+    if (rec && rec.history && rec.history.length) {
+      out.push({ text: it.text, domId: it.domId || '', history: rec.history.map((h) => h.text).filter((x) => normalizeText(x) && !sameText(x, it.text)) });
+    }
   }
   return { results: out };
 }

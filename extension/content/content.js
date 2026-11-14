@@ -159,23 +159,69 @@
   /* ================================================================== */
 
   // Placeholder text Messenger shows instead of an unsent / removed message.
+  // Seen live in 2026: "Alpha deleted a message", "You deleted a message"; Meta's own strings:
+  // "You unsent a message", "<first name> unsent a message", "A poll has been unsent."
   const PLACEHOLDER_PATTERNS = [
-    /\b(?:unsent|deleted|removed) (?:a|this) message\b/i, // "Alpha unsent a message", "You deleted a message"
+    /^(?:you|.{1,80}?) (?:unsent|deleted|removed) (?:a|an|this) (?:message|attachment|photo|video|voice message|poll)\.?$/i,
     /^this message (?:was|has been) (?:unsent|deleted|removed)\.?$/i,
     /^message (?:unsent|deleted|removed)\.?$/i,
-    /^(?:you|.+) unsent a message$/i,
-    /একটি বার্তা (?:আনসেন্ড|সরিয়ে|মুছে)/, // Bangla
-    /বার্তাটি (?:সরানো|মুছে|আনসেন্ড)/,
-    /\b(?:a annulé l’envoi d’un message|hat eine Nachricht zurückgerufen|anuló el envío de un mensaje|retirou o envio de uma mensagem|ha annullato l'invio di un messaggio)\b/i,
+    /^a poll has been unsent\.?$/i,
+    /^(?:bạn|.{1,80}?) đã (?:thu hồi|xóa|xoá) (?:một )?tin nhắn\.?$/i, // Vietnamese
+    /^.{1,80}? (?:cofnął|cofnęła|cofnęłaś|cofnąłeś) wysłanie wiadomości\.?$/i, // Polish
+    /একটি (?:বার্তা|মেসেজ) (?:মুছে ফেলেছেন|আনসেন্ড করেছেন|সরিয়ে দিয়েছেন|সরিয়েছেন)/, // Bangla
+    /^এই (?:বার্তাটি|মেসেজটি) (?:মুছে ফেলা হয়েছে|সরানো হয়েছে|আনসেন্ড করা হয়েছে)/,
+    /(?:a annulé l’envoi d’un message|hat eine Nachricht zurückgerufen|anuló el envío de un mensaje|retirou o envio de uma mensagem|ha annullato l'invio di un messaggio|membatalkan pengiriman pesan)/i,
   ];
+  let learnedPlaceholders = []; // RegExps learned on this computer for other UI languages
 
-  const EDITED_LABELS = new Set(['edited', 'সম্পাদিত', 'modifié', 'bearbeitet', 'editado', 'modificato', 'diedit', 'đã chỉnh sửa']);
-  const YOU_LABELS = new Set(['you', 'আপনি', 'vous', 'du', 'tú', 'tu', 'você', 'anda', 'bạn']);
+  const EDITED_LABELS = new Set(['edited', 'hide edits', 'edytowano', 'সম্পাদিত', 'modifié', 'bearbeitet', 'editado', 'modificato', 'diedit', 'đã chỉnh sửa']);
+  const YOU_LABELS = new Set(['you', 'ty', 'আপনি', 'vous', 'du', 'tú', 'tu', 'você', 'anda', 'bạn']);
+  const YOU_HEADINGS = /^(?:you sent|you replied to|wysłano|bạn đã gửi|আপনি পাঠিয়েছেন)\b/i;
 
   function isPlaceholderText(text) {
     const t = String(text || '').trim();
     if (!t || t.length > 140) return false;
-    return PLACEHOLDER_PATTERNS.some((re) => re.test(t));
+    return PLACEHOLDER_PATTERNS.some((re) => re.test(t)) || learnedPlaceholders.some((re) => re.test(t));
+  }
+
+  function escapeRe(x) {
+    return x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  /** Remembers this UI language's "X unsent a message" wording (sender name masked). */
+  function learnPlaceholder(text, senderName) {
+    const t = norm(text);
+    if (!t || t.length > 120 || isPlaceholderText(t)) return;
+    let src = escapeRe(t);
+    if (senderName && t.includes(senderName)) src = src.split(escapeRe(senderName)).join('.{1,80}?');
+    src = '^' + src + '$';
+    chrome.storage.local.get('learnedPlaceholders').then(({ learnedPlaceholders: list = [] }) => {
+      if (list.includes(src)) return;
+      chrome.storage.local.set({ learnedPlaceholders: [...list, src].slice(-20) });
+    });
+  }
+
+  function loadLearned(list) {
+    learnedPlaceholders = (list || [])
+      .map((src) => {
+        try {
+          return new RegExp(src, 'i');
+        } catch (e) {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  }
+  chrome.storage.local.get('learnedPlaceholders').then(({ learnedPlaceholders: list }) => loadLearned(list));
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.learnedPlaceholders) loadLearned(changes.learnedPlaceholders.newValue);
+  });
+
+  /** Messenger shows one message under several ids over time ("123", "456@msgr.123"): use the stable part. */
+  function canonId(raw) {
+    const id = String(raw || '').trim();
+    const m = /^(?:\d+@msgr\.)?(\d{16,})$/.exec(id);
+    return m ? 'msgr.' + m[1] : id;
   }
 
   function norm(t) {
@@ -199,7 +245,7 @@
       const tag = el.tagName;
       if (tag === 'IMG') {
         const alt = el.getAttribute('alt') || '';
-        if (alt && /^[\p{Extended_Pictographic}\p{Emoji_Component}‍️\s]+$/u.test(alt)) out += alt;
+        if (alt && /^[\p{Extended_Pictographic}\p{Emoji_Component}\u200d\ufe0f\s]+$/u.test(alt)) out += alt;
         return;
       }
       if (tag === 'BR') {
@@ -210,7 +256,7 @@
       for (const c of el.childNodes) walk(c);
     };
     walk(root);
-    return out.replace(/ /g, ' ').trim();
+    return out.replace(/[\u00a0\u202f]/g, ' ').trim();
   }
 
   const SKIP_INSIDE = 'h1,h2,h3,h4,h5,h6,[role="toolbar"],[aria-hidden="true"],[role="button"],a[aria-label],[role="link"][aria-label],.mms-recovered,.mms-edit-history';
@@ -283,6 +329,12 @@
       if (w && h && w <= 40 && h <= 40) continue;
       out.push({ src, alt: img.getAttribute('alt') || '', w, h, key: imageKey(src) });
     }
+    // stickers are often <div role="img" aria-label="… sticker" style="background-image:url(…)">
+    for (const el of row.querySelectorAll('[role="img"][aria-label]')) {
+      const m = /url\(["']?([^"')]+)["']?\)/.exec(el.style.backgroundImage || '');
+      if (!m) continue;
+      out.push({ src: m[1], alt: el.getAttribute('aria-label') || 'sticker', w: el.offsetWidth || 96, h: el.offsetHeight || 96, key: imageKey(m[1]) });
+    }
     return out;
   }
 
@@ -297,6 +349,9 @@
   }
 
   function hasEditedMarker(row) {
+    for (const b of row.querySelectorAll('[role="button"][aria-label]')) {
+      if (EDITED_LABELS.has(norm(b.getAttribute('aria-label')).toLowerCase())) return true;
+    }
     for (const el of row.querySelectorAll('span, div')) {
       if (el.children.length) continue;
       const t = norm(el.textContent).toLowerCase();
@@ -390,6 +445,15 @@
     if (YOU_LABELS.has(lower)) return true;
     // (the number before "@msgr" in data-message-id is NOT the sender, so it is not used here)
     if (lower && /^at /i.test(row.getAttribute('aria-label') || '')) return false;
+    for (const h of row.querySelectorAll('h1,h2,h4,h5,h6,[role="heading"]')) {
+      if (YOU_HEADINGS.test(norm(h.textContent))) return true;
+    }
+    if (row.querySelector('[aria-hidden="true"] [role="button"][aria-haspopup="dialog"] img, [aria-hidden="true"] [role="button"] img[alt]')) return false; // avatar = someone else
+    const lane = row.querySelector(':scope > [role="presentation"]');
+    if (lane) {
+      const fd = getComputedStyle(lane).flexDirection;
+      if (fd === 'row-reverse') return true;
+    }
     // Fall back to layout: your own bubbles sit on the right.
     const textEl = messageTextNodes(row)[0] || row.querySelector('img[alt]') || row;
     const r = textEl.getBoundingClientRect();
@@ -422,7 +486,10 @@
   function identifyThread(log) {
     const win = chatWindowOf(log);
     let name = '';
-    if (win) {
+    const listLabel = norm(log.getAttribute('aria-label'));
+    const lm = /^messages in conversation (?:with|titled) (.+)$/i.exec(listLabel);
+    if (lm) name = lm[1].slice(0, 120);
+    if (!name && win) {
       for (const h of win.querySelectorAll('h1, h2, h3')) {
         if (log.contains(h)) continue;
         name = headingName(h);
@@ -458,18 +525,39 @@
 
   /* ---------------- reading one message list ---------------- */
 
+  const MSG_SELECTOR = '[data-scope="messages_table"][data-message-id], [data-scope="messages_table"][aria-roledescription="message"]';
+
   function messageRows(log) {
     const rows = [];
-    for (const el of log.querySelectorAll('[data-scope="messages_table"]')) {
-      if (el.querySelector('[data-scope="date_break"]') && !el.closest('[role="article"]')) continue;
-      if (el.getAttribute('aria-roledescription') === 'message' || el.closest('[role="article"]')) {
-        // nested messages_table elements: keep the outermost message element
-        const outer = el.parentElement && el.parentElement.closest('[data-scope="messages_table"]');
-        if (outer && log.contains(outer) && (outer.getAttribute('aria-roledescription') === 'message' || outer.closest('[role="article"]'))) continue;
-        rows.push(el);
-      }
+    for (const el of log.querySelectorAll(MSG_SELECTOR)) {
+      if (/@msgrCUTOVER/i.test(el.getAttribute('data-message-id') || '')) continue; // "messages are end-to-end encrypted" notice
+      if (el.querySelector('[data-scope="date_break"]')) continue;
+      const outer = el.parentElement && el.parentElement.closest(MSG_SELECTOR);
+      if (outer && log.contains(outer)) continue; // keep the outermost message element
+      rows.push(el);
     }
     return rows;
+  }
+
+  /** The element that stays in the same place for one message, even if Messenger swaps its id. */
+  function rowAnchor(row) {
+    return row.closest('[data-pagelet="MWMessageRow"], [role="article"], [role="row"]') || row;
+  }
+
+  /** "At 3:11 PM, Alpha" - the part of the label that does not change when a message is unsent. */
+  function identityStamp(row, text) {
+    let label = norm(row.getAttribute('aria-label'));
+    const t = norm(text);
+    if (!label) return '';
+    if (t && label.endsWith(t)) label = label.slice(0, label.length - t.length).trim().replace(/:$/, '').trim();
+    else {
+      const colon = label.indexOf(': ');
+      if (colon > 0 && /\d[:.]\d{2}/.test(label.slice(0, colon))) {
+        const afterTime = label.search(/\d{1,2}[:.]\d{2}(?:\s?[ap]\.?m\.?)?, /i);
+        if (afterTime >= 0 && colon > afterTime) label = label.slice(0, colon);
+      }
+    }
+    return label.slice(0, 160);
   }
 
   function dateBreakBefore(row, log) {
@@ -484,24 +572,29 @@
   }
 
   function readRow(row, log) {
-    const domId = row.getAttribute('data-message-id') || '';
+    const domId = canonId(row.getAttribute('data-message-id'));
     const text = messageText(row);
     const placeholder = isPlaceholderText(text);
+    const label = norm(row.getAttribute('aria-label'));
     const { sender, timeLabel } = parseRowLabel(row, placeholder ? '' : text);
     const isMine = rowDirection(row, log, sender);
     const images = placeholder ? [] : messageImages(row);
     const extras = placeholder ? [] : messageExtras(row);
-    const label = timeLabel || dateBreakBefore(row, log);
+    const when = timeLabel || dateBreakBefore(row, log);
     return {
       row,
+      anchor: rowAnchor(row),
       domId,
+      stamp: identityStamp(row, placeholder ? '' : text),
+      labelHasBody: !!(text && label && label.includes(norm(text).slice(0, 40))),
+      labelLen: label.length,
       text: placeholder ? '' : text,
       placeholderText: placeholder ? text : '',
       placeholder,
       senderName: YOU_LABELS.has(norm(sender).toLowerCase()) ? '' : sender,
       isMine,
-      timeLabel: label,
-      ts: parseTimeLabel(label),
+      timeLabel: when,
+      ts: parseTimeLabel(when),
       images,
       extras,
       edited: !placeholder && hasEditedMarker(row),
@@ -511,7 +604,8 @@
   /* ---------------- per-list state ---------------- */
 
   const logs = new Map(); // log element -> state
-  const rowMemory = new Map(); // domId -> last text seen this session (for live unsend detection)
+  const rowMemory = new Map(); // message id -> what the row showed this session (live unsend detection)
+  const anchorMemory = new WeakMap(); // row element -> the same, survives Messenger changing the id
   const sentSignatures = new Set(); // what was already sent to the background
   const blobCache = new Map(); // blob: url -> data url promise
 
@@ -535,6 +629,10 @@
     return p;
   }
 
+  function memoryFor(r) {
+    return (r.domId && rowMemory.get(r.domId)) || anchorMemory.get(r.anchor) || null;
+  }
+
   async function processLog(log, state) {
     state.timer = 0;
     if (!document.contains(log)) {
@@ -547,6 +645,21 @@
     state.thread = thread;
     const rows = messageRows(log).map((r) => readRow(r, log));
     domStats.rows = Math.max(domStats.rows, rows.length);
+
+    // A row that showed a saved message and now shows one short line, with the label's text
+    // part gone, has been unsent - this catches Messenger's wording in any language.
+    for (const r of rows) {
+      if (r.placeholder) continue;
+      const before = memoryFor(r);
+      if (!before || !before.text || before.unsent || !before.labelHasBody) continue;
+      const leaves = messageTextNodes(r.row);
+      if (r.text && r.text !== before.text && !r.labelHasBody && r.labelLen && leaves.length === 1 && r.text.length <= 120 && !r.images.length && !r.extras.length) {
+        learnPlaceholder(r.text, before.senderName || r.senderName);
+        r.placeholderText = r.text;
+        r.text = '';
+        r.placeholder = true;
+      }
+    }
 
     // context: neighbouring texts help find the original of a placeholder later
     const texts = rows.map((r) => r.text);
@@ -563,27 +676,31 @@
       while (n < rows.length && !texts[n]) n++;
       r.prev = p >= 0 ? texts[p] : '';
       r.next = n < rows.length ? texts[n] : '';
-      const memKey = r.domId || null;
       if (r.placeholder) {
         domStats.placeholders++;
-        const before = memKey ? rowMemory.get(memKey) : null;
-        if (before && before.text) {
-          unsentNow.push({ domId: r.domId, text: before.text, senderName: before.senderName, isMine: before.isMine, prev: r.prev, next: r.next, ts: before.ts });
-          rowMemory.set(memKey, { ...before, unsent: true });
+        const before = memoryFor(r);
+        if (before && before.text && !before.unsent) {
+          unsentNow.push({ domId: before.domId || r.domId, newDomId: before.domId && before.domId !== r.domId ? r.domId : '', text: before.text, senderName: before.senderName, isMine: before.isMine, prev: r.prev, next: r.next, ts: before.ts, stamp: before.stamp });
+          const mark = { ...before, unsent: true };
+          if (r.domId) rowMemory.set(r.domId, mark);
+          if (before.domId) rowMemory.set(before.domId, mark);
+          anchorMemory.set(r.anchor, mark);
         }
         const box = r.row.querySelector('.mms-recovered');
         const tries = box ? Number(box.getAttribute('data-mms-tries') || 0) : 0;
         const checkedAt = box ? Number(box.getAttribute('data-mms-checked') || 0) : 0;
         const retry = box && box.getAttribute('data-mms-state') === 'missing' && tries < 4 && Date.now() - checkedAt > 4000;
         if (!box || retry) {
-          placeholders.push({ pid: placeholders.length, domId: r.domId, senderName: r.senderName, isMine: r.isMine, prev: r.prev, next: r.next, row: r.row, local: before });
+          placeholders.push({ pid: placeholders.length, domId: r.domId, senderName: r.senderName, isMine: r.isMine, prev: r.prev, next: r.next, stamp: r.stamp, row: r.row, local: before && before.text ? before : null });
         } else if (box && box.getAttribute('data-mms-state') === 'missing' && tries < 4) state.retryNeeded = true;
         return;
       }
       if (r.text) visibleTexts.push(r.text);
       if (r.domId) visibleDomIds.push(r.domId);
       if (!r.text && !r.images.length && !r.extras.length) return;
-      if (memKey) rowMemory.set(memKey, { text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ts, media: r.images.length + r.extras.length > 0 });
+      const mem = { domId: r.domId, text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ts, media: r.images.length + r.extras.length > 0, stamp: r.stamp, labelHasBody: r.labelHasBody };
+      if (r.domId) rowMemory.set(r.domId, mem);
+      anchorMemory.set(r.anchor, mem);
       if (r.edited) edited.push(r);
       const sig = [r.domId, r.text, r.images.map((x) => x.key || x.src.slice(0, 80)).join(','), r.extras.map((x) => x.kind + x.title).join(',')].join('|');
       if (!sentSignatures.has(sig)) {
@@ -607,7 +724,7 @@
             if (settings.saveMedia && im.src.length < maxBytes * 1.4) images.push({ dataUrl: im.src, w: im.w, h: im.h, alt: im.alt, key: '' });
           } else images.push({ src: im.src, w: im.w, h: im.h, alt: im.alt, key: im.key });
         }
-        outItems.push({ domId: r.domId, text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ts, prev: r.prev, next: r.next, images, extras: r.extras, edited: r.edited });
+        outItems.push({ domId: r.domId, text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ts, prev: r.prev, next: r.next, stamp: r.stamp, images, extras: r.extras, edited: r.edited });
       }
       domStats.saved += outItems.length;
       send({
@@ -627,7 +744,7 @@
         const res = await send({
           type: 'lookup-placeholders',
           thread: { id: thread.id, name: thread.name, altIds: thread.altIds || [] },
-          placeholders: ask.map(({ pid, domId, senderName, isMine, prev, next }) => ({ pid, domId, senderName, isMine, prev, next })),
+          placeholders: ask.map(({ pid, domId, senderName, isMine, prev, next, stamp }) => ({ pid, domId, senderName, isMine, prev, next, stamp })),
           visibleTexts,
           visibleDomIds,
         });
@@ -654,10 +771,10 @@
     if (settings.showEditHistoryInline && edited.length) {
       const need = edited.filter((r) => !r.row.querySelector('.mms-edit-history'));
       if (need.length) {
-        const res = await send({ type: 'lookup-edited', thread: { id: thread.id, name: thread.name }, texts: need.map((r) => r.text) });
-        const byText = new Map(((res && res.results) || []).map((x) => [norm(x.text), x.history]));
+        const res = await send({ type: 'lookup-edited', thread: { id: thread.id, name: thread.name }, items: need.map((r) => ({ text: r.text, domId: r.domId })) });
+        const byKey = new Map(((res && res.results) || []).map((x) => [x.domId || norm(x.text), x.history]));
         for (const r of need) {
-          const hist = byText.get(norm(r.text));
+          const hist = byKey.get(r.domId) || byKey.get(norm(r.text));
           if (hist && hist.length) renderEditHistory(r.row, hist);
         }
       }
@@ -792,10 +909,25 @@
       if (isOwnMutation(records)) return;
       if (!state.timer) state.timer = setTimeout(() => processLog(log, state).catch(() => {}), 350);
     });
-    state.observer.observe(log, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['src', 'aria-label', 'data-message-id'] });
+    state.observer.observe(log, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['src', 'alt', 'aria-label', 'data-message-id'] });
     logs.set(log, state);
     domStats.logs = logs.size;
     state.timer = setTimeout(() => processLog(log, state).catch(() => {}), 200);
+  }
+
+  /** Message lists on the page: [role=log] first, then the fallbacks Messenger has used. */
+  function findLogs() {
+    const found = new Set();
+    for (const el of document.querySelectorAll('[role="log"], [data-pagelet="MWMessageList"], [role="grid"][aria-label^="Messages in conversation"]')) {
+      if (el.querySelector(MSG_SELECTOR)) found.add(el);
+    }
+    if (!found.size) {
+      // last resort: the lowest element holding all message rows of each chat window
+      for (const zone of document.querySelectorAll('[data-mw-file-dropzone]')) if (zone.querySelector(MSG_SELECTOR)) found.add(zone);
+    }
+    // keep the innermost list when one contains another
+    const list = [...found];
+    return list.filter((el) => !list.some((other) => other !== el && el.contains(other)));
   }
 
   let scanTimer = 0;
@@ -805,7 +937,7 @@
       scanTimer = 0;
       if (!settings.enabled) return;
       if (!settings.captureDom && !settings.showRecoveredInline && !settings.showEditHistoryInline) return;
-      document.querySelectorAll('[role="log"]').forEach(watchLog);
+      findLogs().forEach(watchLog);
       for (const [log, state] of logs) {
         if (!document.contains(log)) {
           state.observer.disconnect();
@@ -826,7 +958,7 @@
         for (const r of records) {
           for (const n of r.addedNodes) {
             if (n.nodeType !== 1) continue;
-            if ((n.getAttribute && n.getAttribute('role') === 'log') || (n.querySelector && n.querySelector('[role="log"]'))) {
+            if ((n.getAttribute && (n.getAttribute('role') === 'log' || n.getAttribute('data-scope') === 'messages_table')) || (n.querySelector && n.querySelector('[role="log"], [data-scope="messages_table"]'))) {
               scheduleFullScan();
               return;
             }

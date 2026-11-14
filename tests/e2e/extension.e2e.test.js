@@ -214,6 +214,52 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     await waitFor(async () => page.evaluate(() => !!document.querySelector('[data-message-id="100012345678901@msgr.7004"] .mms-recovered img')), { what: 'recovered photo' });
   });
 
+  await t.test('encrypted chats: unsent row gets a NEW id - still matched, live and after reload', async () => {
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000008001', sender: 'Khondoker Aurthe', time: '3:16 PM', text: 'id will change' }));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008001'), { what: 'saved under canonical id' });
+    await page.evaluate(() => fb.unsendInPlace('100012345678901@msgr.7460000000000008001', '100012345678901@msgr.7460000000000009999', 'Khondoker Aurthe deleted a message'));
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000009999"] .mms-recovered');
+      return b && b.textContent.includes('id will change');
+    }), { what: 'live recovery despite id change' });
+    const alias = await waitFor(async () => (await dbAll('aliases')).find((a) => a.domId === 'msgr.7460000000000009999'), { what: 'alias stored' });
+    assert.ok(alias.messageKey);
+    const rec = (await dbAll('messages')).find((m) => m.key === alias.messageKey);
+    assert.equal(rec.unsent, true);
+    assert.equal(rec.text, 'id will change');
+  });
+
+  await t.test('stickers, blob photos and the "Edited" button are understood', async () => {
+    await page.evaluate((png) => {
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000008101', sender: 'Khondoker Aurthe', time: '3:17 PM', text: '', photo: fb.blobPng(png) });
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000008102', sender: 'Khondoker Aurthe', time: '3:17 PM', text: '', sticker: 'data:image/png;base64,' + png });
+    }, PNG_1x1);
+    const blobRec = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008101' && m.attachments.some((a) => a.mediaKey)), { what: 'blob photo stored' });
+    assert.ok(blobRec);
+    const stickerRec = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008102' && m.attachments.length), { what: 'sticker saved' });
+    assert.ok(stickerRec.attachments[0]);
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000008103', sender: 'Khondoker Aurthe', time: '3:18 PM', text: 'before button edit' }));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008103'), { what: 'pre-edit saved' });
+    await page.evaluate(() => fb.edit('100012345678901@msgr.7460000000000008103', 'after button edit', true));
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000008103"] .mms-edit-history');
+      return b && b.textContent.includes('before button edit');
+    }), { what: 'edit history via Edited button' });
+  });
+
+  await t.test('other UI languages: the unsent wording is learned from the page', async () => {
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000008201', sender: 'Khondoker Aurthe', time: '3:19 PM', text: 'learn me' }));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008201'), { what: 'saved before unsend' });
+    // a wording no built-in pattern knows
+    await page.evaluate(() => fb.unsendInPlace('100012345678901@msgr.7460000000000008201', '100012345678901@msgr.7460000000000008201', 'Khondoker Aurthe zz-unsendword-zz'));
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000008201"] .mms-recovered');
+      return b && b.textContent.includes('learn me');
+    }), { what: 'structural unsend detection' });
+    const learned = await dash.evaluate(async () => (await chrome.storage.local.get('learnedPlaceholders')).learnedPlaceholders || []);
+    assert.ok(learned.some((src) => src.includes('zz-unsendword-zz')), 'pattern learned: ' + JSON.stringify(learned));
+  });
+
   await t.test('after a reload, old placeholders are filled from the saved copy', async () => {
     await page.evaluate(() =>
       fb.addMessage({ domId: '100012345678901@msgr.7101', sender: 'Khondoker Aurthe', time: '3:20 PM', text: 'alpha one' }) ||
@@ -228,7 +274,17 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
       // same position, but Messenger gave the placeholder a different id: matched by its neighbours
       fb.addMessage({ domId: '100012345678901@msgr.9999', sender: 'Khondoker Aurthe', time: '3:20 PM', placeholder: 'Khondoker Aurthe unsent a message' });
       fb.addMessage({ domId: '100012345678901@msgr.7103', sender: 'Khondoker Aurthe', time: '3:21 PM', text: 'gamma three' });
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000009999', sender: 'Khondoker Aurthe', time: '3:16 PM', placeholder: 'Khondoker Aurthe deleted a message' });
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000008201', sender: 'Khondoker Aurthe', time: '3:19 PM', placeholder: 'Khondoker Aurthe zz-unsendword-zz' });
     });
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000009999"] .mms-recovered');
+      return b && b.textContent.includes('id will change');
+    }), { what: 'recovery through the stored id alias' });
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000008201"] .mms-recovered');
+      return b && b.textContent.includes('learn me');
+    }), { what: 'learned wording recognised after reload' });
     await waitFor(async () => page.evaluate(() => {
       const b = document.querySelector('[data-message-id="100012345678901@msgr.7001"] .mms-recovered');
       return b && b.textContent.includes('screen secret');

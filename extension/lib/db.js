@@ -2,7 +2,7 @@
 // Used by the background worker, the popup and the dashboard.
 
 export const DB_NAME = 'messenger-message-saver';
-export const DB_VERSION = 1;
+export const DB_VERSION = 2;
 
 let dbPromise = null;
 
@@ -35,6 +35,10 @@ export function openDb() {
         const e = db.createObjectStore('events', { keyPath: 'id', autoIncrement: true });
         e.createIndex('at', 'at');
       }
+      // v2: a message whose on-screen id changed (encrypted chats change it on unsend)
+      if (!db.objectStoreNames.contains('aliases')) db.createObjectStore('aliases', { keyPath: 'domId' });
+      const msgStore = req.transaction.objectStore('messages');
+      if (!msgStore.indexNames.contains('domId')) msgStore.createIndex('domId', 'domId');
     };
     req.onsuccess = () => {
       const db = req.result;
@@ -273,18 +277,21 @@ export async function searchMessages(query, { threadKey = null, status = null, l
 
 export async function deleteThread(threadKey) {
   const msgs = await messagesByThread(threadKey);
-  await withStores(['messages', 'threads', 'media'], 'readwrite', async (s) => {
+  const keys = new Set(msgs.map((m) => m.key));
+  const aliases = await getAll('aliases');
+  await withStores(['messages', 'threads', 'media', 'aliases'], 'readwrite', async (s) => {
     for (const m of msgs) {
       s.messages.delete(m.key);
       for (const a of m.attachments || []) if (a.mediaKey) s.media.delete(a.mediaKey);
     }
+    for (const al of aliases) if (keys.has(al.messageKey)) s.aliases.delete(al.domId);
     s.threads.delete(threadKey);
   });
   return msgs.length;
 }
 
 export async function clearAll() {
-  await withStores(['messages', 'threads', 'contacts', 'media', 'notifications', 'events'], 'readwrite', async (s) => {
+  await withStores(['messages', 'threads', 'contacts', 'media', 'notifications', 'events', 'aliases'], 'readwrite', async (s) => {
     for (const k of Object.keys(s)) s[k].clear();
   });
 }
@@ -345,7 +352,7 @@ function base64ToBlob(b64, mime) {
 }
 
 export async function exportAll({ includeMedia = true } = {}) {
-  const [messages, threads, contacts, notifications, events] = await Promise.all(['messages', 'threads', 'contacts', 'notifications', 'events'].map(getAll));
+  const [messages, threads, contacts, notifications, events, aliases] = await Promise.all(['messages', 'threads', 'contacts', 'notifications', 'events', 'aliases'].map(getAll));
   const out = {
     format: 'messenger-message-saver',
     version: 1,
@@ -355,6 +362,7 @@ export async function exportAll({ includeMedia = true } = {}) {
     contacts,
     notifications,
     events,
+    aliases,
     media: [],
   };
   if (includeMedia) {
@@ -371,7 +379,8 @@ export async function importAll(data) {
   if (!data || data.format !== 'messenger-message-saver') throw new Error('This file is not a Messenger Message Saver backup.');
   const counts = { messages: 0, threads: 0, contacts: 0, media: 0 };
   const existing = new Map((await getAll('messages')).map((m) => [m.key, m]));
-  await withStores(['messages', 'threads', 'contacts', 'notifications', 'events', 'media'], 'readwrite', async (s) => {
+  await withStores(['messages', 'threads', 'contacts', 'notifications', 'events', 'media', 'aliases'], 'readwrite', async (s) => {
+    for (const a of data.aliases || []) if (a && a.domId && a.messageKey) s.aliases.put(a);
     for (const m of data.messages || []) {
       const old = existing.get(m.key);
       const merged = old ? mergeImported(old, m) : m;
