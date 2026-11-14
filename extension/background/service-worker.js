@@ -344,6 +344,15 @@ async function rememberDomThread(thread) {
     if (thread.id && nk && nk !== 'name:unknown chat') {
       const alias = (await reqP(st.threads.get(nk))) || { threadKey: nk, domName: thread.name };
       if (alias.aliasFor !== threadKey) st.threads.put({ ...alias, aliasFor: threadKey, updatedAt: now });
+    } else if (!thread.id && threadKey.startsWith('name:') && !old.aliasFor) {
+      // a 1:1 pop-up links to the person's profile; for normal chats that id is the chat id
+      for (const id of thread.altIds || []) {
+        const known = await reqP(st.threads.get(String(id)));
+        if (known && !known.aliasFor) {
+          st.threads.put({ ...old, domName: thread.name || old.domName || '', aliasFor: String(id), updatedAt: now });
+          break;
+        }
+      }
     }
   });
   return threadKey;
@@ -354,6 +363,8 @@ async function ingestDom(batch, ctx) {
   if (!s.enabled || !s.saveMessages || !s.captureDom) return { ok: false };
   const thread = batch.thread || {};
   const threadKey = await rememberDomThread(thread);
+  const chatKeys = await db.threadKeysFor(threadKey);
+  for (const id of thread.altIds || []) if (id && !chatKeys.includes(String(id))) chatKeys.push(String(id));
   const now = Date.now();
   const notices = [];
   const mediaJobs = [];
@@ -370,7 +381,8 @@ async function ingestDom(batch, ctx) {
     };
     const byText = async (text, isMine) => {
       if (!text) return null;
-      const matches = await reqP(st.messages.index('textKey').getAll(db.textKeyOf(threadKey, text)));
+      let matches = [];
+      for (const k of chatKeys) matches = matches.concat(await reqP(st.messages.index('textKey').getAll(db.textKeyOf(k, text))));
       return (
         matches.find((m) => !m.domId && m.isMine === isMine) ||
         matches.find((m) => !m.domId) ||
@@ -462,7 +474,8 @@ async function ingestDom(batch, ctx) {
       const text = normalizeText(u.text);
       let rec = (await byDomId(u.domId)) || null;
       if (!rec && text) {
-        const matches = await reqP(st.messages.index('textKey').getAll(db.textKeyOf(threadKey, text)));
+        let matches = [];
+        for (const k of chatKeys) matches = matches.concat(await reqP(st.messages.index('textKey').getAll(db.textKeyOf(k, text))));
         rec = matches.find((m) => !m.unsent) || matches[0] || null;
       }
       if (!rec) {

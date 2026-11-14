@@ -177,6 +177,17 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     assert.equal(incoming.senderName, 'Khondoker Aurthe');
   });
 
+  await t.test('the same message seen on the network and on screen is stored once', async () => {
+    gw.socket.send(Buffer.from(h.dgwData(3, h.responseEnvelope([h.insertMessage({ text: 'dedupe me', threadKey: THREAD, ts: 1731571870000, id: 'mid.$dup1', senderId: THREAD })]))));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$dup1'), { what: 'network copy' });
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000007777', sender: 'Khondoker Aurthe', time: '3:12 PM', text: 'dedupe me' }));
+    const merged = await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$dup1' && m.domId === 'msgr.7460000000000007777'), { what: 'screen copy merged into network record' });
+    assert.deepEqual(merged.sources.sort(), ['network', 'screen']);
+    assert.equal((await dbAll('messages')).filter((m) => m.text === 'dedupe me').length, 1);
+    const threads = await dbAll('threads');
+    assert.ok(threads.some((t) => t.threadKey === 'name:khondoker aurthe' && t.aliasFor === THREAD), 'pop-up name linked to the chat id');
+  });
+
   await t.test('screen: live unsend shows the original under "unsent a message"', async () => {
     await page.evaluate(() => fb.unsend('100012345678901@msgr.7001', 'Khondoker Aurthe unsent a message'));
     const box = await waitFor(async () => {

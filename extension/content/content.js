@@ -705,6 +705,7 @@
       const sig = [r.domId, r.text, r.images.map((x) => x.key || x.src.slice(0, 80)).join(','), r.extras.map((x) => x.kind + x.title).join(',')].join('|');
       if (!sentSignatures.has(sig)) {
         sentSignatures.add(sig);
+        r.sig = sig;
         items.push(r);
       }
     });
@@ -727,10 +728,14 @@
         outItems.push({ domId: r.domId, text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ts, prev: r.prev, next: r.next, stamp: r.stamp, images, extras: r.extras, edited: r.edited });
       }
       domStats.saved += outItems.length;
+      const sigs = items.map((r) => r.sig);
       send({
         type: 'ingest-dom',
         batch: { thread: { id: thread.id, name: thread.name, e2ee: !!thread.e2ee, url: thread.url, altIds: thread.altIds || [] }, items: outItems, unsentNow },
         ctx: { selfId: selfId() },
+      }).then((res) => {
+        // not stored (e.g. the background worker was restarting): try again on the next pass
+        if (!res || res.error) for (const sig of sigs) sentSignatures.delete(sig);
       });
     }
 
