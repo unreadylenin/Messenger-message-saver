@@ -1315,7 +1315,6 @@
         if (stealth() && (e.target === win || e.target === doc)) e.stopImmediatePropagation();
       };
       win.addEventListener('focus', swallow, true);
-      win.addEventListener('pageshow', swallow, true);
       doc.addEventListener('visibilitychange', swallow, true);
       doc.addEventListener('webkitvisibilitychange', swallow, true);
     } catch (e) {
