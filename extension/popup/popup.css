@@ -65,6 +65,10 @@ body {
   color: var(--danger);
 }
 
+.stats div[title] {
+  cursor: help;
+}
+
 .toggles {
   padding: 4px 6px;
 }
@@ -73,7 +77,7 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 7px 8px;
+  padding: 5px 8px;
   border-radius: 8px;
   cursor: pointer;
 }
@@ -164,9 +168,26 @@ body {
 }
 
 .bottom {
+  position: sticky;
+  bottom: 0;
   display: flex;
   gap: 8px;
-  padding: 10px 14px 4px;
+  padding: 10px 14px;
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+}
+
+.paused-note {
+  margin: 8px 14px 0;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--bg-soft);
+  font-size: 12px;
+}
+
+.recent-list li:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
 }
 
 .bottom .primary {

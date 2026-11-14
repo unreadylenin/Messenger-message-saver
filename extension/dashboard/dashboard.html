@@ -28,6 +28,11 @@
       </nav>
     </header>
 
+    <div id="paused-banner" class="paused-banner" hidden>
+      ⏸️ Messenger Message Saver is paused: nothing is saved, and others can see “Seen” and “typing…”.
+      <label class="switch" title="Turn everything back on"><input type="checkbox" data-setting="enabled" aria-label="Turn Messenger Message Saver on" /><span></span></label>
+    </div>
+
     <div id="welcome" class="welcome" hidden>
       <h1>You're set up 🎉</h1>
       <ol>
@@ -96,12 +101,13 @@
         <div class="settings-grid">
           <div class="panel">
             <h3>Saving</h3>
+            <label class="srow"><span>Messenger Message Saver is on<small>Turn off to pause everything (saving and Unseen)</small></span><span class="switch"><input type="checkbox" data-setting="enabled" /><span></span></span></label>
             <label class="srow"><span>Save messages</span><span class="switch"><input type="checkbox" data-setting="saveMessages" /><span></span></span></label>
             <label class="srow"><span>Read Messenger's own data (normal chats)<small>Catches messages even before you open the chat</small></span><span class="switch"><input type="checkbox" data-setting="captureNetwork" /><span></span></span></label>
             <label class="srow"><span>Read messages shown on screen<small>Needed for end-to-end encrypted chats</small></span><span class="switch"><input type="checkbox" data-setting="captureDom" /><span></span></span></label>
             <label class="srow"><span>Keep copies of Messenger notifications</span><span class="switch"><input type="checkbox" data-setting="captureNotifications" /><span></span></span></label>
             <label class="srow"><span>Save photos and stickers</span><span class="switch"><input type="checkbox" data-setting="saveMedia" /><span></span></span></label>
-            <label class="srow"><span>Largest photo to keep (MB)</span><input type="number" min="1" max="100" step="1" data-setting="maxMediaMB" class="num" /></label>
+            <label class="srow"><span>Largest photo to keep (MB)<small>Up to 40 MB</small></span><input type="number" min="1" max="40" step="1" data-setting="maxMediaMB" class="num" /></label>
             <label class="srow"><span>Delete saved messages older than (days)<small>0 = keep forever</small></span><input type="number" min="0" max="3650" step="1" data-setting="retentionDays" class="num" /></label>
           </div>
           <div class="panel">
@@ -147,7 +153,7 @@
             <li><b>Saving.</b> While a Facebook or Messenger tab is open, the extension keeps a private copy of messages: from Messenger's own data for normal chats, and from what is shown on screen for every chat (including end-to-end encrypted ones). Everything stays on this computer.</li>
             <li><b>Unsent messages.</b> When someone unsends, Messenger shows “… unsent a message”. The saved original appears right under it, in the <i>Unsent &amp; deleted</i> tab, and as a desktop alert.</li>
             <li><b>Edited messages.</b> Earlier versions are kept and shown under the edited message.</li>
-            <li><b>Unseen.</b> “Seen” is not sent when you read. In encrypted chats this works through <i>Strong mode</i>, which makes Messenger think the tab is in the background.</li>
+            <li><b>Unseen.</b> “Seen” is not sent when you read. In normal chats the read marker is held back; in encrypted chats this works through <i>Strong mode</i>, which tells Messenger the window is not focused. Check it once with a friend.</li>
           </ul>
           <h2>Limits</h2>
           <ul>

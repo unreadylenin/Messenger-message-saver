@@ -407,7 +407,10 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     popup.on('pageerror', (e) => errors.push('popup: ' + e.message));
     await popup.goto(`chrome-extension://${extId}/popup/popup.html`);
     await waitFor(async () => Number(await popup.textContent('#s-unsent')) >= 3, { what: 'popup unsent count' });
-    await waitFor(async () => (await popup.textContent('#recent-list')).includes('screen secret'), { what: 'popup recent list' });
+    // the popup lists the 3 most recently unsent messages that were kept
+    const latest = (await dbAll('messages')).filter((m) => m.unsent && m.text).sort((a, b) => b.unsentAt - a.unsentAt)[0];
+    await waitFor(async () => (await popup.textContent('#recent-list')).includes(latest.text), { what: 'popup recent list' });
+    assert.ok((await popup.locator('#recent-list li').count()) <= 3);
     await popup.close();
   });
 
@@ -500,6 +503,46 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     const [download] = await Promise.all([dash.waitForEvent('download'), dash.click('#export-csv')]);
     const csv = fs.readFileSync(await download.path(), 'utf8');
     assert.ok(csv.includes("'=1+1"), 'formula neutralised: ' + csv.split('\n').find((l) => l.includes('1+1')));
+  });
+
+  await t.test('UX: popup hint only when needed, paused state is honest, deletes clear the screen, settings stay in sync', async () => {
+    const popup = await ctx.newPage();
+    popup.on('pageerror', (e) => errors.push('popup: ' + e.message));
+    await popup.setViewportSize({ width: 360, height: 600 });
+    await popup.goto(`chrome-extension://${extId}/popup/popup.html`);
+    await popup.waitForTimeout(1600);
+    assert.equal(await popup.isVisible('#reload-hint'), false, 'no false "reload this tab" warning');
+    assert.equal(await popup.isVisible('#open-dashboard'), true, 'main button visible within 600 px');
+
+    // pause from the popup: switches lock, the note explains, Seen is no longer held back
+    await popup.click('header .switch input[data-setting="enabled"]');
+    await waitFor(async () => popup.isVisible('#paused-note'), { what: 'paused note' });
+    assert.equal(await popup.isDisabled('input[data-setting="blockSeen"]'), true);
+
+    // the Settings page follows at once
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#settings`);
+    await waitFor(async () => dash.isVisible('#paused-banner'), { what: 'paused banner on the Saved Messages page' });
+    await popup.click('header .switch input[data-setting="enabled"]');
+    await waitFor(async () => !(await dash.isVisible('#paused-banner')), { what: 'banner gone after resuming' });
+    await popup.click('input[data-setting="blockSeen"]');
+    await waitFor(async () => !(await dash.isChecked('#view-settings input[data-setting="blockSeen"]')), { what: 'settings page shows the popup change' });
+    assert.equal(await dash.isDisabled('#view-settings input[data-setting="stealthFocus"]'), true, 'Strong mode locked while Unseen is off');
+    await popup.click('input[data-setting="blockSeen"]');
+    await popup.close();
+
+    // deleting a chat clears it from the screen
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#thread=200000000000001`);
+    await waitFor(async () => (await dash.textContent('#thread-messages')).includes('4321'), { what: 'Bob chat open' });
+    dash.once('dialog', () => {});
+    await dash.click('#delete-thread');
+    await dash.click('#confirm-ok');
+    await waitFor(async () => !(await dash.textContent('#thread-messages')).includes('4321'), { what: 'deleted chat no longer on screen' });
+
+    // Chrome's "Options" entry opens Settings
+    const opt = await ctx.newPage();
+    await opt.goto(`chrome-extension://${extId}/dashboard/options.html`);
+    await waitFor(async () => opt.url().endsWith('#settings') && (await opt.isVisible('#view-settings')), { what: 'options -> settings' });
+    await opt.close();
   });
 
   await t.test('no script errors anywhere', async () => {

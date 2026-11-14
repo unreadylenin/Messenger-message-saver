@@ -563,3 +563,74 @@ dialog {
     margin-left: 0;
   }
 }
+
+/* --- review fixes --- */
+.paused-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: rgba(255, 186, 0, 0.18);
+  border-bottom: 1px solid rgba(255, 186, 0, 0.5);
+  font-weight: 600;
+}
+
+.tabs button[aria-selected='true'] {
+  color: var(--brand-text);
+}
+
+.linklike {
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--muted);
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+
+.linklike:focus-visible,
+.threads li:focus-visible,
+.media img:focus-visible,
+.chip:focus-visible,
+.tabs button:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.file-btn:focus-within {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+/* the chat's header, filters and buttons stay put; only the conversation scrolls */
+.thread-pane .view-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg-soft);
+  padding: 6px 0;
+}
+
+.timeline {
+  max-height: calc(100vh - 230px);
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.bubble.flash {
+  animation: flash 1.6s ease-out;
+}
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+#diag td {
+  word-break: break-word;
+}
+
+.lightbox:focus {
+  outline: none;
+}

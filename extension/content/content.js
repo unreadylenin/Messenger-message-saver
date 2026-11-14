@@ -805,7 +805,7 @@
     if (rowMemory.size > 20000) rowMemory.clear();
 
     if (settings.saveMessages && settings.captureDom && (items.length || unsentNow.length)) {
-      const maxBytes = Math.min(settings.maxMediaMB || 15, 12) * 1024 * 1024;
+      const maxBytes = Math.min(settings.maxMediaMB || 15, 40) * 1024 * 1024;
       const outItems = [];
       for (const r of items) {
         const images = [];
@@ -928,8 +928,21 @@
     return box;
   }
 
+  /** Light text around the box means a dark (themed) chat background: use a dark box, else a light one. */
+  function setTone(box, ref) {
+    let dark = false;
+    try {
+      const m = /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(getComputedStyle(ref || document.body).color);
+      if (m) dark = (0.2126 * m[1] + 0.7152 * m[2] + 0.0722 * m[3]) / 255 > 0.55;
+    } catch (e) {
+      /* keep light */
+    }
+    box.setAttribute('data-tone', dark ? 'dark' : 'light');
+  }
+
   function insertBox(row, box) {
     const anchor = placeholderAnchor(row);
+    setTone(box, anchor || row);
     if (anchor && anchor.parentElement) anchor.parentElement.insertBefore(box, anchor.nextSibling);
     else row.appendChild(box);
   }
@@ -1006,6 +1019,7 @@
     }
     const nodes = messageTextNodes(row);
     const anchor = nodes.length ? nodes[nodes.length - 1].closest('span[dir="auto"]') || nodes[nodes.length - 1] : null;
+    setTone(box, nodes[nodes.length - 1] || row);
     if (anchor && anchor.parentElement) anchor.parentElement.insertBefore(box, anchor.nextSibling);
     else row.appendChild(box);
   }

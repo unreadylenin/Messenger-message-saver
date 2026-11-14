@@ -25,20 +25,22 @@
       <button id="reload-tab" class="btn small">Reload tab</button>
     </div>
 
+    <div id="paused-note" class="paused-note" hidden>⏸️ Paused: nothing is saved, and others can see “Seen” and “typing…”.</div>
+
     <section class="stats">
       <div><b id="s-messages">0</b><span>saved</span></div>
       <div class="accent"><b id="s-unsent">0</b><span>unsent kept</span></div>
       <div><b id="s-edited">0</b><span>edited</span></div>
-      <div><b id="s-seen">0</b><span>Seen blocked</span></div>
+      <div title="Counts normal chats only. In encrypted chats Strong mode stops “Seen” without counting it."><b id="s-seen">0</b><span>Seen held back*</span></div>
     </section>
 
-    <section class="toggles">
+    <section class="toggles needs-on">
       <label class="row">
-        <span class="label"><span class="ico">💾</span>Save messages<small>Keeps a private copy on this computer</small></span>
+        <span class="label"><span class="ico">💾</span>Save messages<small>Private copy on this computer</small></span>
         <span class="switch"><input type="checkbox" data-setting="saveMessages" /><span></span></span>
       </label>
       <label class="row">
-        <span class="label"><span class="ico">🗨️</span>Show unsent messages in chat<small>Original text appears under “unsent a message”</small></span>
+        <span class="label"><span class="ico">🗨️</span>Show unsent messages in chat<small>Under “unsent a message”</small></span>
         <span class="switch"><input type="checkbox" data-setting="showRecoveredInline" /><span></span></span>
       </label>
       <label class="row">
@@ -54,11 +56,11 @@
         <span class="switch"><input type="checkbox" data-setting="blockTyping" /><span></span></span>
       </label>
       <label class="row">
-        <span class="label"><span class="ico">🔔</span>Alert when someone unsends<small>Desktop notification with the message</small></span>
+        <span class="label"><span class="ico">🔔</span>Alert when someone unsends<small>Desktop notification</small></span>
         <span class="switch"><input type="checkbox" data-setting="notifyOnUnsend" /><span></span></span>
       </label>
       <label class="row">
-        <span class="label"><span class="ico">🖼️</span>Save photos too<small>So unsent photos stay visible</small></span>
+        <span class="label"><span class="ico">🖼️</span>Save photos too<small>Unsent photos stay visible</small></span>
         <span class="switch"><input type="checkbox" data-setting="saveMedia" /><span></span></span>
       </label>
     </section>

@@ -66,7 +66,7 @@
       "all_frames": false
     }
   ],
-  "options_page": "dashboard/dashboard.html#settings",
+  "options_page": "dashboard/options.html",
   "commands": {
     "toggle-unseen": {
       "suggested_key": {

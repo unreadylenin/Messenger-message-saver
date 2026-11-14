@@ -19,10 +19,21 @@ async function settings() {
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.settings) {
+    const before = { ...DEFAULT_SETTINGS, ...(changes.settings.oldValue || {}) };
     settingsCache = { ...DEFAULT_SETTINGS, ...(changes.settings.newValue || {}) };
     updateBadge();
+    // a new "delete older than N days" applies now, not at the next 6-hourly run
+    if (settingsCache.retentionDays > 0 && settingsCache.retentionDays !== before.retentionDays) serial(() => db.prune(settingsCache.retentionDays));
   }
 });
+
+// once per worker start: apply the retention setting and make sure the 6-hourly run exists
+(async () => {
+  const s = await settings();
+  if (s.retentionDays > 0) serial(() => db.prune(s.retentionDays));
+  const alarm = await chrome.alarms.get('mms-prune');
+  if (!alarm) chrome.alarms.create('mms-prune', { periodInMinutes: 360 });
+})().catch(() => {});
 
 chrome.runtime.onInstalled.addListener(async (details) => {
   const { settings: stored } = await chrome.storage.local.get('settings');
@@ -1005,13 +1016,14 @@ async function countUnseen(actions) {
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== 'toggle-unseen') return;
   const s = await settings();
-  const next = { ...s, blockSeen: !s.blockSeen };
+  // while everything is paused, the shortcut switches the extension back on with Unseen
+  const next = !s.enabled ? { ...s, enabled: true, blockSeen: true } : { ...s, blockSeen: !s.blockSeen };
   await chrome.storage.local.set({ settings: next });
   try {
     await chrome.notifications.create('mms-unseen|' + Date.now(), {
       type: 'basic',
       iconUrl: chrome.runtime.getURL('icons/icon128.png'),
-      title: next.blockSeen ? 'Unseen mode is ON' : 'Unseen mode is OFF',
+      title: (!s.enabled ? 'Messenger Message Saver is back on. ' : '') + (next.blockSeen ? 'Unseen mode is ON' : 'Unseen mode is OFF'),
       message: next.blockSeen ? 'People will not see "Seen" when you read.' : 'Messenger will show "Seen" again when you read.',
       priority: 0,
     });

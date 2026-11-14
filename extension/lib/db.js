@@ -114,7 +114,8 @@ export function textKeyOf(threadKey, text) {
 }
 
 export function statusOf(m) {
-  if (m.unsent) return 'unsent';
+  // an unsent message we never saw has nothing to show: kept apart from the recovered ones
+  if (m.unsent) return normalizeText(m.text) || (m.attachments && m.attachments.length) ? 'unsent' : 'unsent-empty';
   if (m.deleted) return 'deleted';
   if (m.edited) return 'edited';
   return 'normal';
@@ -211,14 +212,16 @@ export async function recentEvents(limit = 50) {
 export async function quickTotals() {
   return withStores(['messages', 'media'], 'readonly', async (s) => {
     const idx = s.messages.index('status');
-    const [messages, unsent, edited, deleted, media] = await Promise.all([
+    const [messages, unsent, unsentEmpty, edited, deleted, media] = await Promise.all([
       reqP(s.messages.count()),
       reqP(idx.count('unsent')),
+      reqP(idx.count('unsent-empty')),
       reqP(idx.count('edited')),
       reqP(idx.count('deleted')),
       reqP(s.media.count()),
     ]);
-    return { messages, unsent, edited, deleted, media };
+    // unsent = unsent messages whose content was kept; unsentEmpty = unsent before they were seen
+    return { messages, unsent, unsentEmpty, edited, deleted, media };
   });
 }
 

@@ -7,6 +7,7 @@
   --muted: #65676b;
   --line: #dadde1;
   --brand: #0866ff;
+  --brand-text: #0866ff;
   --brand-2: #a033ff;
   --danger: #e0245e;
   --danger-soft: rgba(224, 36, 94, 0.1);
@@ -26,14 +27,21 @@
     --text: #e4e6eb;
     --muted: #b0b3b8;
     --line: #3a3b3c;
-    --danger-soft: rgba(240, 40, 73, 0.18);
-    --edit-soft: rgba(10, 124, 255, 0.16);
+    --brand-text: #6aa7ff;
+    --danger: #ff7a9c;
+    --danger-soft: rgba(255, 122, 156, 0.16);
+    --edit: #7cb8ff;
+    --edit-soft: rgba(124, 184, 255, 0.14);
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
   }
 }
 
 * {
   box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
 }
 
 html,
@@ -142,6 +150,15 @@ select:focus-visible {
 
 .switch input:disabled + span {
   opacity: 0.5;
+}
+
+.switch input:focus-visible + span {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.paused .needs-on {
+  opacity: 0.45;
 }
 
 .badge {

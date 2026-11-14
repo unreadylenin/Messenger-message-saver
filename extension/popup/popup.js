@@ -20,8 +20,11 @@ async function bindToggles() {
 function reflect(s) {
   const stealthRow = $('#row-stealth');
   const stealthInput = stealthRow.querySelector('input');
-  stealthInput.disabled = !s.blockSeen;
+  stealthInput.disabled = !s.enabled || !s.blockSeen;
   stealthRow.classList.toggle('disabled', !s.blockSeen);
+  // while paused, every feature is off: show it, and do not let the switches pretend otherwise
+  for (const input of document.querySelectorAll('.toggles input[data-setting]')) if (input.dataset.setting !== 'stealthFocus') input.disabled = !s.enabled;
+  $('#paused-note').hidden = !!s.enabled;
   const parts = [];
   if (!s.enabled) parts.push('Paused');
   else {
@@ -35,7 +38,7 @@ function reflect(s) {
 async function showStats() {
   const [totals, { stats = {} }] = await Promise.all([db.quickTotals(), chrome.storage.local.get('stats')]);
   $('#s-messages').textContent = totals.messages;
-  $('#s-unsent').textContent = totals.unsent;
+  $('#s-unsent').textContent = totals.unsent; // unsent messages whose content was kept
   $('#s-edited').textContent = totals.edited;
   $('#s-seen').textContent = stats.seenBlocked || 0;
 }
@@ -44,7 +47,7 @@ async function showRecent() {
   const list = $('#recent-list');
   const [unsent, contacts, threads] = await Promise.all([db.messagesByStatus('unsent', 30), db.getContactsMap(), db.getAll('threads')]);
   const threadMap = new Map(threads.map((t) => [t.threadKey, t]));
-  const items = unsent.filter((m) => (m.text && m.text.trim()) || (m.attachments && m.attachments.length)).slice(0, 5);
+  const items = unsent.filter((m) => (m.text && m.text.trim()) || (m.attachments && m.attachments.length)).slice(0, 3);
   list.textContent = '';
   $('#recent-empty').hidden = items.length > 0;
   for (const m of items) {
@@ -52,12 +55,19 @@ async function showRecent() {
     const who = senderOf(m, contacts, tName);
     const li = el(
       'li',
-      { title: 'Open in saved messages' },
+      { title: 'Open in saved messages', tabindex: '0', role: 'button' },
       el('span', { class: 'when', text: fmtAgo(m.unsentAt || m.ts) }),
       el('div', { class: 'who', text: who === tName ? who : `${who} · ${tName}` }),
       el('div', { class: 'txt', text: m.text || '[photo / attachment]' })
     );
-    li.addEventListener('click', () => openDashboard('#thread=' + encodeURIComponent(m.threadKey) + '&msg=' + encodeURIComponent(m.key)));
+    const open = () => openDashboard('#thread=' + encodeURIComponent(m.threadKey) + '&msg=' + encodeURIComponent(m.key));
+    li.addEventListener('click', open);
+    li.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        open();
+      }
+    });
     list.appendChild(li);
   }
 }
