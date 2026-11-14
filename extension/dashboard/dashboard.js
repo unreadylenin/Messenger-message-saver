@@ -349,7 +349,9 @@ async function exportJson(includeMedia) {
 }
 
 function csvCell(v) {
-  const s = String(v === undefined || v === null ? '' : v);
+  let s = String(v === undefined || v === null ? '' : v);
+  // a cell starting with = + - @ would run as a formula in Excel or Google Sheets
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
   return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
@@ -521,8 +523,9 @@ async function init() {
   $('#import-json').addEventListener('change', (e) => e.target.files[0] && importJson(e.target.files[0]));
   $('#delete-thread').addEventListener('click', async () => {
     if (!state.currentThread) return;
-    if (!(await confirmDialog(`Delete everything saved from “${nameOfThread(state.currentThread)}”? This cannot be undone.`))) return;
-    for (const k of await db.threadKeysFor(state.currentThread)) await db.deleteThread(k);
+    if (!(await confirmDialog(`Delete everything saved from “${nameOfThread(state.currentThread)}”: messages, photos, unsend and edit history, and Messenger notification copies from this chat? This cannot be undone.`))) return;
+    const name = nameOfThread(state.currentThread);
+    for (const k of await db.threadKeysFor(state.currentThread)) await db.deleteThread(k, { name });
     state.currentThread = null;
     toast('Chat data deleted');
     await refreshAll();

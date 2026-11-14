@@ -55,6 +55,7 @@
     badge: true,
     blockSeen: true,
     stealthFocus: true,
+    stealthVisibility: false,
     blockTyping: true,
   };
 
@@ -137,6 +138,7 @@
       blockSeen: settings.enabled && settings.blockSeen,
       blockTyping: settings.enabled && settings.blockTyping,
       stealthFocus: settings.enabled && settings.blockSeen && settings.stealthFocus,
+      stealthVisibility: settings.enabled && settings.blockSeen && settings.stealthFocus && settings.stealthVisibility,
     };
     if (!extensionAlive) return;
     document.dispatchEvent(new CustomEvent(CHANNEL_IN, { detail: JSON.stringify({ type: 'settings', inst: instance, data: forPage }) }));
@@ -252,9 +254,14 @@
   function learnPlaceholder(text, senderName) {
     const t = norm(text);
     if (!t || t.length > 120 || isPlaceholderText(t)) return;
-    let src = escapeRe(t);
-    if (senderName && t.includes(senderName)) src = src.split(escapeRe(senderName)).join('.{1,80}?');
-    src = '^' + src + '$';
+    // Messenger's wording names the sender ("Alpha unsent…", "You unsent…"); anything else is not learned
+    const name = norm(senderName);
+    const tokens = [name, name.split(' ')[0], ...YOU_LABELS].filter((x) => x && x.length >= 2);
+    const lower = t.toLowerCase();
+    const hit = tokens.find((x) => lower.includes(x.toLowerCase()));
+    if (!hit) return;
+    const at = lower.indexOf(hit.toLowerCase());
+    const src = '^' + escapeRe(t.slice(0, at)) + '.{1,80}?' + escapeRe(t.slice(at + hit.length)) + '$';
     chrome.storage.local.get('learnedPlaceholders').then(({ learnedPlaceholders: list = [] }) => {
       if (list.includes(src)) return;
       chrome.storage.local.set({ learnedPlaceholders: [...list, src].slice(-20) });

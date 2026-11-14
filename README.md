@@ -51,6 +51,7 @@ Click **Remove** on the extension's card. This also deletes everything it saved 
 
 - **Toolbar icon** → quick switches (Save, Unseen, Hide typing, alerts, photos), counts, and the latest unsent messages. The red number on the icon counts newly recovered unsent messages.
 - **Alt + Shift + U** turns Unseen mode on or off from any tab (change the key at `chrome://extensions/shortcuts`).
+- **Delete chat data** (Saved Messages → Chats) removes that chat's messages, photos, unsend/edit history and the Messenger notification copies titled with the chat's name. Photos that another chat also contains are kept.
 - **Open saved messages** → the full page with tabs: *Unsent & deleted*, *Chats*, *Edited*, *Notifications*, *Settings*, *Help*.
 - In a chat, recovered messages appear right under Messenger's *"unsent a message"* line. Only you can see these boxes.
 
@@ -58,7 +59,8 @@ Click **Remove** on the extension's card. This also deletes everything it saved 
 
 - **A message can only be recovered if it reached this browser before it was unsent.** Keep facebook.com or messenger.com open in a tab (a chat pop-up or the Messages page). Messages unsent while Facebook was closed on this computer cannot be recovered.
 - **End-to-end encrypted chats** (most one-to-one chats now) cannot be read from Messenger's network data, because it is encrypted. For these chats the extension saves what is **shown on screen** and copies of **Messenger notifications**. So the chat (pop-up or page) must have been open, or a notification must have appeared, before the unsend.
-- **Unseen in encrypted chats** uses *Strong mode*: Messenger is made to think the tab is in the background, so it does not report "Seen". Side effects: Messenger may play its message sound while you are on the page, and videos in the Facebook feed may not start on their own. Replying to a chat always marks it as seen — that is how Messenger works.
+- **Unseen in encrypted chats** uses *Strong mode*: Messenger is told the window is not focused, so it does not report "Seen". Side effect: Messenger may play its message sound or show a notification while you are reading. An extra option (off by default) also reports the tab as hidden; use it only if Strong mode alone is not enough, because with several Facebook tabs open, encrypted chats can stop loading until you reload the tab. Replying to a chat always marks it as seen — that is how Messenger works.
+- **Unseen in normal chats** holds "Seen" back by sending Messenger's own last-known read position instead of the new one. If that position is not known yet (for example in a tab that was open before you installed or updated the extension), "Seen" is left alone rather than risk marking the chat unread, and the toolbar popup asks you to reload that tab.
 - **Check Unseen once with a friend** before relying on it: ask them to message you, open the chat, and ask whether they see "Seen". Facebook can change how "Seen" is sent at any time.
 - **"Typing…"** can only be hidden in normal (non-encrypted) chats.
 - Facebook changes its website often. If something stops working, open **Settings → Diagnostics** on the Saved Messages page.
@@ -74,7 +76,7 @@ Click **Remove** on the extension's card. This also deletes everything it saved 
 
 | Part | File | Job |
 |---|---|---|
-| Page hook | `extension/content/main-world.js` | Runs inside the Facebook page before Facebook's own code. Reads Messenger's sync data (the *LightSpeed* format, carried over the `gateway.facebook.com` WebSocket, the older MQTT socket and GraphQL replies), and rewrites your own outgoing *mark read* / *typing* requests when Unseen is on. Read markers are rewound to what the server already has instead of being dropped, so your send-message queue is never blocked. |
+| Page hook | `extension/content/main-world.js` | Runs inside the Facebook page before Facebook's own code. Reads Messenger's sync data (the *LightSpeed* format, carried over the `gateway.facebook.com` WebSocket, the older MQTT socket and Messenger GraphQL replies), and rewrites your own outgoing *mark read* (tasks 21 and 49) and *typing* requests when Unseen is on. Read markers are only ever rewound to what the server already has — never dropped (that could block sending) and never lowered further (that would mark the chat unread). |
 | Content script | `extension/content/content.js` | Reads messages shown on screen (`[role="log"]` → `[data-scope="messages_table"]` rows, which carry a stable `data-message-id`), notices when a row turns into *"unsent a message"*, and shows the saved original under it. |
 | Background worker | `extension/background/service-worker.js` | Stores everything in IndexedDB, matches placeholders to originals (exact message id first, then same sender + same neighbouring messages), downloads photos, shows alerts. |
 | Pages | `extension/popup/`, `extension/dashboard/` | Toolbar popup and the Saved Messages page. |

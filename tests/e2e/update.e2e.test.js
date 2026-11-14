@@ -63,6 +63,8 @@ test('open Messenger tab survives an extension update and a disable', { timeout:
   await page.goto('https://www.facebook.com/');
   await page.evaluate(() => fb.connect());
   await waitFor(() => gw.socket, { what: 'gateway' });
+  // the server tells the tab how far this chat is read (as Messenger's sync does)
+  gw.socket.send(Buffer.from(h.dgwData(3, h.responseEnvelope([h.call('deleteThenInsertThread', { 0: h.i64(1731571860000), 1: h.i64(1731571000000), 2: 'hi', 3: '', 7: h.i64(THREAD), 9: h.i64(1) }, 50)]))));
 
   const extPage = async () => {
     const p = await ctx.newPage();
@@ -106,12 +108,12 @@ test('open Messenger tab survives an extension update and a disable', { timeout:
     dash = await extPage();
 
     await setSettings(dash, { blockSeen: false, stealthFocus: false, blockTyping: false });
-    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).visibilityState === 'visible', { what: 'tab follows "Unseen off" after the update' });
+    await waitFor(async () => (await readReceiptLeaving()) === 1731571860000, { what: 'tab follows "Unseen off" after the update' });
     assert.equal(await readReceiptLeaving(), 1731571860000, '"Seen" goes out untouched when Unseen is off');
 
     await setSettings(dash, { blockSeen: true, stealthFocus: true, blockTyping: true });
-    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).hidden === true, { what: 'tab follows "Unseen on" after the update' });
-    assert.equal(await readReceiptLeaving(), 0, '"Seen" neutralised again');
+    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).hasFocus === false, { what: 'tab follows "Unseen on" after the update' });
+    assert.equal(await readReceiptLeaving(), 1731571000000, '"Seen" rewound again to the server value');
   });
 
   await t.test('after a reload, the open tab keeps saving and recovering', async () => {
@@ -132,8 +134,8 @@ test('open Messenger tab survives an extension update and a disable', { timeout:
     await ext.locator(`extensions-item#${extId} #enableToggle`).click();
     await ext.waitForTimeout(500);
     await ext.close();
-    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).visibilityState === 'visible', { timeout: 15000, what: 'page no longer faked as hidden' });
-    assert.equal(await readReceiptLeaving(), 1731571860000, '"Seen" no longer changed once the extension is off');
+    await waitFor(async () => (await readReceiptLeaving()) === 1731571860000, { timeout: 15000, what: '"Seen" no longer changed once the extension is off' });
+    assert.notEqual(await page.evaluate(() => fb.focusInfo().hasFocus === false && document.visibilityState === 'hidden'), true);
     assert.equal(await page.evaluate(() => document.querySelectorAll('.mms-recovered').length), 0, 'boxes removed');
   });
 });

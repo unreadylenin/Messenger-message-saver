@@ -700,91 +700,91 @@
   // type 3 payload: {"epoch_id":..,"tasks":[{"failure_count":null,"label":"21",
   //   "payload":"{\"thread_id\":..,\"last_read_watermark_ts\":..,\"sync_group\":1}",
   //   "queue_name":"<thread id>","task_id":N}],"version_id":".."}
+  // The web client marks a chat read with two tasks: label "21" (thread_id,
+  // last_read_watermark_ts) and label "49" (thread_key, last_read_watermark_timestamp_ms).
   // type 4 (stateless) payload: {"label":"3","payload":"{\"thread_key\":..,
   //   \"is_typing\":1,...}","version":".."}
   //
-  // Tasks are never removed: a mark-read task shares its queue with "send message"
-  // tasks of the same chat, so dropping it could stall sending. Instead the task is
-  // kept and its read watermark is rewound to what the server already has (no new
-  // "Seen"), and typing tasks are rewritten to "not typing".
+  // Rules for "Seen":
+  //  - a task is never removed (it shares its queue with "send message" tasks);
+  //  - a read marker is only ever moved back to the value the server already has for that
+  //    chat, so nothing new is reported and nothing is marked unread;
+  //  - when that value is not known yet, the task is left alone (a lower value would mark
+  //    the chat unread on all devices) and reported as 'seen-unknown';
+  //  - a task that does not move the marker forward (e.g. "Mark as unread") is left alone.
 
-  const LABEL_MARK_READ = '21';
+  const READ_LABELS = new Set(['21', '49']);
+  const READ_KEYS = ['last_read_watermark_ts', 'last_read_watermark_timestamp_ms'];
   const LABEL_TYPING = '3';
 
-  function isMarkReadTask(label, payloadText) {
-    return label === LABEL_MARK_READ || (typeof payloadText === 'string' && payloadText.indexOf('last_read_watermark_ts') !== -1);
-  }
-
-  function isTypingTask(label, payloadText) {
-    return typeof payloadText === 'string' && payloadText.indexOf('is_typing') !== -1 && (label === LABEL_TYPING || label === '');
+  function ownKey(obj, key) {
+    return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
   }
 
   /**
-   * Rewrites one task object in place. Returns an action record or null.
-   * opts: {blockSeen, blockTyping, readWatermarks: Map<threadId, ts>}
+   * Looks at one task (rewriting it in place when needed).
+   * Returns null, or {action, changed}. opts: {blockSeen, blockTyping, readWatermarks}
    */
   function rewriteTask(task, opts) {
     if (!task || typeof task !== 'object' || typeof task.payload !== 'string') return null;
     const label = task.label === undefined || task.label === null ? '' : String(task.label);
-    if (opts.blockSeen && isMarkReadTask(label, task.payload)) {
+    if (opts.blockSeen && READ_LABELS.has(label)) {
       const p = parseExact(task.payload);
       if (!p || typeof p !== 'object') return null;
-      const thread = idToString(p.thread_id !== undefined ? p.thread_id : p.thread_key);
-      const wanted = idToString(p.last_read_watermark_ts);
+      const key = READ_KEYS.find((k) => ownKey(p, k));
+      if (!key) return null;
+      const thread = idToString(ownKey(p, 'thread_id') ? p.thread_id : p.thread_key);
+      const wanted = Number(idToString(p[key]));
       const known = opts.readWatermarks && opts.readWatermarks.get(thread);
-      let safe = 0;
-      if (typeof known === 'number' && known > 0) {
-        if (Number(wanted) <= known) return null; // does not move the read marker: harmless
-        safe = known; // rewind to what the server already has
-      }
-      if (wanted === String(safe)) return null;
-      p.last_read_watermark_ts = safe;
+      if (typeof known !== 'number' || !(known > 0)) return { action: { type: 'seen-unknown', thread, label }, changed: false };
+      if (!(wanted > known)) return null; // not moving the marker forward: leave it
+      p[key] = known;
       task.payload = stringifyExact(p);
-      return { type: 'seen-blocked', thread, from: wanted, to: safe };
+      return { action: { type: 'seen-blocked', thread, label, from: String(wanted), to: known }, changed: true };
     }
-    if (opts.blockTyping && isTypingTask(label, task.payload)) {
+    if (opts.blockTyping && label === LABEL_TYPING) {
       const p = parseExact(task.payload);
-      if (!p || typeof p !== 'object' || !isTruthyFlag(p.is_typing)) return null;
+      if (!p || typeof p !== 'object' || !ownKey(p, 'is_typing') || !isTruthyFlag(p.is_typing)) return null;
       p.is_typing = 0;
       task.payload = stringifyExact(p);
-      return { type: 'typing-blocked', thread: idToString(p.thread_key !== undefined ? p.thread_key : p.thread_id) };
+      return { action: { type: 'typing-blocked', thread: idToString(ownKey(p, 'thread_key') ? p.thread_key : p.thread_id) }, changed: true };
     }
     return null;
   }
 
   /**
-   * Rewrites an outgoing request envelope (JSON text). Returns {text, actions} when
-   * something changed, otherwise null.
+   * Looks at an outgoing request envelope (JSON text). Returns null when it is not of
+   * interest, otherwise {text, actions} where text is the rewritten request, or null when
+   * the request must go out unchanged.
    */
   function rewriteRequestText(text, opts) {
     if (typeof text !== 'string' || text.length < 10) return null;
     if (!opts.blockSeen && !opts.blockTyping) return null;
-    const interesting =
-      (opts.blockSeen && (text.indexOf('last_read_watermark_ts') !== -1 || text.indexOf('\\"label\\":\\"21\\"') !== -1)) ||
-      (opts.blockTyping && text.indexOf('is_typing') !== -1);
+    const interesting = (opts.blockSeen && text.indexOf('last_read_watermark') !== -1) || (opts.blockTyping && text.indexOf('is_typing') !== -1);
     if (!interesting) return null;
     const env = parseExact(text);
     if (!env || typeof env !== 'object' || typeof env.payload !== 'string') return null;
     const inner = parseExact(env.payload);
     if (!inner || typeof inner !== 'object') return null;
     const actions = [];
-    if (Array.isArray(inner.tasks)) {
-      for (const task of inner.tasks) {
-        const act = rewriteTask(task, opts);
-        if (act) actions.push(act);
-      }
-    } else if (typeof inner.payload === 'string') {
-      const act = rewriteTask(inner, opts); // stateless task envelope
-      if (act) actions.push(act);
-    }
+    let changed = false;
+    const look = (task) => {
+      const r = rewriteTask(task, opts);
+      if (!r) return;
+      actions.push(r.action);
+      if (r.changed) changed = true;
+    };
+    if (Array.isArray(inner.tasks)) inner.tasks.forEach(look);
+    else if (typeof inner.payload === 'string') look(inner); // stateless task envelope
     if (!actions.length) return null;
+    if (!changed) return { text: null, actions };
     env.payload = stringifyExact(inner);
     return { text: stringifyExact(env), actions };
   }
 
   /**
-   * Rewrites a binary outgoing WebSocket message (DGW or MQTT). Returns
-   * {bytes, actions} when changed, otherwise null.
+   * Looks at a binary outgoing WebSocket message (DGW or MQTT). Returns null, or
+   * {bytes, actions} where bytes is null when the message must go out unchanged.
    */
   function rewriteOutgoingBytes(u8, kind, opts) {
     if (!u8 || u8.length > MAX_SCAN_BYTES) return null;
@@ -797,14 +797,17 @@
         if ((f.type === DGW.DATA || f.type === DGW.EXT_DATA) && f.payload && f.payload[0] === 0x7b) {
           const res = rewriteRequestText(utf8Decode(f.payload), opts);
           if (res) {
-            changed = true;
             actions.push(...res.actions);
-            return dgwEncodeData(f, utf8Encode(res.text));
+            if (res.text !== null) {
+              changed = true;
+              return dgwEncodeData(f, utf8Encode(res.text));
+            }
           }
         }
         return f.raw;
       });
-      return changed ? { bytes: concatBytes(parts), actions } : null;
+      if (!actions.length) return null;
+      return { bytes: changed ? concatBytes(parts) : null, actions };
     }
     if (kind === 'mqtt') {
       const packets = mqttParse(u8);
@@ -815,14 +818,17 @@
         if (p.type === 3 && p.payload && p.payload[0] === 0x7b) {
           const res = rewriteRequestText(utf8Decode(p.payload), opts);
           if (res) {
-            changed = true;
             actions.push(...res.actions);
-            return mqttEncodePublish(p, utf8Encode(res.text));
+            if (res.text !== null) {
+              changed = true;
+              return mqttEncodePublish(p, utf8Encode(res.text));
+            }
           }
         }
         return p.raw;
       });
-      return changed ? { bytes: concatBytes(parts), actions } : null;
+      if (!actions.length) return null;
+      return { bytes: changed ? concatBytes(parts) : null, actions };
     }
     return null;
   }
@@ -876,6 +882,7 @@
     }
 
     const doc = win.document;
+    const lateInjected = doc.readyState !== 'loading';
     const CustomEventCtor = win.CustomEvent;
     const dispatch = win.EventTarget.prototype.dispatchEvent;
 
@@ -887,6 +894,7 @@
         blockSeen: true,
         blockTyping: true,
         stealthFocus: true,
+        stealthVisibility: false,
       },
       ready: false,
       owner: null,
@@ -901,7 +909,9 @@
         unsent: 0,
         edits: 0,
         seenBlocked: 0,
+        seenUnknown: 0, // "Seen" that could not be held back (chat's read marker not known yet)
         typingBlocked: 0,
+        lateInjected, // hook added after the page had started (after an install/update)
         httpPayloads: 0,
         notifications: 0,
         errors: 0,
@@ -1004,8 +1014,19 @@
     function kindOf(ws) {
       let k = socketKinds.get(ws);
       if (!k) {
+        // a socket opened before this hook was added: start reading it now
         k = socketKind(ws && ws.url);
         socketKinds.set(ws, k);
+        state.diag.sockets[k] = (state.diag.sockets[k] || 0) + 1;
+        if (k === 'dgw' || k === 'mqtt') {
+          try {
+            ws.addEventListener('message', function (ev) {
+              onIncoming(ws, ev.data);
+            });
+          } catch (e) {
+            noteError(e);
+          }
+        }
       }
       return k;
     }
@@ -1048,13 +1069,14 @@
         const res = rewriteRequestText(data, opts);
         if (!res) return data;
         recordActions(res.actions);
-        return res.text;
+        return res.text === null ? data : res.text;
       }
       const u8 = asBytes(data);
       if (!u8) return data; // Blob payloads cannot be rewritten synchronously
       const res = rewriteOutgoingBytes(u8, kind, opts);
       if (!res) return data;
       recordActions(res.actions);
+      if (!res.bytes) return data;
       // keep the caller's type: ArrayBuffer in -> ArrayBuffer out
       if (data instanceof ArrayBuffer) return res.bytes.buffer.slice(res.bytes.byteOffset, res.bytes.byteOffset + res.bytes.byteLength);
       return res.bytes;
@@ -1064,6 +1086,7 @@
       for (const a of actions) {
         if (a.type === 'seen-blocked') state.diag.seenBlocked++;
         else if (a.type === 'typing-blocked') state.diag.typingBlocked++;
+        else if (a.type === 'seen-unknown') state.diag.seenUnknown++;
       }
       state.diagDirty = true;
       emit('unseen-actions', actions);
@@ -1287,21 +1310,27 @@
       };
     }
 
-    /* ---------------- Stealth focus: page always looks "in the background" ---------------- */
-    // Messenger only marks a chat as read while the tab is visible and focused. Faking
-    // "hidden + unfocused" stops "Seen" in encrypted chats too, where the network
-    // traffic itself cannot be read or changed.
+    /* ---------------- Strong mode: the page looks unfocused ---------------- */
+    // Messenger marks a chat as read only while the window has focus. Reporting "no focus"
+    // keeps it from sending "Seen" in encrypted chats too, where the traffic cannot be read.
+    // The page's visibility stays real (Facebook needs it to recover its encrypted-chat
+    // engine when several tabs are open); faking "hidden" as well is a separate, off-by-
+    // default option, and visibilitychange events are never blocked.
 
-    function stealth() {
+    function stealthFocus() {
       const s = state.settings;
       return active() && !!s.blockSeen && !!s.stealthFocus;
+    }
+
+    function stealthHidden() {
+      return stealthFocus() && !!state.settings.stealthVisibility;
     }
 
     try {
       const DocProto = win.Document.prototype;
       const nativeHasFocus = DocProto.hasFocus;
       DocProto.hasFocus = function hasFocus() {
-        return stealth() ? false : nativeHasFocus.call(this);
+        return stealthFocus() ? false : nativeHasFocus.call(this);
       };
       const patchGetter = (name, fakeValue) => {
         const desc = Object.getOwnPropertyDescriptor(DocProto, name);
@@ -1310,7 +1339,7 @@
           configurable: true,
           enumerable: desc.enumerable,
           get: function () {
-            return stealth() ? fakeValue : desc.get.call(this);
+            return stealthHidden() ? fakeValue : desc.get.call(this);
           },
         });
       };
@@ -1318,12 +1347,14 @@
       patchGetter('hidden', true);
       patchGetter('webkitVisibilityState', 'hidden');
       patchGetter('webkitHidden', true);
-      const swallow = function (e) {
-        if (stealth() && (e.target === win || e.target === doc)) e.stopImmediatePropagation();
-      };
-      win.addEventListener('focus', swallow, true);
-      doc.addEventListener('visibilitychange', swallow, true);
-      doc.addEventListener('webkitvisibilitychange', swallow, true);
+      // window focus events would tell Messenger the user is looking at the chat
+      win.addEventListener(
+        'focus',
+        function (e) {
+          if (stealthFocus() && (e.target === win || e.target === doc)) e.stopImmediatePropagation();
+        },
+        true
+      );
     } catch (e) {
       noteError(e);
     }

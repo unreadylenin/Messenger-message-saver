@@ -66,18 +66,24 @@ async function checkActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab || !tab.url || !/^https:\/\/(www|web)\.(facebook|messenger)\.com\//.test(tab.url)) return;
   const key = 'diag:' + tab.id;
-  const got = await chrome.storage.session.get(key);
-  if (!got[key]) {
+  let diag = (await chrome.storage.session.get(key))[key];
+  if (!diag) {
     // give a freshly loaded page a moment to report in
     await new Promise((r) => setTimeout(r, 1200));
-    const again = await chrome.storage.session.get(key);
-    if (again[key]) return;
-    $('#reload-hint').hidden = false;
-    $('#reload-tab').addEventListener('click', () => {
-      chrome.tabs.reload(tab.id);
-      window.close();
-    });
+    diag = (await chrome.storage.session.get(key))[key];
   }
+  const s = await getSettings();
+  let text = '';
+  if (!diag) text = 'Reload this Facebook tab once so the extension can start working here.';
+  else if (diag.lateInjected && s.blockSeen) text = 'This tab was open before the extension started. Reload it so Unseen covers every chat.';
+  else if (diag.seenUnknown > 0 && s.blockSeen) text = '“Seen” may have been sent in a chat whose read state was not known yet. Reload this tab to be safe.';
+  if (!text) return;
+  $('#reload-text').textContent = text;
+  $('#reload-hint').hidden = false;
+  $('#reload-tab').addEventListener('click', () => {
+    chrome.tabs.reload(tab.id);
+    window.close();
+  });
 }
 
 function openDashboard(hash = '') {

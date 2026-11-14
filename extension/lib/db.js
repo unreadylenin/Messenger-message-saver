@@ -293,18 +293,35 @@ export async function searchMessages(query, { threadKey = null, status = null, l
 
 /* ---------------- maintenance ---------------- */
 
-export async function deleteThread(threadKey) {
+/** Deletes photos that no saved message points to any more (photos can be shared by several messages). */
+export async function collectUnusedMedia() {
+  const used = new Set();
+  for (const m of await getAll('messages')) for (const a of m.attachments || []) if (a.mediaKey) used.add(a.mediaKey);
+  const keys = await withStores(['media'], 'readonly', (s) => reqP(s.media.getAllKeys()));
+  const unused = keys.filter((k) => !used.has(k));
+  if (unused.length) await withStores(['media'], 'readwrite', async (s) => unused.forEach((k) => s.media.delete(k)));
+  return unused.length;
+}
+
+/**
+ * Deletes everything saved from one chat: messages, their unsend/edit history entries,
+ * id aliases, queued photo downloads, Messenger notification copies titled with the chat's
+ * name, and photos no other chat uses.
+ */
+export async function deleteThread(threadKey, { name = '' } = {}) {
   const msgs = await messagesByThread(threadKey);
   const keys = new Set(msgs.map((m) => m.key));
-  const aliases = await getAll('aliases');
-  await withStores(['messages', 'threads', 'media', 'aliases'], 'readwrite', async (s) => {
-    for (const m of msgs) {
-      s.messages.delete(m.key);
-      for (const a of m.attachments || []) if (a.mediaKey) s.media.delete(a.mediaKey);
-    }
+  const [aliases, pending, events, notifications] = await Promise.all(['aliases', 'pendingMedia', 'events', 'notifications'].map(getAll));
+  const title = normalizeText(name).toLowerCase();
+  await withStores(['messages', 'threads', 'aliases', 'pendingMedia', 'events', 'notifications'], 'readwrite', async (s) => {
+    for (const m of msgs) s.messages.delete(m.key);
     for (const al of aliases) if (keys.has(al.messageKey)) s.aliases.delete(al.domId);
+    for (const j of pending) if (keys.has(j.messageKey)) s.pendingMedia.delete(j.id);
+    for (const e of events) if (e.threadKey === threadKey || keys.has(e.messageKey)) s.events.delete(e.id);
+    if (title) for (const n of notifications) if (normalizeText(n.title).toLowerCase() === title) s.notifications.delete(n.id);
     s.threads.delete(threadKey);
   });
+  await collectUnusedMedia();
   return msgs.length;
 }
 
@@ -324,8 +341,6 @@ export async function prune(retentionDays) {
       req.onsuccess = () => {
         const cur = req.result;
         if (!cur) return resolve();
-        const m = cur.value;
-        for (const a of m.attachments || []) if (a.mediaKey) s.media.delete(a.mediaKey);
         cur.delete();
         removed++;
         cur.continue();
@@ -347,6 +362,7 @@ export async function prune(retentionDays) {
       }
     };
   });
+  if (removed) await collectUnusedMedia();
   return removed;
 }
 
@@ -472,6 +488,10 @@ export async function importAll(data) {
   const counts = { messages: 0, threads: 0, contacts: 0, media: 0 };
   const existing = new Map();
   if ((data.messages || []).length) for (const m of await getAll('messages')) existing.set(m.key, m);
+  const threadsNow = new Map((data.threads || []).length ? (await getAll('threads')).map((t) => [t.threadKey, t]) : []);
+  const contactsNow = new Map((data.contacts || []).length ? (await getAll('contacts')).map((c) => [c.id, c]) : []);
+  const notifSeen = new Set((data.notifications || []).length ? (await getAll('notifications')).map((n) => [n.ts, n.title, n.body].join('|')) : []);
+  const eventSeen = new Set((data.events || []).length ? (await getAll('events')).map((e) => [e.type, e.messageKey, e.at].join('|')) : []);
   await withStores(['messages', 'threads', 'contacts', 'notifications', 'events', 'media', 'aliases'], 'readwrite', async (s) => {
     for (const a of data.aliases || []) if (a && a.domId && a.messageKey) s.aliases.put(a);
     for (const m of data.messages || []) {
@@ -481,18 +501,24 @@ export async function importAll(data) {
       counts.messages++;
     }
     for (const t of data.threads || []) {
-      s.threads.put(t);
+      s.threads.put(mergeRecord(threadsNow.get(t.threadKey), t, ['ambiguous']));
       counts.threads++;
     }
     for (const c of data.contacts || []) {
-      s.contacts.put(c);
+      s.contacts.put(mergeRecord(contactsNow.get(c.id), c, []));
       counts.contacts++;
     }
     for (const n of data.notifications || []) {
+      const k = [n.ts, n.title, n.body].join('|');
+      if (notifSeen.has(k)) continue;
+      notifSeen.add(k);
       const { id, ...rest } = n;
       s.notifications.add(rest);
     }
     for (const e of data.events || []) {
+      const k = [e.type, e.messageKey, e.at].join('|');
+      if (eventSeen.has(k)) continue;
+      eventSeen.add(k);
       const { id, ...rest } = e;
       s.events.add(rest);
     }
@@ -503,6 +529,18 @@ export async function importAll(data) {
     }
   });
   return counts;
+}
+
+/** Field-by-field merge: the newer record wins, empty values never overwrite, sticky flags stay set. */
+function mergeRecord(current, incoming, sticky) {
+  if (!current) return incoming;
+  const newer = (incoming.updatedAt || 0) > (current.updatedAt || 0);
+  const [base, over] = newer ? [current, incoming] : [incoming, current];
+  const out = { ...base };
+  for (const [k, v] of Object.entries(over)) if (v !== '' && v !== null && v !== undefined) out[k] = v;
+  for (const k of sticky) if (current[k] || incoming[k]) out[k] = true;
+  if (out.ambiguous) delete out.aliasFor;
+  return out;
 }
 
 function mergeImported(a, b) {
@@ -519,13 +557,14 @@ function mergeImported(a, b) {
     seen.add(k);
     return true;
   });
-  const atts = [...(a.attachments || []), ...(b.attachments || [])];
-  const seenA = new Set();
-  out.attachments = atts.filter((x) => {
+  // same attachment in both: keep one, and keep whichever copy knows its saved photo
+  const byKey = new Map();
+  for (const x of [...(a.attachments || []), ...(b.attachments || [])]) {
     const k = x.fbid || x.url || x.previewUrl || JSON.stringify(x);
-    if (seenA.has(k)) return false;
-    seenA.add(k);
-    return true;
-  });
+    const prev = byKey.get(k);
+    if (!prev) byKey.set(k, { ...x });
+    else for (const [f, v] of Object.entries(x)) if (v && !prev[f]) prev[f] = v;
+  }
+  out.attachments = [...byKey.values()];
   return out;
 }

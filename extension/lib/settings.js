@@ -19,7 +19,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
   badge: true,
   // --- unseen ---
   blockSeen: true, // don't tell others you've read their messages
-  stealthFocus: true, // strong mode: page looks "in background" (needed for encrypted chats)
+  stealthFocus: true, // strong mode: the page reports "no focus" so encrypted chats don't send Seen
+  stealthVisibility: false, // also report the tab as hidden (can break encrypted chats with several tabs)
   blockTyping: true, // don't show "typing..." to others
 });
 

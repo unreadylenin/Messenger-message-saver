@@ -123,7 +123,7 @@ test('Unseen: mark-read task is rewound, other tasks and big ids untouched (DGW)
   const watermarks = new Map([[THREAD, 1731571000000]]);
   const res = mw.rewriteOutgoingBytes(original, 'dgw', { blockSeen: true, blockTyping: true, readWatermarks: watermarks });
   assert.ok(res, 'should rewrite');
-  assert.deepEqual(res.actions, [{ type: 'seen-blocked', thread: THREAD, from: '1731571860000', to: 1731571000000 }]);
+  assert.deepEqual(res.actions, [{ type: 'seen-blocked', thread: THREAD, label: '21', from: '1731571860000', to: 1731571000000 }]);
 
   const frames = mw.dgwParse(res.bytes);
   assert.equal(frames.length, 2);
@@ -142,17 +142,42 @@ test('Unseen: mark-read task is rewound, other tasks and big ids untouched (DGW)
   assert.equal(inner.tasks[1].task_id, 4);
 });
 
-test('Unseen: mark-read with no known watermark falls back to 0; non-advancing read untouched', () => {
+test('Unseen: unknown read marker -> request left alone and reported; non-advancing read untouched', () => {
   const readPayload = `{"thread_id":${THREAD},"last_read_watermark_ts":1731571860000,"sync_group":1}`;
   const req = h.taskRequest([{ label: '21', payload: readPayload, queue: THREAD, taskId: 4 }]);
-  const res = mw.rewriteRequestText(req, { blockSeen: true, blockTyping: false, readWatermarks: new Map() });
-  assert.equal(JSON.parse(JSON.parse(JSON.parse(res.text).payload).tasks[0].payload).last_read_watermark_ts, 0);
+  const unknown = mw.rewriteRequestText(req, { blockSeen: true, blockTyping: false, readWatermarks: new Map() });
+  assert.equal(unknown.text, null, 'never rewritten to 0 (that would mark the chat unread)');
+  assert.deepEqual(unknown.actions, [{ type: 'seen-unknown', thread: THREAD, label: '21' }]);
 
   const notAdvancing = mw.rewriteRequestText(req, { blockSeen: true, blockTyping: false, readWatermarks: new Map([[THREAD, 1731571860000]]) });
   assert.equal(notAdvancing, null);
 
   const off = mw.rewriteRequestText(req, { blockSeen: false, blockTyping: true, readWatermarks: new Map() });
   assert.equal(off, null);
+});
+
+test('Unseen: the label-49 read task (thread_key, ..._timestamp_ms) is rewound too', () => {
+  const t49 = `{"thread_key":${THREAD},"last_read_watermark_timestamp_ms":1790754536981,"sync_group":1}`;
+  const t21 = `{"thread_id":${THREAD},"last_read_watermark_ts":1790754536981,"sync_group":1}`;
+  const req = h.taskRequest([
+    { label: '49', payload: t49, queue: THREAD, taskId: 7 },
+    { label: '21', payload: t21, queue: THREAD, taskId: 8 },
+  ]);
+  const res = mw.rewriteRequestText(req, { blockSeen: true, blockTyping: false, readWatermarks: new Map([[THREAD, 1790750000000]]) });
+  const tasks = JSON.parse(JSON.parse(res.text).payload).tasks;
+  assert.equal(JSON.parse(tasks[0].payload).last_read_watermark_timestamp_ms, 1790750000000);
+  assert.equal(JSON.parse(tasks[1].payload).last_read_watermark_ts, 1790750000000);
+  assert.deepEqual(res.actions.map((a) => a.label), ['49', '21']);
+
+  // "Mark as unread" (an older marker) is the user's own choice: left alone
+  const unread = h.taskRequest([{ label: '49', payload: `{"thread_key":${THREAD},"last_read_watermark_timestamp_ms":1700000000000,"sync_group":1}`, queue: THREAD, taskId: 9 }]);
+  assert.equal(mw.rewriteRequestText(unread, { blockSeen: true, blockTyping: false, readWatermarks: new Map([[THREAD, 1790750000000]]) }), null);
+});
+
+test('Unseen: a sent message that merely mentions last_read_watermark_ts is never touched', () => {
+  const send = `{"thread_id":${THREAD},"otid":"7123456789012345678","text":"grep last_read_watermark_ts in the logs","sync_group":1}`;
+  const req = h.taskRequest([{ label: '46', payload: send, queue: THREAD, taskId: 3 }]);
+  assert.equal(mw.rewriteRequestText(req, { blockSeen: true, blockTyping: true, readWatermarks: new Map() }), null);
 });
 
 test('Unseen: typing indicator is turned into "not typing"', () => {
@@ -179,14 +204,14 @@ test('Unseen: MQTT /ls_req publish is rewritten with a correct remaining length'
   const readPayload = `{"thread_id":${THREAD},"last_read_watermark_ts":1731571860000,"sync_group":1}`;
   const req = h.taskRequest([{ label: '21', payload: readPayload, queue: THREAD, taskId: 4 }]);
   const pkt = h.mqttPublish('/ls_req', req, { qos: 1, packetId: 77 });
-  const res = mw.rewriteOutgoingBytes(pkt, 'mqtt', { blockSeen: true, blockTyping: true, readWatermarks: new Map() });
-  assert.ok(res);
+  const res = mw.rewriteOutgoingBytes(pkt, 'mqtt', { blockSeen: true, blockTyping: true, readWatermarks: new Map([[THREAD, 1731571000000]]) });
+  assert.ok(res && res.bytes);
   const parsed = mw.mqttParse(res.bytes);
   assert.equal(parsed.length, 1);
   assert.equal(parsed[0].topic, '/ls_req');
   assert.equal(parsed[0].packetId, 77);
   const inner = JSON.parse(JSON.parse(dec.decode(parsed[0].payload)).payload);
-  assert.equal(JSON.parse(inner.tasks[0].payload).last_read_watermark_ts, 0);
+  assert.equal(JSON.parse(inner.tasks[0].payload).last_read_watermark_ts, 1731571000000);
 });
 
 test('socketKind classifies Messenger sockets', () => {

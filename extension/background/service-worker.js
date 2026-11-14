@@ -124,6 +124,17 @@ function sameText(a, b) {
   return normalizeText(a).toLowerCase() === normalizeText(b).toLowerCase();
 }
 
+/**
+ * An edit is a change reported by the same source (Messenger's data, or the screen) that
+ * reported the earlier text: the two sources can format the same message differently.
+ */
+function isNewVersion(rec, source, text) {
+  const before = rec.srcText && rec.srcText[source];
+  if (!normalizeText(before) || sameText(before, text)) return false;
+  if (sameText(rec.text, text)) return false;
+  return !(rec.history || []).some((h) => sameText(h.text, text));
+}
+
 function hasContent(rec) {
   return !!(normalizeText(rec.text) || (rec.attachments && rec.attachments.length));
 }
@@ -256,7 +267,7 @@ async function ingestLs(ev, ctx) {
         if (m.ts && (!rec.ts || rec.ts === rec.capturedAt)) rec.ts = m.ts;
         if (m.text && !rec.unsent) {
           if (!normalizeText(rec.text)) rec.text = m.text;
-          else if (!sameText(rec.text, m.text)) {
+          else if (isNewVersion(rec, 'network', m.text)) {
             rec.history = [...(rec.history || []), { text: rec.text, at: now }];
             rec.text = m.text;
             rec.edited = true;
@@ -266,6 +277,7 @@ async function ingestLs(ev, ctx) {
           }
         }
       }
+      if (m.text) rec.srcText = { ...(rec.srcText || {}), network: m.text };
       addSource(rec, 'network');
       touched.set(key, rec);
     }
@@ -293,6 +305,7 @@ async function ingestLs(ev, ctx) {
       if (!rec) continue;
       if (e.text && !sameText(e.text, rec.text)) {
         if (normalizeText(rec.text)) rec.history = [...(rec.history || []), { text: rec.text, at: now }];
+        rec.srcText = { ...(rec.srcText || {}), network: e.text };
         rec.text = e.text;
         rec.edited = true;
         rec.editedAt = now;
@@ -508,19 +521,17 @@ async function ingestDom(batch, ctx) {
           rec.ts = it.ts;
           rec.approxTime = false;
         }
-        // same message, different text on screen: it was edited
-        if (text && normalizeText(rec.text) && !sameText(rec.text, text) && !rec.unsent) {
-          const knownBefore = (rec.history || []).some((h) => sameText(h.text, text));
-          if (!knownBefore) {
-            rec.history = [...(rec.history || []), { text: rec.text, at: now }];
-            rec.text = text;
-            rec.edited = true;
-            rec.editedAt = now;
-            st.events.add({ type: 'edited', messageKey: rec.key, threadKey: rec.threadKey, at: now, text });
-            notices.push({ kind: 'edited', rec });
-          }
+        // same message, different text on screen than the screen showed before: it was edited
+        if (text && normalizeText(rec.text) && !rec.unsent && isNewVersion(rec, 'screen', text)) {
+          rec.history = [...(rec.history || []), { text: rec.text, at: now }];
+          rec.text = text;
+          rec.edited = true;
+          rec.editedAt = now;
+          st.events.add({ type: 'edited', messageKey: rec.key, threadKey: rec.threadKey, at: now, text });
+          notices.push({ kind: 'edited', rec });
         } else if (text && !normalizeText(rec.text)) rec.text = text;
       }
+      if (text) rec.srcText = { ...(rec.srcText || {}), screen: text };
       rec.lastSeenAt = now;
       for (const im of images) {
         const att = mergeAttachment(rec, {
@@ -908,9 +919,9 @@ async function saveMedia(job) {
   }
   await serial(() =>
     db.withStores(['media', 'messages'], 'readwrite', async (st) => {
-      if (!existing) st.media.put({ key: mediaKey, blob, mime: blob.type, size: blob.size, url: job.url || '', messageKey: job.messageKey, savedAt: Date.now() });
       const rec = await reqP(st.messages.get(job.messageKey));
-      if (!rec) return;
+      if (!rec) return; // the message was deleted meanwhile: do not keep its photo
+      if (!existing) st.media.put({ key: mediaKey, blob, mime: blob.type, size: blob.size, url: job.url || '', messageKey: job.messageKey, savedAt: Date.now() });
       for (const a of rec.attachments || []) {
         const match = (job.fbid && a.fbid === job.fbid) || (job.url && (a.previewUrl === job.url || a.playableUrl === job.url));
         if (match || (!job.fbid && !job.url && !a.mediaKey)) {
@@ -981,6 +992,10 @@ async function countUnseen(actions) {
   for (const a of actions) {
     if (a.type === 'seen-blocked') stats.seenBlocked = (stats.seenBlocked || 0) + 1;
     if (a.type === 'typing-blocked') stats.typingBlocked = (stats.typingBlocked || 0) + 1;
+    if (a.type === 'seen-unknown') {
+      stats.seenUnknown = (stats.seenUnknown || 0) + 1;
+      stats.seenUnknownAt = Date.now();
+    }
   }
   await chrome.storage.local.set({ stats });
 }

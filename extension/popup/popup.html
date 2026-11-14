@@ -21,7 +21,7 @@
     </header>
 
     <div id="reload-hint" class="hint" hidden>
-      <span>Reload this Facebook tab once so the extension can start working here.</span>
+      <span id="reload-text">Reload this Facebook tab once so the extension can start working here.</span>
       <button id="reload-tab" class="btn small">Reload tab</button>
     </div>
 
@@ -46,7 +46,7 @@
         <span class="switch"><input type="checkbox" data-setting="blockSeen" /><span></span></span>
       </label>
       <label class="row sub" id="row-stealth">
-        <span class="label">Strong mode (encrypted chats)<small>Messenger thinks the tab is in the background</small></span>
+        <span class="label">Strong mode (encrypted chats)<small>Messenger is told the window isn’t focused</small></span>
         <span class="switch"><input type="checkbox" data-setting="stealthFocus" /><span></span></span>
       </label>
       <label class="row">

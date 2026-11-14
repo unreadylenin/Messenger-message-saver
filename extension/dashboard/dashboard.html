@@ -115,9 +115,10 @@
           <div class="panel">
             <h3>Unseen</h3>
             <label class="srow"><span>Don't send “Seen”</span><span class="switch"><input type="checkbox" data-setting="blockSeen" /><span></span></span></label>
-            <label class="srow"><span>Strong mode for encrypted chats<small>Messenger thinks the tab is in the background, so it never reports “Seen”. Side effect: Messenger may play its message sound while you are on the page.</small></span><span class="switch"><input type="checkbox" data-setting="stealthFocus" /><span></span></span></label>
+            <label class="srow"><span>Strong mode for encrypted chats<small>Messenger is told the window is not focused, so it does not report “Seen”. Side effect: Messenger may play its message sound or show a notification while you are reading.</small></span><span class="switch"><input type="checkbox" data-setting="stealthFocus" /><span></span></span></label>
+            <label class="srow"><span>Extra: also report the tab as hidden<small>Only if Strong mode alone is not enough. With several Facebook tabs open, encrypted chats can stop loading until you reload the tab, and feed videos may not start.</small></span><span class="switch"><input type="checkbox" data-setting="stealthVisibility" /><span></span></span></label>
             <label class="srow"><span>Don't show “typing…”<small>Works in normal (not end-to-end encrypted) chats</small></span><span class="switch"><input type="checkbox" data-setting="blockTyping" /><span></span></span></label>
-            <p class="muted small">Replying to a chat always shows “Seen” - that is how Messenger works.</p>
+            <p class="muted small">Replying to a chat always shows “Seen” - that is how Messenger works. Right after installing or updating, reload open Facebook tabs so every chat is covered.</p>
           </div>
           <div class="panel">
             <h3>Backup</h3>
