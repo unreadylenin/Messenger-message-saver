@@ -875,7 +875,10 @@
           visibleTexts,
           visibleDomIds,
         });
-        const found = new Map(((res && res.results) || []).map((x) => [x.pid, x]));
+        if (!extensionAlive) return; // retired while waiting
+        // no answer (e.g. the background worker was restarting): try again, show nothing yet
+        const answered = !!(res && Array.isArray(res.results));
+        const found = new Map((answered ? res.results : []).map((x) => [x.pid, x]));
         for (const ph of ask) {
           const hit = found.get(ph.pid);
           if (hit) {
@@ -883,10 +886,10 @@
             renderRecovered(ph.row, hit);
           } else if (ph.local && ph.local.text) {
             renderRecovered(ph.row, { text: ph.local.text, media: [], senderName: ph.local.senderName, ts: ph.local.ts, confidence: 'high', live: true });
-          } else {
+          } else if (answered) {
             renderNotCaptured(ph.row);
             state.retryNeeded = true;
-          }
+          } else state.retryNeeded = true;
         }
       }
     }
@@ -899,6 +902,7 @@
       const need = edited.filter((r) => !r.row.querySelector('.mms-edit-history'));
       if (need.length) {
         const res = await send({ type: 'lookup-edited', thread: { id: thread.id, name: thread.name }, items: need.map((r) => ({ text: r.text, domId: r.domId })) });
+        if (!extensionAlive) return;
         const byKey = new Map(((res && res.results) || []).map((x) => [x.domId || norm(x.text), x.history]));
         for (const r of need) {
           const hist = byKey.get(r.domId) || byKey.get(norm(r.text));
