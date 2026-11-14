@@ -1098,8 +1098,36 @@
 
     /* ---------------- HTTP (GraphQL) replies ---------------- */
 
+    // Only Messenger requests are read; the busy news feed is left alone.
+    const MESSENGER_HINT = /lightspeed|LSPlatform|messenger|messaging|MAW|inbox|thread/i;
+
     function interestingUrl(url) {
-      return /\/api\/graphql|\/ajax\/|lightspeed|\/messaging\//i.test(String(url || ''));
+      const u = String(url || '');
+      if (/lightspeed|\/messaging\/|\/messages\//i.test(u)) return 'yes';
+      return /\/api\/graphql|\/ajax\//i.test(u) ? 'maybe' : '';
+    }
+
+    /** Looks at a GraphQL request body for Messenger's query names. */
+    function bodyLooksMessenger(body) {
+      try {
+        if (!body) return false;
+        if (typeof body === 'string') return MESSENGER_HINT.test(body.slice(0, 4000));
+        if (body instanceof win.URLSearchParams) return MESSENGER_HINT.test(body.get('fb_api_req_friendly_name') || body.toString().slice(0, 4000));
+        if (body instanceof win.FormData) return MESSENGER_HINT.test(String(body.get('fb_api_req_friendly_name') || ''));
+      } catch (e) {
+        /* unreadable body */
+      }
+      return false;
+    }
+
+    function headerLooksMessenger(headers) {
+      try {
+        if (!headers) return false;
+        const get = (k) => (typeof headers.get === 'function' ? headers.get(k) : headers[k] || headers[k.toLowerCase()]);
+        return MESSENGER_HINT.test(String(get('X-FB-Friendly-Name') || get('x-fb-friendly-name') || ''));
+      } catch (e) {
+        return false;
+      }
     }
 
     function handleHttpText(text) {
@@ -1120,8 +1148,11 @@
           const p = Reflect.apply(target, thisArg, args);
           try {
             const req = args[0];
+            const init = args[1] || {};
             const url = typeof req === 'string' ? req : req && req.url;
-            if (interestingUrl(url) && p && typeof p.then === 'function') {
+            const kind = interestingUrl(url);
+            const wanted = kind === 'yes' || (kind === 'maybe' && (bodyLooksMessenger(init.body) || headerLooksMessenger(init.headers) || headerLooksMessenger(req && req.headers)));
+            if (wanted && p && typeof p.then === 'function') {
               p.then(
                 (resp) => {
                   try {
@@ -1155,10 +1186,11 @@
         }
         return xopen.apply(this, arguments);
       };
-      XHR.prototype.send = function send() {
+      XHR.prototype.send = function send(body) {
         try {
           const url = xhrUrls.get(this);
-          if (interestingUrl(url)) {
+          const kind = interestingUrl(url);
+          if (kind === 'yes' || (kind === 'maybe' && bodyLooksMessenger(body))) {
             this.addEventListener('load', function () {
               try {
                 if (this.responseType === '' || this.responseType === 'text') handleHttpText(this.responseText);

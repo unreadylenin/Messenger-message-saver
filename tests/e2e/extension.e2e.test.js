@@ -54,9 +54,11 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
   if (!sw) sw = await ctx.waitForEvent('serviceworker', { timeout: 20000 });
   const extId = sw.url().split('/')[2];
 
-  // fake facebook.com
+  // fake facebook.com (GraphQL answers with whatever the current test put in graphqlReply)
+  let graphqlReply = '{}';
   await ctx.route('https://www.facebook.com/**', (route) => {
     if (route.request().resourceType() === 'document') return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: FIXTURE });
+    if (route.request().url().includes('/api/graphql/')) return route.fulfill({ status: 200, contentType: 'text/javascript; charset=utf-8', body: 'for (;;);' + graphqlReply });
     return route.fulfill({ status: 204, body: '' });
   });
   await ctx.grantPermissions(['notifications'], { origin: 'https://www.facebook.com' });
@@ -120,6 +122,23 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     assert.ok(contacts.some((c) => c.id === THREAD && c.name === 'Khondoker Aurthe'));
     const notes = await sw.evaluate(() => new Promise((r) => chrome.notifications.getAll(r)));
     assert.ok(Object.keys(notes).some((k) => k.startsWith('mms|')), 'desktop alert shown for the unsend');
+  });
+
+  await t.test('GraphQL: Messenger queries are read, news-feed queries are ignored', async () => {
+    const lsDoc = (text, id) => JSON.stringify({ data: { viewer: { lightspeed_web_request: { payload: h.lsPayload([h.insertMessage({ text, threadKey: THREAD, ts: 1731571865000, id, senderId: THREAD })]), dependencies: [] } } } });
+    graphqlReply = lsDoc('from graphql', 'mid.$gql1');
+    await page.evaluate(() => fetch('/api/graphql/', { method: 'POST', body: new URLSearchParams({ fb_api_req_friendly_name: 'LSPlatformGraphQLLightspeedRequestQuery', variables: '{}' }) }).then((r) => r.text()));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$gql1' && m.text === 'from graphql'), { what: 'GraphQL message saved' });
+    graphqlReply = lsDoc('feed noise', 'mid.$feed1');
+    await page.evaluate(() => fetch('/api/graphql/', { method: 'POST', body: new URLSearchParams({ fb_api_req_friendly_name: 'CometNewsFeedPaginationQuery', variables: '{}' }) }).then((r) => r.text()));
+    await page.evaluate(() => new Promise((resolve) => {
+      const x = new XMLHttpRequest();
+      x.open('POST', '/api/graphql/');
+      x.onload = resolve;
+      x.send('fb_api_req_friendly_name=CometNewsFeedPaginationQuery');
+    }));
+    await new Promise((r) => setTimeout(r, 800));
+    assert.equal((await dbAll('messages')).some((m) => m.key === 'fb:mid.$feed1'), false, 'feed requests are not read');
   });
 
   await t.test('Unseen: "Seen" is rewound and "typing" is cleared before leaving the browser', async () => {

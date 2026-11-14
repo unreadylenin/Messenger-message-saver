@@ -57,7 +57,8 @@ Click **Remove** on the extension's card. This also deletes everything it saved 
 
 - **A message can only be recovered if it reached this browser before it was unsent.** Keep facebook.com or messenger.com open in a tab (a chat pop-up or the Messages page). Messages unsent while Facebook was closed on this computer cannot be recovered.
 - **End-to-end encrypted chats** (most one-to-one chats now) cannot be read from Messenger's network data, because it is encrypted. For these chats the extension saves what is **shown on screen** and copies of **Messenger notifications**. So the chat (pop-up or page) must have been open, or a notification must have appeared, before the unsend.
-- **Unseen in encrypted chats** uses *Strong mode*: Messenger is made to think the tab is in the background, so it does not report "Seen". Side effect: Messenger may play its message sound while you are on the page. Replying to a chat always marks it as seen — that is how Messenger works.
+- **Unseen in encrypted chats** uses *Strong mode*: Messenger is made to think the tab is in the background, so it does not report "Seen". Side effects: Messenger may play its message sound while you are on the page, and videos in the Facebook feed may not start on their own. Replying to a chat always marks it as seen — that is how Messenger works.
+- **Check Unseen once with a friend** before relying on it: ask them to message you, open the chat, and ask whether they see "Seen". Facebook can change how "Seen" is sent at any time.
 - **"Typing…"** can only be hidden in normal (non-encrypted) chats.
 - Facebook changes its website often. If something stops working, open **Settings → Diagnostics** on the Saved Messages page.
 
