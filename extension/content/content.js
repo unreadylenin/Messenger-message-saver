@@ -1,0 +1,829 @@
+/*
+ * Messenger Message Saver - content script (extension's private "isolated world").
+ *
+ * 1. Passes settings to the page hook (main-world.js) and forwards what it captures
+ *    to the background worker.
+ * 2. Reads the messages shown on screen (chat pop-ups on facebook.com, the full
+ *    facebook.com/messages page and messenger.com). This also works for end-to-end
+ *    encrypted chats, whose network traffic cannot be read.
+ * 3. Under every "X unsent a message" it shows the saved original, and under edited
+ *    messages it shows the earlier text.
+ *
+ * Page structure used (checked against live captures, Oct-Nov 2026):
+ *   message list  : [role="log"]
+ *   message row   : [data-scope="messages_table"] with aria-roledescription="message",
+ *                   data-message-id="<sender id>@msgr.<id>", aria-label="At <time>, <Sender>: <text>"
+ *   date separator: [data-scope="date_break"]
+ *   text          : span[dir="auto"] > div[dir="auto"] (emoji are <img alt="😀">)
+ *   chat window   : [data-mw-file-dropzone] with the chat name in the heading above the log
+ * Facebook's CSS class names are never used: they change every few weeks.
+ */
+(() => {
+  'use strict';
+
+  if (window.__mmsContentLoaded) return;
+  window.__mmsContentLoaded = true;
+
+  const CHANNEL_OUT = '__mms_page_to_ext__'; // page hook -> here
+  const CHANNEL_IN = '__mms_ext_to_page__'; // here -> page hook
+
+  const DEFAULT_SETTINGS = {
+    enabled: true,
+    saveMessages: true,
+    captureNetwork: true,
+    captureDom: true,
+    captureNotifications: true,
+    saveMedia: true,
+    maxMediaMB: 15,
+    retentionDays: 0,
+    showRecoveredInline: true,
+    showEditHistoryInline: true,
+    notifyOnUnsend: true,
+    notifyOnEdit: false,
+    badge: true,
+    blockSeen: true,
+    stealthFocus: true,
+    blockTyping: true,
+  };
+
+  let settings = { ...DEFAULT_SETTINGS };
+  let extensionAlive = true;
+  const domStats = { logs: 0, rows: 0, saved: 0, placeholders: 0, recovered: 0 };
+
+  /* ---------------- talking to the background worker ---------------- */
+
+  function send(msg) {
+    if (!extensionAlive) return Promise.resolve(null);
+    try {
+      return chrome.runtime.sendMessage(msg).catch((e) => {
+        if (String(e && e.message).includes('Extension context invalidated')) extensionAlive = false;
+        return null;
+      });
+    } catch (e) {
+      extensionAlive = false; // extension was reloaded or removed
+      return Promise.resolve(null);
+    }
+  }
+
+  function selfId() {
+    const m = /(?:^|;\s*)c_user=(\d+)/.exec(document.cookie || '');
+    return m ? m[1] : '';
+  }
+
+  /* ---------------- settings -> page hook ---------------- */
+
+  function pushSettingsToPage() {
+    const forPage = {
+      enabled: settings.enabled,
+      captureNetwork: settings.enabled && settings.saveMessages && settings.captureNetwork,
+      captureNotifications: settings.enabled && settings.saveMessages && settings.captureNotifications,
+      blockSeen: settings.enabled && settings.blockSeen,
+      blockTyping: settings.enabled && settings.blockTyping,
+      stealthFocus: settings.enabled && settings.blockSeen && settings.stealthFocus,
+    };
+    document.dispatchEvent(new CustomEvent(CHANNEL_IN, { detail: JSON.stringify({ type: 'settings', data: forPage }) }));
+  }
+
+  chrome.storage.local.get('settings').then(({ settings: stored }) => {
+    settings = { ...DEFAULT_SETTINGS, ...(stored || {}) };
+    pushSettingsToPage();
+    startDom();
+  });
+
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !changes.settings) return;
+    settings = { ...DEFAULT_SETTINGS, ...(changes.settings.newValue || {}) };
+    pushSettingsToPage();
+    if (!settings.enabled || !settings.showRecoveredInline) removeInline('.mms-recovered');
+    if (!settings.enabled || !settings.showEditHistoryInline) removeInline('.mms-edit-history');
+    scheduleFullScan();
+  });
+
+  /* ---------------- page hook -> background ---------------- */
+
+  let lsBuffer = null;
+  let lsTimer = 0;
+
+  function mergeEvents(into, ev) {
+    for (const k of Object.keys(ev)) {
+      if (Array.isArray(ev[k])) {
+        if (!into[k]) into[k] = [];
+        into[k].push(...ev[k]);
+      }
+    }
+  }
+
+  function flushLs() {
+    lsTimer = 0;
+    if (!lsBuffer) return;
+    const events = lsBuffer;
+    lsBuffer = null;
+    send({ type: 'ingest-ls', events, ctx: { selfId: selfId(), url: location.href } });
+  }
+
+  document.addEventListener(CHANNEL_OUT, (e) => {
+    let m;
+    try {
+      m = JSON.parse(String(e.detail));
+    } catch (err) {
+      return;
+    }
+    if (!m || typeof m !== 'object') return;
+    switch (m.type) {
+      case 'ls-events':
+        if (!settings.enabled || !settings.saveMessages) return;
+        lsBuffer = lsBuffer || {};
+        mergeEvents(lsBuffer, m.data || {});
+        if (!lsTimer) lsTimer = setTimeout(flushLs, 250);
+        break;
+      case 'notification':
+        if (settings.enabled && settings.saveMessages && settings.captureNotifications) send({ type: 'ingest-notification', notification: m.data });
+        break;
+      case 'unseen-actions':
+        send({ type: 'unseen-actions', actions: m.data });
+        break;
+      case 'diag':
+        send({ type: 'diag', diag: { ...(m.data || {}), dom: domStats } });
+        break;
+      default:
+        break;
+    }
+  });
+
+  // The page hook buffers until it gets settings; send defaults right away so nothing
+  // waits on storage (real settings follow a few milliseconds later).
+  pushSettingsToPage();
+
+  /* ================================================================== */
+  /* On-screen capture                                                  */
+  /* ================================================================== */
+
+  // Placeholder text Messenger shows instead of an unsent / removed message.
+  const PLACEHOLDER_PATTERNS = [
+    /\b(?:unsent|deleted|removed) (?:a|this) message\b/i, // "Alpha unsent a message", "You deleted a message"
+    /^this message (?:was|has been) (?:unsent|deleted|removed)\.?$/i,
+    /^message (?:unsent|deleted|removed)\.?$/i,
+    /^(?:you|.+) unsent a message$/i,
+    /একটি বার্তা (?:আনসেন্ড|সরিয়ে|মুছে)/, // Bangla
+    /বার্তাটি (?:সরানো|মুছে|আনসেন্ড)/,
+    /\b(?:a annulé l’envoi d’un message|hat eine Nachricht zurückgerufen|anuló el envío de un mensaje|retirou o envio de uma mensagem|ha annullato l'invio di un messaggio)\b/i,
+  ];
+
+  const EDITED_LABELS = new Set(['edited', 'সম্পাদিত', 'modifié', 'bearbeitet', 'editado', 'modificato', 'diedit', 'đã chỉnh sửa']);
+  const YOU_LABELS = new Set(['you', 'আপনি', 'vous', 'du', 'tú', 'tu', 'você', 'anda', 'bạn']);
+
+  function isPlaceholderText(text) {
+    const t = String(text || '').trim();
+    if (!t || t.length > 140) return false;
+    return PLACEHOLDER_PATTERNS.some((re) => re.test(t));
+  }
+
+  function norm(t) {
+    return String(t || '')
+      .normalize('NFC')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /** Text of an element, with emoji images turned back into their characters. */
+  function textOf(root) {
+    let out = '';
+    const walk = (node) => {
+      if (node.nodeType === 3) {
+        out += node.nodeValue;
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      const el = node;
+      if (el.classList && (el.classList.contains('mms-recovered') || el.classList.contains('mms-edit-history'))) return;
+      const tag = el.tagName;
+      if (tag === 'IMG') {
+        const alt = el.getAttribute('alt') || '';
+        if (alt && /^[\p{Extended_Pictographic}\p{Emoji_Component}‍️\s]+$/u.test(alt)) out += alt;
+        return;
+      }
+      if (tag === 'BR') {
+        out += '\n';
+        return;
+      }
+      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'SVG') return;
+      for (const c of el.childNodes) walk(c);
+    };
+    walk(root);
+    return out.replace(/ /g, ' ').trim();
+  }
+
+  const SKIP_INSIDE = 'h1,h2,h3,h4,h5,h6,[role="toolbar"],[aria-hidden="true"],[role="button"],a[aria-label],[role="link"][aria-label],.mms-recovered,.mms-edit-history';
+  const CALL_BUTTONS = '[role="button"][aria-label="Call again"],[role="button"][aria-label="Call back"],[role="button"][aria-label="Join call"],[role="button"][aria-label="Join"]';
+
+  // Delivery status under your own messages ("Sent", "Delivered", "Seen", "Sent 5h ago")
+  const STATUS_TEXT = /^(?:sent|delivered|seen|sending\.*|not delivered|failed to send)(?:\s+\d+\s*[smhdw]\w*\s+ago)?$|^seen by\b/i;
+
+  /** The message's own text pieces (not the reply quote, header, toolbar or a11y button). */
+  function messageTextNodes(row) {
+    const nodes = [];
+    for (const el of row.querySelectorAll('div[dir="auto"], span[dir="auto"]')) {
+      if (el.querySelector('div[dir="auto"], span[dir="auto"]')) continue; // use the innermost only
+      const skip = el.closest(SKIP_INSIDE);
+      if (skip && row.contains(skip)) continue;
+      // status line: <span role="presentation"><span dir="auto">Sent</span></span>
+      if (el.parentElement && el.parentElement.matches('span[role="presentation"]')) continue;
+      if (STATUS_TEXT.test(norm(el.textContent))) continue;
+      nodes.push(el);
+    }
+    return nodes;
+  }
+
+  function messageText(row) {
+    const parts = [];
+    for (const el of messageTextNodes(row)) {
+      const t = textOf(el);
+      if (t && !parts.includes(t)) parts.push(t);
+    }
+    // call notices ("Audio call", "Missed video call", "18 mins")
+    if (row.querySelector(CALL_BUTTONS)) {
+      const bits = [];
+      for (const el of row.querySelectorAll('span[dir="auto"], div[dir="auto"]')) {
+        if (el.querySelector('[dir="auto"]') || el.closest('[role="toolbar"]') || el.closest('[role="button"][aria-label^="Enter,"]')) continue;
+        const t = textOf(el);
+        if (t && !bits.includes(t)) bits.push(t);
+      }
+      return bits.length ? '📞 ' + bits.join(' · ') : '📞 Call';
+    }
+    return parts.join('\n').trim();
+  }
+
+  /** Link previews, voice messages and files shown in a row (not photos). */
+  function messageExtras(row) {
+    const out = [];
+    for (const a of row.querySelectorAll('a[aria-label], [role="link"][aria-label]')) {
+      const label = norm(a.getAttribute('aria-label'));
+      const m = /^open attachment, (.+)$/i.exec(label);
+      if (!m) continue;
+      const href = a.getAttribute('href') || '';
+      out.push({ kind: 'link', title: m[1].slice(0, 300), url: /^https?:/.test(href) ? href : '' });
+    }
+    if (row.querySelector('[role="slider"][aria-label="Audio scrubber"], audio')) out.push({ kind: 'voice', title: 'Voice message' });
+    if (row.querySelector('video')) out.push({ kind: 'video', title: 'Video' });
+    return out;
+  }
+
+  /** Photos / stickers / GIFs in a row (not avatars, not emoji). */
+  function messageImages(row) {
+    const out = [];
+    for (const img of row.querySelectorAll('img')) {
+      const src = img.currentSrc || img.getAttribute('src') || '';
+      if (!src) continue;
+      if (/\/images\/emoji\.php\//.test(src) || /static\.xx\.fbcdn\.net\/images\/emoji/.test(src)) continue;
+      const hidden = img.closest('[aria-hidden="true"]');
+      if (hidden && row.contains(hidden) && img.closest('[role="button"]')) continue; // avatar
+      if (/[?&]stp=[^&]*_s(?:\d{1,2}|1[0-4]\d)x/.test(src)) continue; // tiny avatar thumbnails
+      const w = Number(img.getAttribute('width')) || img.naturalWidth || 0;
+      const h = Number(img.getAttribute('height')) || img.naturalHeight || 0;
+      if (w && h && w <= 40 && h <= 40) continue;
+      out.push({ src, alt: img.getAttribute('alt') || '', w, h, key: imageKey(src) });
+    }
+    return out;
+  }
+
+  function imageKey(src) {
+    if (src.startsWith('blob:') || src.startsWith('data:')) return '';
+    try {
+      const u = new URL(src);
+      return u.pathname.split('/').pop() || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function hasEditedMarker(row) {
+    for (const el of row.querySelectorAll('span, div')) {
+      if (el.children.length) continue;
+      const t = norm(el.textContent).toLowerCase();
+      if (t && t.length < 25 && EDITED_LABELS.has(t)) {
+        if (el.closest('[role="button"][aria-label^="Enter"]')) continue;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /* ---------------- sender, time, direction ---------------- */
+
+  const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+  const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+
+  /** Parses English Messenger time labels ("3:11 PM", "Tuesday 10:25pm", "April 16, 2026, 10:55 AM"). */
+  function parseTimeLabel(label, now = new Date()) {
+    const s = String(label || '').trim().toLowerCase();
+    const tm = /(\d{1,2}):(\d{2})\s*(am|pm)?/.exec(s);
+    if (!tm) return 0;
+    let hh = Number(tm[1]);
+    const mm = Number(tm[2]);
+    if (tm[3] === 'pm' && hh < 12) hh += 12;
+    if (tm[3] === 'am' && hh === 12) hh = 0;
+    const d = new Date(now.getTime());
+    d.setSeconds(0, 0);
+    const md = /(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.? (\d{1,2})(?:, (\d{4}))?/.exec(s);
+    if (md) {
+      const mi = MONTHS.findIndex((m) => m.startsWith(md[1].slice(0, 3)));
+      d.setFullYear(md[3] ? Number(md[3]) : now.getFullYear(), mi, Number(md[2]));
+    } else {
+      const wd = WEEKDAYS.findIndex((w) => s.includes(w) || new RegExp('\\b' + w.slice(0, 3) + '\\b').test(s));
+      if (wd >= 0) {
+        const diff = (now.getDay() - wd + 7) % 7 || 7;
+        d.setDate(d.getDate() - diff);
+      } else if (s.includes('yesterday')) d.setDate(d.getDate() - 1);
+    }
+    d.setHours(hh, mm, 0, 0);
+    const t = d.getTime();
+    return t > now.getTime() + 60000 ? t - 7 * 86400000 : t;
+  }
+
+  /**
+   * Reads sender and time from the row's aria-label (English):
+   *   "At <time>, <Sender>"  |  "At <time>, <Sender>: <text>"  |  "At <time>, <Sender> <text>"
+   */
+  const TIME_TOKEN = /\d{1,2}[:.]\d{2}(?:\s?[ap]\.?m\.?)?/i;
+
+  function splitSender(rest, text, avatarName) {
+    rest = norm(rest);
+    const t = norm(text);
+    if (t && rest.endsWith(t) && rest.length > t.length) return rest.slice(0, rest.length - t.length).trim().replace(/:$/, '').trim();
+    const colon = rest.indexOf(': ');
+    if (colon > 0 && colon < 80) return rest.slice(0, colon).trim();
+    if (avatarName && rest.toLowerCase().startsWith(avatarName.toLowerCase())) return avatarName;
+    for (const you of YOU_LABELS) if (rest.toLowerCase() === you || rest.toLowerCase().startsWith(you + ' ')) return rest.slice(0, you.length);
+    return rest.length <= 60 ? rest : '';
+  }
+
+  function parseRowLabel(row, text) {
+    const avatar = row.querySelector('[aria-hidden="true"] [role="button"] img[alt]');
+    const avatarName = avatar ? norm(avatar.getAttribute('alt')) : '';
+    let sender = '';
+    let timeLabel = '';
+    const label = norm(row.getAttribute('aria-label'));
+    let m = /^at (.*?\d{1,2}[:.]\d{2}(?:\s?[ap]\.?m\.?)?), (.*)$/i.exec(label);
+    if (m) {
+      timeLabel = m[1];
+      sender = splitSender(m[2], text, avatarName);
+    }
+    if (!sender) {
+      // accessibility button next to the message: "Enter, Message sent 12:26 AM by Alpha: text"
+      const art = row.closest('[role="article"]');
+      const scope = (art && art.parentElement) || row.parentElement;
+      const a11y = scope ? scope.querySelector('[role="button"][aria-label^="Enter, Message sent"]') : null;
+      const al = a11y ? norm(a11y.getAttribute('aria-label')) : '';
+      m = /^enter, message sent (.*?\d{1,2}[:.]\d{2}(?:\s?[ap]\.?m\.?)?) by (.*)$/i.exec(al);
+      if (m) {
+        timeLabel = timeLabel || m[1];
+        sender = splitSender(m[2], text, avatarName);
+      }
+    }
+    if (!sender) sender = avatarName;
+    void TIME_TOKEN;
+    return { sender, timeLabel };
+  }
+
+  function rowDirection(row, log, sender, domId) {
+    const lower = norm(sender).toLowerCase();
+    if (YOU_LABELS.has(lower)) return true;
+    const me = selfId();
+    if (me && domId && domId.split('@')[0] === me) return true;
+    if (lower && !YOU_LABELS.has(lower) && /^at /i.test(row.getAttribute('aria-label') || '')) return false;
+    // Fall back to layout: your own bubbles sit on the right.
+    const textEl = messageTextNodes(row)[0] || row.querySelector('img[alt]') || row;
+    const r = textEl.getBoundingClientRect();
+    const L = log.getBoundingClientRect();
+    if (!r.width || !L.width) return null;
+    const leftGap = r.left - L.left;
+    const rightGap = L.right - r.right;
+    if (Math.abs(leftGap - rightGap) < 24) return null;
+    return leftGap > rightGap;
+  }
+
+  /* ---------------- which chat is this list in? ---------------- */
+
+  function threadFromUrl() {
+    const m = /\/(?:messages\/)?(e2ee\/)?t\/([^/?#]+)/.exec(location.pathname);
+    if (!m || m[2] === 'new') return null;
+    return { id: decodeURIComponent(m[2]), e2ee: !!m[1] };
+  }
+
+  function chatWindowOf(log) {
+    return log.closest('[data-mw-file-dropzone]') || log.parentElement;
+  }
+
+  function headingName(el) {
+    if (!el) return '';
+    const t = norm(textOf(el));
+    return t.replace(/^(?:messages in )?conversation (?:with|titled) /i, '').slice(0, 120);
+  }
+
+  function identifyThread(log) {
+    const win = chatWindowOf(log);
+    let name = '';
+    if (win) {
+      for (const h of win.querySelectorAll('h1, h2, h3')) {
+        if (log.contains(h)) continue;
+        name = headingName(h);
+        if (name) break;
+      }
+    }
+    const inMain = !!log.closest('[role="main"]');
+    const fromUrl = threadFromUrl();
+    const isMessagesPage = /^\/(?:messages\/)?(?:e2ee\/)?t\//.test(location.pathname) || location.hostname.endsWith('messenger.com');
+    if (inMain && fromUrl && isMessagesPage) {
+      if (!name) {
+        const main = log.closest('[role="main"]');
+        const h = main && [...main.querySelectorAll('h1, h2, h3')].find((x) => !log.contains(x) && norm(x.textContent));
+        name = headingName(h);
+      }
+      return { id: fromUrl.id, e2ee: fromUrl.e2ee, name, surface: 'page', url: location.href };
+    }
+    // Chat pop-up: identify by its title and the profile link in its header.
+    const altIds = [];
+    const box = (win && win.parentElement && win.parentElement.parentElement) || win;
+    if (box) {
+      for (const a of box.querySelectorAll('a[href]')) {
+        if (log.contains(a)) continue;
+        const href = a.getAttribute('href') || '';
+        const pm = /^(?:https:\/\/www\.facebook\.com)?\/(?:profile\.php\?id=)?(\d{5,})\/?(?:[?#].*)?$/.exec(href);
+        if (pm) altIds.push(pm[1]);
+        const tm = /\/(?:messages\/)?(?:e2ee\/)?t\/(\d+)/.exec(href);
+        if (tm) altIds.push(tm[1]);
+      }
+    }
+    return { id: '', name: name || 'Unknown chat', altIds: [...new Set(altIds)], surface: 'popup', url: location.href };
+  }
+
+  /* ---------------- reading one message list ---------------- */
+
+  function messageRows(log) {
+    const rows = [];
+    for (const el of log.querySelectorAll('[data-scope="messages_table"]')) {
+      if (el.querySelector('[data-scope="date_break"]') && !el.closest('[role="article"]')) continue;
+      if (el.getAttribute('aria-roledescription') === 'message' || el.closest('[role="article"]')) {
+        // nested messages_table elements: keep the outermost message element
+        const outer = el.parentElement && el.parentElement.closest('[data-scope="messages_table"]');
+        if (outer && log.contains(outer) && (outer.getAttribute('aria-roledescription') === 'message' || outer.closest('[role="article"]'))) continue;
+        rows.push(el);
+      }
+    }
+    return rows;
+  }
+
+  function dateBreakBefore(row, log) {
+    // nearest date separator above the row, for the message time
+    const all = log.querySelectorAll('[data-scope="date_break"]');
+    let best = '';
+    for (const d of all) {
+      if (d.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING) best = norm(d.textContent);
+      else break;
+    }
+    return best;
+  }
+
+  function readRow(row, log) {
+    const domId = row.getAttribute('data-message-id') || '';
+    const text = messageText(row);
+    const placeholder = isPlaceholderText(text);
+    const { sender, timeLabel } = parseRowLabel(row, placeholder ? '' : text);
+    const isMine = rowDirection(row, log, sender, domId);
+    const images = placeholder ? [] : messageImages(row);
+    const extras = placeholder ? [] : messageExtras(row);
+    const label = timeLabel || dateBreakBefore(row, log);
+    return {
+      row,
+      domId,
+      text: placeholder ? '' : text,
+      placeholderText: placeholder ? text : '',
+      placeholder,
+      senderName: YOU_LABELS.has(norm(sender).toLowerCase()) ? '' : sender,
+      isMine,
+      timeLabel: label,
+      ts: parseTimeLabel(label),
+      images,
+      extras,
+      edited: !placeholder && hasEditedMarker(row),
+    };
+  }
+
+  /* ---------------- per-list state ---------------- */
+
+  const logs = new Map(); // log element -> state
+  const rowMemory = new Map(); // domId -> last text seen this session (for live unsend detection)
+  const sentSignatures = new Set(); // what was already sent to the background
+  const blobCache = new Map(); // blob: url -> data url promise
+
+  function blobToDataUrl(src, maxBytes) {
+    if (blobCache.has(src)) return blobCache.get(src);
+    const p = fetch(src)
+      .then((r) => r.blob())
+      .then(
+        (b) =>
+          new Promise((resolve) => {
+            if (!b || b.size > maxBytes || !/^image\//.test(b.type)) return resolve('');
+            const fr = new FileReader();
+            fr.onload = () => resolve(String(fr.result || ''));
+            fr.onerror = () => resolve('');
+            fr.readAsDataURL(b);
+          })
+      )
+      .catch(() => '');
+    blobCache.set(src, p);
+    if (blobCache.size > 300) blobCache.delete(blobCache.keys().next().value);
+    return p;
+  }
+
+  async function processLog(log, state) {
+    state.timer = 0;
+    if (!document.contains(log)) {
+      state.observer.disconnect();
+      logs.delete(log);
+      return;
+    }
+    if (!settings.enabled) return;
+    const thread = identifyThread(log);
+    state.thread = thread;
+    const rows = messageRows(log).map((r) => readRow(r, log));
+    domStats.rows = Math.max(domStats.rows, rows.length);
+
+    // context: neighbouring texts help find the original of a placeholder later
+    const texts = rows.map((r) => r.text);
+    const items = [];
+    const unsentNow = [];
+    const placeholders = [];
+    const edited = [];
+    const visibleTexts = [];
+    const visibleDomIds = [];
+    rows.forEach((r, i) => {
+      let p = i - 1;
+      while (p >= 0 && !texts[p]) p--;
+      let n = i + 1;
+      while (n < rows.length && !texts[n]) n++;
+      r.prev = p >= 0 ? texts[p] : '';
+      r.next = n < rows.length ? texts[n] : '';
+      const memKey = r.domId || null;
+      if (r.placeholder) {
+        domStats.placeholders++;
+        const before = memKey ? rowMemory.get(memKey) : null;
+        if (before && before.text) {
+          unsentNow.push({ domId: r.domId, text: before.text, senderName: before.senderName, isMine: before.isMine, prev: r.prev, next: r.next, ts: before.ts });
+          rowMemory.set(memKey, { ...before, unsent: true });
+        }
+        if (!r.row.querySelector('.mms-recovered') || r.row.querySelector('.mms-recovered[data-mms-state="pending"]')) {
+          placeholders.push({ pid: placeholders.length, domId: r.domId, senderName: r.senderName, isMine: r.isMine, prev: r.prev, next: r.next, row: r.row, local: before });
+        }
+        return;
+      }
+      if (r.text) visibleTexts.push(r.text);
+      if (r.domId) visibleDomIds.push(r.domId);
+      if (!r.text && !r.images.length && !r.extras.length) return;
+      if (memKey) rowMemory.set(memKey, { text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ts });
+      if (r.edited) edited.push(r);
+      const sig = [r.domId, r.text, r.images.map((x) => x.key || x.src.slice(0, 80)).join(','), r.extras.map((x) => x.kind + x.title).join(',')].join('|');
+      if (!sentSignatures.has(sig)) {
+        sentSignatures.add(sig);
+        items.push(r);
+      }
+    });
+    if (sentSignatures.size > 20000) sentSignatures.clear();
+    if (rowMemory.size > 20000) rowMemory.clear();
+
+    if (settings.saveMessages && settings.captureDom && (items.length || unsentNow.length)) {
+      const maxBytes = Math.min(settings.maxMediaMB || 15, 15) * 1024 * 1024;
+      const outItems = [];
+      for (const r of items) {
+        const images = [];
+        for (const im of r.images) {
+          if (settings.saveMedia && im.src.startsWith('blob:')) {
+            const dataUrl = await blobToDataUrl(im.src, maxBytes);
+            if (dataUrl) images.push({ dataUrl, w: im.w, h: im.h, alt: im.alt, key: '' });
+          } else if (im.src.startsWith('data:')) {
+            if (settings.saveMedia && im.src.length < maxBytes * 1.4) images.push({ dataUrl: im.src, w: im.w, h: im.h, alt: im.alt, key: '' });
+          } else images.push({ src: im.src, w: im.w, h: im.h, alt: im.alt, key: im.key });
+        }
+        outItems.push({ domId: r.domId, text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ts, prev: r.prev, next: r.next, images, extras: r.extras, edited: r.edited });
+      }
+      domStats.saved += outItems.length;
+      send({
+        type: 'ingest-dom',
+        batch: { thread: { id: thread.id, name: thread.name, e2ee: !!thread.e2ee, url: thread.url, altIds: thread.altIds || [] }, items: outItems, unsentNow },
+        ctx: { selfId: selfId() },
+      });
+    }
+
+    if (settings.showRecoveredInline && placeholders.length) {
+      for (const ph of placeholders) {
+        if (ph.local && ph.local.text) renderRecovered(ph.row, { text: ph.local.text, media: [], senderName: ph.local.senderName, ts: ph.local.ts, confidence: 'high', live: true });
+      }
+      const ask = placeholders.filter((ph) => !(ph.local && ph.local.text));
+      if (ask.length) {
+        const res = await send({
+          type: 'lookup-placeholders',
+          thread: { id: thread.id, name: thread.name, altIds: thread.altIds || [] },
+          placeholders: ask.map(({ pid, domId, senderName, isMine, prev, next }) => ({ pid, domId, senderName, isMine, prev, next })),
+          visibleTexts,
+          visibleDomIds,
+        });
+        const found = new Map(((res && res.results) || []).map((x) => [x.pid, x]));
+        for (const ph of ask) {
+          const hit = found.get(ph.pid);
+          if (hit) {
+            domStats.recovered++;
+            renderRecovered(ph.row, hit);
+          } else renderNotCaptured(ph.row);
+        }
+      }
+    }
+
+    if (settings.showEditHistoryInline && edited.length) {
+      const need = edited.filter((r) => !r.row.querySelector('.mms-edit-history'));
+      if (need.length) {
+        const res = await send({ type: 'lookup-edited', thread: { id: thread.id, name: thread.name }, texts: need.map((r) => r.text) });
+        const byText = new Map(((res && res.results) || []).map((x) => [norm(x.text), x.history]));
+        for (const r of need) {
+          const hist = byText.get(norm(r.text));
+          if (hist && hist.length) renderEditHistory(r.row, hist);
+        }
+      }
+    }
+  }
+
+  /* ---------------- inline display ---------------- */
+
+  function placeholderAnchor(row) {
+    for (const el of messageTextNodes(row)) {
+      if (isPlaceholderText(textOf(el))) return el.closest('span[dir="auto"]') || el;
+    }
+    return null;
+  }
+
+  function fmtTime(ts) {
+    if (!ts) return '';
+    try {
+      return new Date(ts).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function makeBox(cls) {
+    const box = document.createElement('div');
+    box.className = cls;
+    box.setAttribute('data-mms', '1');
+    return box;
+  }
+
+  function insertBox(row, box) {
+    const anchor = placeholderAnchor(row);
+    if (anchor && anchor.parentElement) anchor.parentElement.insertBefore(box, anchor.nextSibling);
+    else row.appendChild(box);
+  }
+
+  function renderRecovered(row, hit) {
+    const old = row.querySelector('.mms-recovered');
+    if (old && old.getAttribute('data-mms-state') === 'found') return;
+    if (old) old.remove();
+    const box = makeBox('mms-recovered');
+    box.setAttribute('data-mms-state', 'found');
+    const head = document.createElement('div');
+    head.className = 'mms-head';
+    head.textContent = '🛡️ Saved copy of the unsent message' + (hit.confidence === 'medium' ? ' (best match)' : '');
+    box.appendChild(head);
+    if (hit.text) {
+      const body = document.createElement('div');
+      body.className = 'mms-text';
+      body.textContent = hit.text;
+      box.appendChild(body);
+    }
+    for (const m of hit.media || []) {
+      if (m.dataUrl || m.url) {
+        const img = document.createElement('img');
+        img.className = 'mms-img';
+        img.alt = m.title || 'saved photo';
+        img.referrerPolicy = 'no-referrer';
+        img.src = m.dataUrl || m.url;
+        img.addEventListener('error', () => img.remove());
+        box.appendChild(img);
+      } else if (m.title) {
+        const t = document.createElement('div');
+        t.className = 'mms-meta';
+        t.textContent = '📎 ' + m.title;
+        box.appendChild(t);
+      }
+    }
+    const meta = document.createElement('div');
+    meta.className = 'mms-meta';
+    const when = fmtTime(hit.ts);
+    meta.textContent = (when ? (hit.approxTime ? 'saved ' : 'sent ') + when : '') + (hit.unsentAt ? ' · unsent ' + fmtTime(hit.unsentAt) : '');
+    if (meta.textContent) box.appendChild(meta);
+    box.title = 'Shown by Messenger Message Saver - only you can see this.';
+    insertBox(row, box);
+  }
+
+  function renderNotCaptured(row) {
+    if (row.querySelector('.mms-recovered')) return;
+    const box = makeBox('mms-recovered mms-missing');
+    box.setAttribute('data-mms-state', 'missing');
+    box.textContent = '🛡️ No saved copy: this message was unsent before Messenger Message Saver could see it.';
+    insertBox(row, box);
+  }
+
+  function renderEditHistory(row, history) {
+    if (row.querySelector('.mms-edit-history')) return;
+    const box = makeBox('mms-edit-history');
+    const head = document.createElement('div');
+    head.className = 'mms-head';
+    head.textContent = '✏️ Before editing:';
+    box.appendChild(head);
+    for (const h of history.slice(-5)) {
+      const line = document.createElement('div');
+      line.className = 'mms-text';
+      line.textContent = h;
+      box.appendChild(line);
+    }
+    const nodes = messageTextNodes(row);
+    const anchor = nodes.length ? nodes[nodes.length - 1].closest('span[dir="auto"]') || nodes[nodes.length - 1] : null;
+    if (anchor && anchor.parentElement) anchor.parentElement.insertBefore(box, anchor.nextSibling);
+    else row.appendChild(box);
+  }
+
+  function removeInline(selector) {
+    document.querySelectorAll(selector).forEach((el) => el.remove());
+  }
+
+  /* ---------------- observers ---------------- */
+
+  function isOwnMutation(records) {
+    return records.every((r) => {
+      const nodes = [...r.addedNodes, ...r.removedNodes];
+      if (!nodes.length) return r.target && r.target.closest && r.target.closest('[data-mms]');
+      return nodes.every((n) => n.nodeType === 1 && n.hasAttribute && n.hasAttribute('data-mms'));
+    });
+  }
+
+  function watchLog(log) {
+    if (logs.has(log)) return;
+    const state = { timer: 0, observer: null, thread: null };
+    state.observer = new MutationObserver((records) => {
+      if (isOwnMutation(records)) return;
+      if (!state.timer) state.timer = setTimeout(() => processLog(log, state).catch(() => {}), 350);
+    });
+    state.observer.observe(log, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['src', 'aria-label', 'data-message-id'] });
+    logs.set(log, state);
+    domStats.logs = logs.size;
+    state.timer = setTimeout(() => processLog(log, state).catch(() => {}), 200);
+  }
+
+  let scanTimer = 0;
+  function scheduleFullScan() {
+    if (scanTimer) return;
+    scanTimer = setTimeout(() => {
+      scanTimer = 0;
+      if (!settings.enabled) return;
+      if (!settings.captureDom && !settings.showRecoveredInline && !settings.showEditHistoryInline) return;
+      document.querySelectorAll('[role="log"]').forEach(watchLog);
+      for (const [log, state] of logs) {
+        if (!document.contains(log)) {
+          state.observer.disconnect();
+          logs.delete(log);
+        } else if (!state.timer) state.timer = setTimeout(() => processLog(log, state).catch(() => {}), 50);
+      }
+      domStats.logs = logs.size;
+    }, 400);
+  }
+
+  let started = false;
+  function startDom() {
+    if (started) return;
+    started = true;
+    const begin = () => {
+      scheduleFullScan();
+      const rootObserver = new MutationObserver((records) => {
+        for (const r of records) {
+          for (const n of r.addedNodes) {
+            if (n.nodeType !== 1) continue;
+            if ((n.getAttribute && n.getAttribute('role') === 'log') || (n.querySelector && n.querySelector('[role="log"]'))) {
+              scheduleFullScan();
+              return;
+            }
+          }
+        }
+      });
+      rootObserver.observe(document.documentElement, { childList: true, subtree: true });
+      // Messenger is a single-page app: re-check when the address changes.
+      let lastUrl = location.href;
+      setInterval(() => {
+        if (location.href !== lastUrl) {
+          lastUrl = location.href;
+          scheduleFullScan();
+        }
+      }, 1000);
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', begin, { once: true });
+    else begin();
+  }
+
+})();

@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Saved Messages</title>
+    <link rel="icon" href="../icons/icon32.png" />
+    <link rel="stylesheet" href="../lib/ui.css" />
+    <link rel="stylesheet" href="dashboard.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <div class="brand">
+        <img src="../icons/icon48.png" alt="" width="30" height="30" />
+        <div>
+          <strong>Messenger Message Saver</strong>
+          <span class="muted small" id="totals-line"></span>
+        </div>
+      </div>
+      <input id="search" type="search" placeholder="Search all saved messages…" autocomplete="off" aria-label="Search all saved messages" />
+      <nav class="tabs" role="tablist">
+        <button role="tab" data-view="unsent" aria-selected="true">Unsent &amp; deleted <span class="count" id="c-unsent"></span></button>
+        <button role="tab" data-view="chats">Chats</button>
+        <button role="tab" data-view="edited">Edited <span class="count" id="c-edited"></span></button>
+        <button role="tab" data-view="notifications">Notifications</button>
+        <button role="tab" data-view="settings">Settings</button>
+        <button role="tab" data-view="help">Help</button>
+      </nav>
+    </header>
+
+    <div id="welcome" class="welcome" hidden>
+      <h1>You're set up 🎉</h1>
+      <ol>
+        <li><b>Reload</b> any Facebook or Messenger tab that was already open.</li>
+        <li>Chat as usual. Messages are saved on this computer as they arrive or appear on screen.</li>
+        <li>When someone unsends, the original appears right under <i>“unsent a message”</i>, and here.</li>
+        <li><b>Unseen mode</b> is on: people won't see “Seen” when you read. Turn it off any time from the toolbar icon.</li>
+      </ol>
+      <button class="btn primary" id="welcome-close">Got it</button>
+    </div>
+
+    <main>
+      <section id="view-unsent" class="view" data-view="unsent">
+        <div class="view-head">
+          <h2>Unsent &amp; deleted messages</h2>
+          <div class="chips" id="unsent-filter">
+            <button class="chip on" data-f="recovered">Recovered</button>
+            <button class="chip" data-f="all">All (incl. not captured)</button>
+          </div>
+        </div>
+        <div id="unsent-list" class="cards"></div>
+      </section>
+
+      <section id="view-chats" class="view" data-view="chats" hidden>
+        <aside class="threads">
+          <input id="thread-filter" type="search" placeholder="Find a chat…" aria-label="Find a chat" />
+          <ul id="thread-list"></ul>
+        </aside>
+        <div class="thread-pane">
+          <div class="view-head">
+            <h2 id="thread-title">Pick a chat</h2>
+            <div class="chips" id="msg-filter">
+              <button class="chip on" data-f="all">All</button>
+              <button class="chip" data-f="unsent">Unsent</button>
+              <button class="chip" data-f="edited">Edited</button>
+              <button class="chip" data-f="media">Photos</button>
+            </div>
+            <div class="thread-actions">
+              <button class="btn small" id="export-thread">Export chat</button>
+              <button class="btn small" id="delete-thread">Delete chat data</button>
+            </div>
+          </div>
+          <div id="thread-messages" class="timeline"></div>
+        </div>
+      </section>
+
+      <section id="view-edited" class="view" data-view="edited" hidden>
+        <div class="view-head"><h2>Edited messages</h2></div>
+        <div id="edited-list" class="cards"></div>
+      </section>
+
+      <section id="view-search" class="view" data-view="search" hidden>
+        <div class="view-head"><h2 id="search-title">Search</h2></div>
+        <div id="search-list" class="cards"></div>
+      </section>
+
+      <section id="view-notifications" class="view" data-view="notifications" hidden>
+        <div class="view-head">
+          <h2>Messenger notifications</h2>
+          <p class="muted small">A backup copy of Messenger's own desktop notifications (sender and text). Useful when a message was unsent before you opened the chat.</p>
+        </div>
+        <div id="notification-list" class="cards"></div>
+      </section>
+
+      <section id="view-settings" class="view" data-view="settings" hidden>
+        <div class="settings-grid">
+          <div class="panel">
+            <h3>Saving</h3>
+            <label class="srow"><span>Save messages</span><span class="switch"><input type="checkbox" data-setting="saveMessages" /><span></span></span></label>
+            <label class="srow"><span>Read Messenger's own data (normal chats)<small>Catches messages even before you open the chat</small></span><span class="switch"><input type="checkbox" data-setting="captureNetwork" /><span></span></span></label>
+            <label class="srow"><span>Read messages shown on screen<small>Needed for end-to-end encrypted chats</small></span><span class="switch"><input type="checkbox" data-setting="captureDom" /><span></span></span></label>
+            <label class="srow"><span>Keep copies of Messenger notifications</span><span class="switch"><input type="checkbox" data-setting="captureNotifications" /><span></span></span></label>
+            <label class="srow"><span>Save photos and stickers</span><span class="switch"><input type="checkbox" data-setting="saveMedia" /><span></span></span></label>
+            <label class="srow"><span>Largest photo to keep (MB)</span><input type="number" min="1" max="100" step="1" data-setting="maxMediaMB" class="num" /></label>
+            <label class="srow"><span>Delete saved messages older than (days)<small>0 = keep forever</small></span><input type="number" min="0" max="3650" step="1" data-setting="retentionDays" class="num" /></label>
+          </div>
+          <div class="panel">
+            <h3>Showing</h3>
+            <label class="srow"><span>Show unsent messages inside the chat</span><span class="switch"><input type="checkbox" data-setting="showRecoveredInline" /><span></span></span></label>
+            <label class="srow"><span>Show earlier text of edited messages</span><span class="switch"><input type="checkbox" data-setting="showEditHistoryInline" /><span></span></span></label>
+            <label class="srow"><span>Desktop alert when someone unsends</span><span class="switch"><input type="checkbox" data-setting="notifyOnUnsend" /><span></span></span></label>
+            <label class="srow"><span>Desktop alert when someone edits</span><span class="switch"><input type="checkbox" data-setting="notifyOnEdit" /><span></span></span></label>
+            <label class="srow"><span>Count new unsent messages on the toolbar icon</span><span class="switch"><input type="checkbox" data-setting="badge" /><span></span></span></label>
+          </div>
+          <div class="panel">
+            <h3>Unseen</h3>
+            <label class="srow"><span>Don't send “Seen”</span><span class="switch"><input type="checkbox" data-setting="blockSeen" /><span></span></span></label>
+            <label class="srow"><span>Strong mode for encrypted chats<small>Messenger thinks the tab is in the background, so it never reports “Seen”. Side effect: Messenger may play its message sound while you are on the page.</small></span><span class="switch"><input type="checkbox" data-setting="stealthFocus" /><span></span></span></label>
+            <label class="srow"><span>Don't show “typing…”<small>Works in normal (not end-to-end encrypted) chats</small></span><span class="switch"><input type="checkbox" data-setting="blockTyping" /><span></span></span></label>
+            <p class="muted small">Replying to a chat always shows “Seen” - that is how Messenger works.</p>
+          </div>
+          <div class="panel">
+            <h3>Backup</h3>
+            <div class="btn-col">
+              <button class="btn" id="export-json">Download backup (with photos)</button>
+              <button class="btn" id="export-json-light">Download backup (text only)</button>
+              <button class="btn" id="export-html">Download as readable web page</button>
+              <button class="btn" id="export-csv">Download as spreadsheet (CSV)</button>
+              <label class="btn file-btn">Restore a backup…<input type="file" id="import-json" accept="application/json,.json" /></label>
+            </div>
+            <h3 class="danger-h">Danger zone</h3>
+            <button class="btn danger" id="delete-all">Delete everything saved</button>
+          </div>
+          <div class="panel wide">
+            <h3>Diagnostics</h3>
+            <p class="muted small">What the extension sees in your open Facebook / Messenger tabs. If “gateway sockets” stays 0, Messenger may have changed how it connects; messages are then saved from the screen only.</p>
+            <div id="diag"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-help" class="view" data-view="help" hidden>
+        <div class="help">
+          <h2>How it works</h2>
+          <ul>
+            <li><b>Saving.</b> While a Facebook or Messenger tab is open, the extension keeps a private copy of messages: from Messenger's own data for normal chats, and from what is shown on screen for every chat (including end-to-end encrypted ones). Everything stays on this computer.</li>
+            <li><b>Unsent messages.</b> When someone unsends, Messenger shows “… unsent a message”. The saved original appears right under it, in the <i>Unsent &amp; deleted</i> tab, and as a desktop alert.</li>
+            <li><b>Edited messages.</b> Earlier versions are kept and shown under the edited message.</li>
+            <li><b>Unseen.</b> “Seen” is not sent when you read. In encrypted chats this works through <i>Strong mode</i>, which makes Messenger think the tab is in the background.</li>
+          </ul>
+          <h2>Limits</h2>
+          <ul>
+            <li>A message can only be recovered if it reached this browser before it was unsent: Messenger must have been open in a tab (a chat pop-up or the Messages page). Messages unsent while Facebook was closed cannot be recovered.</li>
+            <li>In end-to-end encrypted chats the message must have been <b>shown on screen</b> at least once (the chat pop-up or chat page was open), or have arrived as a Messenger notification.</li>
+            <li>“Typing…” can only be hidden in normal chats.</li>
+            <li>Facebook changes its website often. If something stops working, check <i>Settings → Diagnostics</i>.</li>
+          </ul>
+          <h2>Privacy</h2>
+          <p>No data leaves your computer. The extension has no servers and sends nothing anywhere. Uninstalling it deletes everything it saved.</p>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="confirm-dialog">
+      <form method="dialog">
+        <p id="confirm-text"></p>
+        <div class="dlg-actions">
+          <button value="cancel" class="btn">Cancel</button>
+          <button value="ok" class="btn danger" id="confirm-ok">Delete</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" hidden></div>
+    <script type="module" src="dashboard.js"></script>
+  </body>
+</html>

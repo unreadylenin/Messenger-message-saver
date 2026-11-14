@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Facebook (test double)</title>
+    <style>
+      body { font: 14px system-ui, sans-serif; margin: 0; background: #fff; }
+      .popup { position: fixed; right: 20px; bottom: 0; width: 330px; height: 520px; border: 1px solid #ccc; display: flex; flex-direction: column; }
+      .popup-head { padding: 8px; border-bottom: 1px solid #ddd; }
+      [role="log"] { flex: 1; overflow: auto; padding: 8px; }
+      .row-out { display: flex; justify-content: flex-end; }
+      .row-in { display: flex; justify-content: flex-start; }
+      .bubble { max-width: 70%; padding: 6px 10px; border-radius: 16px; background: #eee; }
+      .row-out .bubble { background: #0866ff; color: #fff; }
+      main.page { margin-right: 380px; }
+    </style>
+  </head>
+  <body>
+    <!--
+      Test double of Messenger's 2026 page structure (role="log", data-scope="messages_table",
+      aria-roledescription="message", data-message-id, aria-label "At <time>, <Sender>: <text>").
+      Written for these tests; it contains no Facebook code.
+    -->
+    <main class="page" id="page-main"></main>
+
+    <div class="popup" id="popup">
+      <div class="popup-head">
+        <div role="button"><a href="/100012345678901/" role="link"><span>Khondoker Aurthe</span></a></div>
+        <span>Active 1h ago</span>
+      </div>
+      <div data-mw-file-dropzone="1" style="display: flex; flex-direction: column; flex: 1; min-height: 0">
+        <h2 dir="auto">Khondoker Aurthe</h2>
+        <div role="status"></div>
+        <div role="log" id="log"></div>
+      </div>
+      <div role="textbox" contenteditable="true" aria-label="Message">Aa</div>
+    </div>
+
+    <script>
+      (function () {
+        'use strict';
+        const log = document.getElementById('log');
+        const state = { ws: null, received: [], streamId: 1 };
+
+        function rowHtml(m) {
+          const label = m.placeholder
+            ? `At ${m.time}, ${m.sender}`
+            : `At ${m.time}, ${m.sender}: ${m.text}`;
+          const avatar = m.mine
+            ? ''
+            : `<div role="presentation"><div aria-hidden="true"><span><div aria-expanded="false" aria-haspopup="dialog" role="button" tabindex="-1"><img alt="${m.sender}" src="https://scontent.xx.fbcdn.net/v/t1.6435-1/avatar.jpg?stp=dst-jpg_s100x100_tt6" width="28" height="28"></div></span></div></div>`;
+          const heading = m.heading ? `<div role="presentation"><div><div><span aria-hidden="true"><h3 dir="auto">${m.heading}</h3></span></div></div></div>` : '';
+          const textPart = m.placeholder
+            ? `<span dir="auto"><div dir="auto">${m.placeholder}</div></span>`
+            : m.text
+            ? `<span dir="auto"><div dir="auto">${m.text}</div></span>`
+            : '';
+          const photo = m.photo ? `<div role="presentation"><img alt="Open photo" width="480" height="360" src="${m.photo}"></div>` : '';
+          const edited = m.edited ? `<div role="presentation"><span>Edited</span></div>` : '';
+          return `<div data-virtualized="false"><div><div role="none"><div role="article"><div>
+              <div aria-label="${label.replace(/"/g, '&quot;')}" aria-roledescription="message" data-message-id="${m.domId}" data-scope="messages_table" tabindex="-1" class="${m.mine ? 'row-out' : 'row-in'}">
+                ${heading}
+                ${avatar}
+                <div role="presentation" class="bubble"><div><span><div role="none"><div><div role="presentation">${textPart}</div></div></div></span></div>${photo}${edited}</div>
+                <div role="presentation"><div aria-hidden="true" aria-label="Message actions" role="toolbar"></div></div>
+              </div>
+            </div></div>
+            <div role="none"><div aria-label="Enter, Message sent ${m.time} by ${m.sender}${m.text ? ': ' + m.text : ''}" role="button" tabindex="-1"><span dir="auto">Enter, Message sent ${m.time} by ${m.sender}</span></div></div>
+          </div></div></div>`;
+        }
+
+        function dateBreak(text) {
+          return `<div data-virtualized="false"><div role="none"><div data-scope="messages_table"><div role="presentation"><div aria-hidden="true" data-scope="date_break"><span dir="auto"><span>${text}</span></span></div></div></div></div></div>`;
+        }
+
+        const rows = new Map();
+
+        window.fb = {
+          dateBreak(text) {
+            log.insertAdjacentHTML('beforeend', dateBreak(text));
+          },
+          addMessage(m) {
+            const wrap = document.createElement('div');
+            wrap.innerHTML = rowHtml(m);
+            const node = wrap.firstElementChild;
+            rows.set(m.domId, { node, m });
+            log.appendChild(node);
+          },
+          // Messenger keeps the row (same data-message-id) and swaps its content
+          unsend(domId, placeholder) {
+            const r = rows.get(domId);
+            const m = { ...r.m, placeholder, text: '', photo: '' };
+            const wrap = document.createElement('div');
+            wrap.innerHTML = rowHtml(m);
+            const node = wrap.firstElementChild;
+            r.node.replaceWith(node);
+            rows.set(domId, { node, m });
+          },
+          edit(domId, text) {
+            const r = rows.get(domId);
+            const m = { ...r.m, text, edited: true };
+            const wrap = document.createElement('div');
+            wrap.innerHTML = rowHtml(m);
+            const node = wrap.firstElementChild;
+            r.node.replaceWith(node);
+            rows.set(domId, { node, m });
+          },
+          clear() {
+            log.textContent = '';
+            rows.clear();
+          },
+          connect(url) {
+            return new Promise((resolve, reject) => {
+              const ws = new WebSocket(url || 'wss://gateway.facebook.com/ws/lightspeed?x-dgw-appid=2220391788200892&x-dgw-appversion=0&x-dgw-authtype=1%3A0&x-dgw-version=5');
+              ws.binaryType = 'arraybuffer';
+              ws.onopen = () => resolve(true);
+              ws.onerror = () => reject(new Error('ws error'));
+              ws.onmessage = (ev) => state.received.push(ev.data.byteLength || 0);
+              state.ws = ws;
+            });
+          },
+          // client -> server: EstablishStream + Data(JSON) in one WebSocket message, like Messenger
+          sendJson(json, requiresAck = true) {
+            const enc = new TextEncoder();
+            const id = ++state.streamId;
+            const params = enc.encode('{}');
+            const payload = enc.encode(json);
+            const est = new Uint8Array(6 + params.length);
+            est.set([15, id & 255, id >> 8, params.length & 255, (params.length >> 8) & 255, params.length >> 16]);
+            est.set(params, 6);
+            const len = 2 + payload.length;
+            const data = new Uint8Array(6 + len);
+            data.set([13, id & 255, id >> 8, len & 255, (len >> 8) & 255, len >> 16, 1, requiresAck ? 0x80 : 0]);
+            data.set(payload, 8);
+            const all = new Uint8Array(est.length + data.length);
+            all.set(est, 0);
+            all.set(data, est.length);
+            state.ws.send(all.buffer);
+            return id;
+          },
+          focusInfo() {
+            return { hasFocus: document.hasFocus(), visibilityState: document.visibilityState, hidden: document.hidden };
+          },
+          receivedCount() {
+            return state.received.length;
+          },
+        };
+      })();
+    </script>
+  </body>
+</html>

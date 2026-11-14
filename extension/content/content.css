@@ -1,0 +1,93 @@
+/* Boxes added under Messenger messages by Messenger Message Saver. */
+.mms-recovered,
+.mms-edit-history {
+  box-sizing: border-box;
+  display: block;
+  max-width: 100%;
+  margin: 4px 0 2px;
+  padding: 6px 10px;
+  border-radius: 12px;
+  font: 13px/1.35 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  text-align: left;
+  white-space: normal;
+  word-break: break-word;
+  user-select: text;
+  pointer-events: auto;
+}
+
+.mms-recovered {
+  background: rgba(240, 40, 73, 0.1);
+  border: 1px solid rgba(240, 40, 73, 0.45);
+  color: #1c1e21;
+}
+
+.mms-recovered.mms-missing {
+  background: rgba(128, 128, 128, 0.1);
+  border-color: rgba(128, 128, 128, 0.4);
+  color: #65676b;
+  font-size: 12px;
+}
+
+.mms-edit-history {
+  background: rgba(0, 132, 255, 0.08);
+  border: 1px dashed rgba(0, 132, 255, 0.5);
+  color: #1c1e21;
+}
+
+.mms-recovered .mms-head,
+.mms-edit-history .mms-head {
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0.8;
+  margin-bottom: 2px;
+}
+
+.mms-recovered .mms-text,
+.mms-edit-history .mms-text {
+  font-size: 14px;
+  white-space: pre-wrap;
+}
+
+.mms-edit-history .mms-text + .mms-text {
+  margin-top: 2px;
+  padding-top: 2px;
+  border-top: 1px dotted rgba(0, 132, 255, 0.35);
+}
+
+.mms-recovered .mms-meta {
+  font-size: 11px;
+  opacity: 0.7;
+  margin-top: 3px;
+}
+
+.mms-recovered .mms-img {
+  display: block;
+  max-width: 220px;
+  max-height: 220px;
+  margin-top: 4px;
+  border-radius: 8px;
+  object-fit: contain;
+}
+
+@media (prefers-color-scheme: dark) {
+  .mms-recovered,
+  .mms-edit-history {
+    color: #e4e6eb;
+  }
+  .mms-recovered.mms-missing {
+    color: #b0b3b8;
+  }
+}
+
+/* Facebook's own dark mode sets the class "__fb-dark-mode" on <html> */
+html.__fb-dark-mode .mms-recovered,
+html.__fb-dark-mode .mms-edit-history {
+  color: #e4e6eb;
+}
+html.__fb-dark-mode .mms-recovered.mms-missing {
+  color: #b0b3b8;
+}
+html.__fb-light-mode .mms-recovered,
+html.__fb-light-mode .mms-edit-history {
+  color: #1c1e21;
+}
