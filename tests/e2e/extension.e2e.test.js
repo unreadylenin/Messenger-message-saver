@@ -182,6 +182,14 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     const inner3 = JSON.parse(JSON.parse(dec.decode(mw.dgwParse(new Uint8Array(got3))[1].payload)).payload);
     assert.equal(JSON.parse(inner3.tasks[1].payload).last_read_watermark_ts, 1731571860000, 'untouched when Unseen is off');
     await setSettings({ blockSeen: true, blockTyping: true });
+    await new Promise((r) => setTimeout(r, 400));
+    // a later read with Unseen back on is held at what the server now has (never lower)
+    const readLater = `{"thread_id":${THREAD},"last_read_watermark_ts":1731571990000,"sync_group":1}`;
+    const before4 = gw.fromPage.length;
+    await page.evaluate((json) => fb.sendJson(json), h.taskRequest([{ label: '21', payload: readLater, queue: THREAD, taskId: 5 }]));
+    const got4 = await waitFor(() => gw.fromPage.length > before4 && gw.fromPage[gw.fromPage.length - 1], { what: 'frame after Unseen back on' });
+    const inner4 = JSON.parse(JSON.parse(dec.decode(mw.dgwParse(new Uint8Array(got4))[1].payload)).payload);
+    assert.equal(JSON.parse(inner4.tasks[0].payload).last_read_watermark_ts, 1731571860000, 'rewound to the marker this tab sent, not below it');
   });
 
   await t.test('screen: incoming and own messages are saved with sender and direction', async () => {

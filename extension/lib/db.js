@@ -298,12 +298,16 @@ export async function searchMessages(query, { threadKey = null, status = null, l
 
 /** Deletes photos that no saved message points to any more (photos can be shared by several messages). */
 export async function collectUnusedMedia() {
-  const used = new Set();
-  for (const m of await getAll('messages')) for (const a of m.attachments || []) if (a.mediaKey) used.add(a.mediaKey);
-  const keys = await withStores(['media'], 'readonly', (s) => reqP(s.media.getAllKeys()));
-  const unused = keys.filter((k) => !used.has(k));
-  if (unused.length) await withStores(['media'], 'readwrite', async (s) => unused.forEach((k) => s.media.delete(k)));
-  return unused.length;
+  // one read-write transaction over messages + media: a photo saved at the same moment by
+  // the background worker is either seen with its message here, or written after this ends
+  return withStores(['messages', 'media'], 'readwrite', async (s) => {
+    const used = new Set();
+    for (const m of await reqP(s.messages.getAll())) for (const a of m.attachments || []) if (a.mediaKey) used.add(a.mediaKey);
+    const keys = await reqP(s.media.getAllKeys());
+    const unused = keys.filter((k) => !used.has(k));
+    for (const k of unused) s.media.delete(k);
+    return unused.length;
+  });
 }
 
 /**

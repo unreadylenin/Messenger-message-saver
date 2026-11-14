@@ -147,10 +147,16 @@ test('Unseen: unknown read marker -> request left alone and reported; non-advanc
   const req = h.taskRequest([{ label: '21', payload: readPayload, queue: THREAD, taskId: 4 }]);
   const unknown = mw.rewriteRequestText(req, { blockSeen: true, blockTyping: false, readWatermarks: new Map() });
   assert.equal(unknown.text, null, 'never rewritten to 0 (that would mark the chat unread)');
-  assert.deepEqual(unknown.actions, [{ type: 'seen-unknown', thread: THREAD, label: '21' }]);
+  assert.deepEqual(unknown.actions, [{ type: 'seen-unknown', thread: THREAD, label: '21', value: 1731571860000 }]);
 
   const notAdvancing = mw.rewriteRequestText(req, { blockSeen: true, blockTyping: false, readWatermarks: new Map([[THREAD, 1731571860000]]) });
-  assert.equal(notAdvancing, null);
+  assert.equal(notAdvancing.text, null, 'goes out unchanged');
+  assert.deepEqual(notAdvancing.actions, [{ type: 'seen-sent', thread: THREAD, value: 1731571860000 }]);
+
+  // with Unseen off nothing changes, but the marker that goes out is noted
+  const learnOnly = mw.rewriteRequestText(req, { blockSeen: false, blockTyping: false, learn: true, readWatermarks: new Map() });
+  assert.equal(learnOnly.text, null);
+  assert.deepEqual(learnOnly.actions, [{ type: 'seen-sent', thread: THREAD, value: 1731571860000 }]);
 
   const off = mw.rewriteRequestText(req, { blockSeen: false, blockTyping: true, readWatermarks: new Map() });
   assert.equal(off, null);
@@ -171,7 +177,7 @@ test('Unseen: the label-49 read task (thread_key, ..._timestamp_ms) is rewound t
 
   // "Mark as unread" (an older marker) is the user's own choice: left alone
   const unread = h.taskRequest([{ label: '49', payload: `{"thread_key":${THREAD},"last_read_watermark_timestamp_ms":1700000000000,"sync_group":1}`, queue: THREAD, taskId: 9 }]);
-  assert.equal(mw.rewriteRequestText(unread, { blockSeen: true, blockTyping: false, readWatermarks: new Map([[THREAD, 1790750000000]]) }), null);
+  assert.equal(mw.rewriteRequestText(unread, { blockSeen: true, blockTyping: false, readWatermarks: new Map([[THREAD, 1790750000000]]) }).text, null);
 });
 
 test('Unseen: a sent message that merely mentions last_read_watermark_ts is never touched', () => {

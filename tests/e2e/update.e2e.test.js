@@ -83,9 +83,9 @@ test('open Messenger tab survives an extension update and a disable', { timeout:
       const { getSettings } = await import('/lib/settings.js');
       await chrome.storage.local.set({ settings: { ...(await getSettings()), ...p } });
     }, patch);
-  const readReceiptLeaving = async () => {
+  const readReceiptLeaving = async (value = 1731571860000) => {
     const before = gw.fromPage.length;
-    const readTask = `{"thread_id":${THREAD},"last_read_watermark_ts":1731571860000,"sync_group":1}`;
+    const readTask = `{"thread_id":${THREAD},"last_read_watermark_ts":${value},"sync_group":1}`;
     await page.evaluate((json) => fb.sendJson(json), h.taskRequest([{ label: '21', payload: readTask, queue: THREAD, taskId: 4 }]));
     const got = await waitFor(() => gw.fromPage.length > before && gw.fromPage[gw.fromPage.length - 1], { what: 'frame' });
     const env = JSON.parse(dec.decode(mw.dgwParse(new Uint8Array(got))[1].payload));
@@ -113,7 +113,8 @@ test('open Messenger tab survives an extension update and a disable', { timeout:
 
     await setSettings(dash, { blockSeen: true, stealthFocus: true, blockTyping: true });
     await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).hasFocus === false, { what: 'tab follows "Unseen on" after the update' });
-    assert.equal(await readReceiptLeaving(), 1731571000000, '"Seen" rewound again to the server value');
+    // the server now has 1731571860000 (sent while Unseen was off): a newer read is held there, never lower
+    assert.equal(await readReceiptLeaving(1731571990000), 1731571860000, '"Seen" held at the server value');
   });
 
   await t.test('after a reload, the open tab keeps saving and recovering', async () => {

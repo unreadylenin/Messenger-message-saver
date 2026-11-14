@@ -728,16 +728,19 @@
   function rewriteTask(task, opts) {
     if (!task || typeof task !== 'object' || typeof task.payload !== 'string') return null;
     const label = task.label === undefined || task.label === null ? '' : String(task.label);
-    if (opts.blockSeen && READ_LABELS.has(label)) {
+    if ((opts.blockSeen || opts.learn) && READ_LABELS.has(label)) {
       const p = parseExact(task.payload);
       if (!p || typeof p !== 'object') return null;
       const key = READ_KEYS.find((k) => ownKey(p, k));
       if (!key) return null;
       const thread = idToString(ownKey(p, 'thread_id') ? p.thread_id : p.thread_key);
       const wanted = Number(idToString(p[key]));
+      // a read marker that goes out unchanged becomes the server's value: remember it
+      const sent = { type: 'seen-sent', thread, value: wanted };
+      if (!opts.blockSeen) return { action: sent, changed: false };
       const known = opts.readWatermarks && opts.readWatermarks.get(thread);
-      if (typeof known !== 'number' || !(known > 0)) return { action: { type: 'seen-unknown', thread, label }, changed: false };
-      if (!(wanted > known)) return null; // not moving the marker forward: leave it
+      if (typeof known !== 'number' || !(known > 0)) return { action: { type: 'seen-unknown', thread, label, value: wanted }, changed: false };
+      if (!(wanted > known)) return { action: sent, changed: false }; // not moving the marker forward: leave it
       p[key] = known;
       task.payload = stringifyExact(p);
       return { action: { type: 'seen-blocked', thread, label, from: String(wanted), to: known }, changed: true };
@@ -759,8 +762,8 @@
    */
   function rewriteRequestText(text, opts) {
     if (typeof text !== 'string' || text.length < 10) return null;
-    if (!opts.blockSeen && !opts.blockTyping) return null;
-    const interesting = (opts.blockSeen && text.indexOf('last_read_watermark') !== -1) || (opts.blockTyping && text.indexOf('is_typing') !== -1);
+    if (!opts.blockSeen && !opts.blockTyping && !opts.learn) return null;
+    const interesting = ((opts.blockSeen || opts.learn) && text.indexOf('last_read_watermark') !== -1) || (opts.blockTyping && text.indexOf('is_typing') !== -1);
     if (!interesting) return null;
     const env = parseExact(text);
     if (!env || typeof env !== 'object' || typeof env.payload !== 'string') return null;
@@ -1060,11 +1063,13 @@
 
     function onOutgoing(ws, data) {
       const s = state.settings;
-      if (!active() || (!s.blockSeen && !s.blockTyping)) return data;
       const kind = kindOf(ws);
       if (kind !== 'dgw' && kind !== 'mqtt') return data;
       state.diag.framesOut++;
-      const opts = { blockSeen: !!s.blockSeen, blockTyping: !!s.blockTyping, readWatermarks: state.readWatermarks };
+      // with the extension paused or Unseen off nothing is changed, but read markers that
+      // go out are still noted, so turning Unseen back on never rewinds below them
+      const on = active();
+      const opts = { blockSeen: on && !!s.blockSeen, blockTyping: on && !!s.blockTyping, learn: true, readWatermarks: state.readWatermarks };
       if (typeof data === 'string') {
         const res = rewriteRequestText(data, opts);
         if (!res) return data;
@@ -1083,13 +1088,21 @@
     }
 
     function recordActions(actions) {
+      const report = [];
       for (const a of actions) {
+        if ((a.type === 'seen-sent' || a.type === 'seen-unknown') && a.thread && a.value > 0) {
+          const known = state.readWatermarks.get(a.thread) || 0;
+          if (a.value > known) state.readWatermarks.set(a.thread, a.value);
+        }
+        if (a.type === 'seen-sent') continue; // bookkeeping only
         if (a.type === 'seen-blocked') state.diag.seenBlocked++;
         else if (a.type === 'typing-blocked') state.diag.typingBlocked++;
         else if (a.type === 'seen-unknown') state.diag.seenUnknown++;
+        report.push(a);
       }
+      if (!report.length) return;
       state.diagDirty = true;
-      emit('unseen-actions', actions);
+      emit('unseen-actions', report);
     }
 
     if (typeof NativeWS === 'function') {

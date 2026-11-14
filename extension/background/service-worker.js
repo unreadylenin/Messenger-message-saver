@@ -51,7 +51,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'mms-media') return pumpMedia();
   if (alarm.name !== 'mms-prune') return;
   const s = await settings();
-  if (s.retentionDays > 0) await db.prune(s.retentionDays);
+  if (s.retentionDays > 0) await serial(() => db.prune(s.retentionDays));
 });
 
 /* ---------------- tabs opened before an install, update or re-enable ---------------- */
@@ -987,7 +987,8 @@ async function saveMedia(job) {
     db.withStores(['media', 'messages'], 'readwrite', async (st) => {
       const rec = await reqP(st.messages.get(job.messageKey));
       if (!rec) return; // the message was deleted meanwhile: do not keep its photo
-      if (!existing) st.media.put({ key: mediaKey, blob, mime: blob.type, size: blob.size, url: job.url || '', messageKey: job.messageKey, savedAt: Date.now() });
+      const stored = await reqP(st.media.get(mediaKey)); // checked again inside the write
+      if (!stored) st.media.put({ key: mediaKey, blob, mime: blob.type, size: blob.size, url: job.url || '', messageKey: job.messageKey, savedAt: Date.now() });
       for (const a of rec.attachments || []) {
         const match = (job.fbid && a.fbid === job.fbid) || (job.url && (a.previewUrl === job.url || a.playableUrl === job.url));
         if (match || (!job.fbid && !job.url && !a.mediaKey)) {
