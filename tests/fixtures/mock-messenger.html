@@ -46,13 +46,18 @@
         const state = { ws: null, received: [], streamId: 1 };
 
         function rowHtml(m) {
+          const lead = m.labelPrefix || 'At'; // other UI languages translate "At"
+          // the screen-reader button is translated too (Vietnamese form seen live: "Nhập, Tin nhắn do X gửi lúc 00:42: …")
+          const a11y = (m.labelPrefix
+            ? `Nhập, Tin nhắn do ${m.sender} gửi lúc ${m.time}`
+            : `Enter, Message sent ${m.time} by ${m.sender}`) + (m.text && !m.placeholder ? ': ' + m.text : '');
           const label = m.placeholder
-            ? `At ${m.time}, ${m.sender}`
+            ? `${lead} ${m.time}, ${m.sender}`
             : m.like
-            ? `At ${m.time}, ${m.sender}: 👍`
+            ? `${lead} ${m.time}, ${m.sender}: 👍`
             : m.text
-            ? `At ${m.time}, ${m.sender}: ${m.text}`
-            : `At ${m.time}, ${m.sender}`;
+            ? `${lead} ${m.time}, ${m.sender}: ${m.text}`
+            : `${lead} ${m.time}, ${m.sender}`;
           const avatar = m.mine
             ? ''
             : `<div role="presentation"><div aria-hidden="true"><span><div aria-expanded="false" aria-haspopup="dialog" role="button" tabindex="-1"><img alt="${m.sender}" src="https://scontent.xx.fbcdn.net/v/t1.6435-1/avatar.jpg?stp=dst-jpg_s100x100_tt6" width="28" height="28"></div></span></div></div>`;
@@ -76,7 +81,7 @@
                 <div role="presentation"><div aria-hidden="true" aria-label="Message actions" role="toolbar"></div></div>
               </div>
             </div></div>
-            <div role="none"><div aria-label="Enter, Message sent ${m.time} by ${m.sender}${m.text ? ': ' + m.text : ''}" role="button" tabindex="-1"><span dir="auto">Enter, Message sent ${m.time} by ${m.sender}</span></div></div>
+            <div role="none"><div aria-label="${a11y}" role="button" tabindex="-1"><span dir="auto">${a11y}</span></div></div>
           </div></div></div>`;
         }
 
@@ -134,7 +139,7 @@
             const r = rows.get(domId);
             const msg = r.node.querySelector('[data-scope="messages_table"]');
             msg.setAttribute('data-message-id', newDomId);
-            msg.setAttribute('aria-label', `At ${r.m.time}, ${r.m.sender}`);
+            msg.setAttribute('aria-label', `${r.m.labelPrefix || 'At'} ${r.m.time}, ${r.m.sender}`);
             const bubble = msg.querySelector('.bubble');
             bubble.innerHTML = `<div><span><div role="none"><div><div role="presentation"><span dir="auto"><div dir="auto">${placeholder}</div></span></div></div></div></span></div>`;
             rows.set(newDomId, { node: r.node, m: { ...r.m, domId: newDomId, placeholder, text: '' } });

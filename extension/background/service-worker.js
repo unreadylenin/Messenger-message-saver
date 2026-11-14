@@ -682,6 +682,50 @@ function distinctive(t) {
   return n.length >= 4 && !COMMON_TEXTS.has(n) && !/^[\p{Extended_Pictographic}\p{Emoji_Component}\u200d\ufe0f\s\p{P}]+$/u.test(n);
 }
 
+// Bengali and Arabic-Indic digits -> 0-9, so clock times can be read in any UI language
+function asciiDigits(t) {
+  return String(t || '').replace(/[\u09e6-\u09ef\u0660-\u0669\u06f0-\u06f9]/g, (d) => {
+    const c = d.charCodeAt(0);
+    return String(c >= 0x09e6 && c <= 0x09ef ? c - 0x09e6 : c >= 0x0660 && c <= 0x0669 ? c - 0x0660 : c - 0x06f0);
+  });
+}
+
+/** Minutes after midnight from a label like "At 3:11 PM, Alpha" or "Lúc 21:01, Kim"; null if none. */
+function clockOf(label) {
+  const t = asciiDigits(label);
+  const m = /(\d{1,2})[:.](\d{2})(?!\d)\s*(a\.?m\.?|p\.?m\.?|sa|ch)?/i.exec(t);
+  if (!m) return null;
+  let h = Number(m[1]);
+  const min = Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  const ampm = (m[3] || '').toLowerCase().replace(/\./g, '');
+  if ((ampm === 'pm' || ampm === 'ch') && h < 12) h += 12;
+  if ((ampm === 'am' || ampm === 'sa') && h === 12) h = 0;
+  return h * 60 + min;
+}
+
+function clockOfTs(ts) {
+  if (!ts) return null;
+  const d = new Date(ts);
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+function clockGap(a, b) {
+  const d = Math.abs(a - b);
+  return Math.min(d, 1440 - d);
+}
+
+/** Does the label carry a date (a number other than the clock time), e.g. "April 16, 2026, 10:55 AM"? */
+function stampHasDate(label) {
+  const t = asciiDigits(label).replace(/\d{1,2}[:.]\d{2}/g, ' ');
+  return /\d/.test(t);
+}
+
+function sameDay(a, b) {
+  if (!a || !b) return false;
+  return new Date(a).toDateString() === new Date(b).toDateString();
+}
+
 /** true / false when both names are known, null when one is missing. Accepts "Alpha" vs "Alpha Smith". */
 function sameSender(a, b) {
   const x = normalizeText(a).toLowerCase();
@@ -763,22 +807,33 @@ async function lookupPlaceholders(req) {
       if (typeof ph.isMine === 'boolean' && typeof c.isMine === 'boolean' && ph.isMine !== c.isMine) return;
       const nameMatch = sameSender(ph.senderName, c.senderName || (contacts.get(c.senderId) || {}).name);
       if (nameMatch === false) return;
+      // 1) full date and time known (English labels, or Messenger's own data): must agree
       let timeMatch = false;
-      if (ph.ts && c.ts && !c.approxTime) {
+      const exact = !!(ph.ts && c.ts && !c.approxTime);
+      if (exact) {
         const d = Math.abs(ph.ts - c.ts);
         if (d > 3 * 60000) return; // a different minute: a different message
         timeMatch = d <= 90000;
       }
-      const stampMatch = !!(ph.stamp && c.stamp && normalizeText(ph.stamp) === normalizeText(c.stamp));
+      // 2) any language: the clock time in the labels ("Lúc 21:01, Kim") must not disagree
+      const phClock = clockOf(ph.stamp);
+      const cClock = c.stamp ? clockOf(c.stamp) : c.approxTime ? null : clockOfTs(c.ts);
+      if (phClock !== null && cClock !== null && clockGap(phClock, cClock) > 3) return;
+      // 3) the same "At <time>, <Sender>" label only identifies a message if it carries a date,
+      //    or within the day the message was saved (a bare time repeats every day)
+      const sameStamp = !!(ph.stamp && c.stamp && normalizeText(ph.stamp) === normalizeText(c.stamp));
+      const stampMatch = sameStamp && (stampHasDate(ph.stamp) || sameDay(c.capturedAt || c.ts, Date.now()));
       const ctx = c.domContext ? { prev: normalizeText(c.domContext.prev).toLowerCase(), next: normalizeText(c.domContext.next).toLowerCase() } : neighbours.get(c.key) || { prev: '', next: '' };
       let near = 0;
       if (distinctive(pPrev) && pPrev === ctx.prev) near++;
       if (distinctive(pNext) && pNext === ctx.next) near++;
       const identity = (timeMatch || stampMatch ? 1 : 0) + near;
-      if (!identity) return;
-      if (!c.unsent && !c.deleted && identity < 2) return; // not known to be unsent: need two signals
+      // one signal is enough only for a message known to be unsent whose exact date and time agree;
+      // otherwise two independent signals are needed
+      if (!(identity >= 2 || (exact && timeMatch && c.unsent))) return;
       const score = (c.unsent ? 4 : c.deleted ? 2 : 0) + (timeMatch ? 5 : 0) + (stampMatch ? 5 : 0) + 4 * near + (nameMatch ? 1 : 0);
-      if (score >= 8) pairs.push({ pi, ci, score, ts: c.ts, strong: (timeMatch || stampMatch) && (near > 0 || c.unsent) });
+      // "high" only when the exact date and time agree; everything else is shown as "best match"
+      if (score >= 8) pairs.push({ pi, ci, score, ts: c.ts, strong: timeMatch && (near > 0 || c.unsent) });
     });
   });
   pairs.sort((a, b) => b.score - a.score || a.pi - b.pi || a.ts - b.ts);

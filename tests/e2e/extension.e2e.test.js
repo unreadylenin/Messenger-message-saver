@@ -380,6 +380,47 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     assert.equal(like.text, '👍');
   });
 
+  await t.test('other UI languages: no wrong match from a repeated clock time or a common greeting', async () => {
+    await page.evaluate(() => {
+      fb.openPopup({ logId: 'log-kim', title: 'Kim Le', profileId: '400000000000001', label: 'Tin nhắn trong cuộc trò chuyện với Kim Le', generic: 'Tin nhắn' });
+      fb.inLog('log-kim', (f) => {
+        f.addMessage({ domId: '400000000000001@msgr.7460000000000006601', sender: 'Kim Le', time: '21:01', labelPrefix: 'Lúc', text: 'my new password is Tr0ub4dor' });
+        f.addMessage({ domId: '400000000000001@msgr.7460000000000006602', sender: 'Kim Le', time: '21:05', labelPrefix: 'Lúc', text: 'chào buổi sáng nhé' });
+        f.addMessage({ domId: '400000000000001@msgr.7460000000000006603', sender: 'Kim Le', time: '21:06', labelPrefix: 'Lúc', text: 'the alarm code is 1234' });
+      });
+    });
+    await waitFor(async () => (await dbAll('messages')).some((m) => m.text === 'the alarm code is 1234'), { what: 'Kim messages saved' });
+    await page.evaluate(() => fb.inLog('log-kim', (f) => {
+      f.unsendInPlace('400000000000001@msgr.7460000000000006601', '400000000000001@msgr.7460000000000006601', 'Kim Le đã thu hồi một tin nhắn');
+      f.unsendInPlace('400000000000001@msgr.7460000000000006603', '400000000000001@msgr.7460000000000006603', 'Kim Le đã thu hồi một tin nhắn');
+    }));
+    await waitFor(async () => (await dbAll('messages')).filter((m) => m.threadKey === '400000000000001' && m.unsent).length === 2, { what: 'both unsends saved' });
+    // those were saved yesterday
+    await dash.evaluate(async () => {
+      const db = await import('/lib/db.js');
+      const day = 86400000;
+      await db.withStores(['messages'], 'readwrite', async (s) => {
+        const all = await db.reqP(s.messages.index('threadKey').getAll('400000000000001'));
+        for (const m of all) s.messages.put({ ...m, capturedAt: m.capturedAt - day, ts: m.ts - day });
+      });
+    });
+    // today: the same clock time with unrelated neighbours, and the same greeting before another message
+    await page.evaluate(() => fb.inLog('log-kim', (f) => {
+      f.clear && 0;
+      f.addMessage({ domId: '400000000000001@msgr.7460000000000006700', sender: 'Kim Le', time: '21:00', labelPrefix: 'Lúc', text: 'unrelated words here' });
+      f.addMessage({ domId: '400000000000001@msgr.7460000000000006701', sender: 'Kim Le', time: '21:01', labelPrefix: 'Lúc', placeholder: 'Kim Le đã thu hồi một tin nhắn' });
+      f.addMessage({ domId: '400000000000001@msgr.7460000000000006702', sender: 'Kim Le', time: '09:15', labelPrefix: 'Lúc', text: 'chào buổi sáng nhé' });
+      f.addMessage({ domId: '400000000000001@msgr.7460000000000006703', sender: 'Kim Le', time: '09:16', labelPrefix: 'Lúc', placeholder: 'Kim Le đã thu hồi một tin nhắn' });
+    }));
+    for (const id of ['6701', '6703']) {
+      const box = await waitFor(async () => page.evaluate((i) => {
+        const b = document.querySelector(`[data-message-id="400000000000001@msgr.746000000000000${i}"] .mms-recovered`);
+        return b && b.textContent;
+      }, id), { what: 'box for ' + id });
+      assert.match(box, /No saved copy/, id + ' must not show another message: ' + box);
+    }
+  });
+
   await t.test('Messenger notifications are kept as a backup copy', async () => {
     await page.evaluate(() => {
       try {

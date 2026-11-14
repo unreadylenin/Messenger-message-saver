@@ -454,16 +454,21 @@
     if (md) {
       const mi = MONTHS.findIndex((m) => m.startsWith(md[1].slice(0, 3)));
       d.setFullYear(md[3] ? Number(md[3]) : now.getFullYear(), mi, Number(md[2]));
-    } else {
+    }
+    let weekday = false;
+    if (!md) {
       const wd = WEEKDAYS.findIndex((w) => s.includes(w) || new RegExp('\\b' + w.slice(0, 3) + '\\b').test(s));
       if (wd >= 0) {
+        weekday = true;
         const diff = (now.getDay() - wd + 7) % 7 || 7;
         d.setDate(d.getDate() - diff);
       } else if (s.includes('yesterday')) d.setDate(d.getDate() - 1);
     }
     d.setHours(hh, mm, 0, 0);
     const t = d.getTime();
-    return t > now.getTime() + 60000 ? t - 7 * 86400000 : t;
+    if (t <= now.getTime() + 60000) return t;
+    // a time later than now: a weekday means last week; a bare time means yesterday at most
+    return weekday ? t - 7 * 86400000 : t - 86400000;
   }
 
   /**
