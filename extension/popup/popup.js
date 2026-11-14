@@ -33,7 +33,7 @@ function reflect(s) {
 }
 
 async function showStats() {
-  const [{ totals }, { stats = {} }] = await Promise.all([db.summarize(), chrome.storage.local.get('stats')]);
+  const [totals, { stats = {} }] = await Promise.all([db.quickTotals(), chrome.storage.local.get('stats')]);
   $('#s-messages').textContent = totals.messages;
   $('#s-unsent').textContent = totals.unsent;
   $('#s-edited').textContent = totals.edited;

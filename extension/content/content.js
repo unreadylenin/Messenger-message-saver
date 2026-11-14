@@ -21,8 +21,20 @@
 (() => {
   'use strict';
 
-  if (window.__mmsContentLoaded) return;
-  window.__mmsContentLoaded = true;
+  // One live copy per tab. After the extension is updated, reloaded or re-enabled, the
+  // background worker injects a fresh copy; an old copy whose extension context is gone
+  // steps aside (and stops itself, see invalidated()).
+  const runtimeRef = chrome.runtime;
+  const instance = { id: Math.random().toString(36).slice(2), t: Date.now() };
+  const prev = window.__mmsContent;
+  if (prev && typeof prev.alive === 'function' && prev.alive()) return;
+  if (prev && typeof prev.stop === 'function') {
+    try {
+      prev.stop();
+    } catch (e) {
+      /* already gone */
+    }
+  }
 
   const CHANNEL_OUT = '__mms_page_to_ext__'; // page hook -> here
   const CHANNEL_IN = '__mms_ext_to_page__'; // here -> page hook
@@ -49,21 +61,66 @@
   let settings = { ...DEFAULT_SETTINGS };
   let extensionAlive = true;
   const domStats = { logs: 0, rows: 0, saved: 0, placeholders: 0, recovered: 0 };
+  const cleanups = []; // observers and timers to stop if this copy is retired
+
+  function runtimeAlive() {
+    try {
+      return !!(runtimeRef && runtimeRef.id);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  window.__mmsContent = {
+    alive: () => extensionAlive && runtimeAlive(),
+    stop: () => invalidated(true),
+  };
 
   /* ---------------- talking to the background worker ---------------- */
+
+  function isInvalidation(e) {
+    return /context invalidated/i.test(String((e && e.message) || e)) || !runtimeAlive();
+  }
 
   function send(msg) {
     if (!extensionAlive) return Promise.resolve(null);
     try {
-      return chrome.runtime.sendMessage(msg).catch((e) => {
-        if (String(e && e.message).includes('Extension context invalidated')) extensionAlive = false;
+      return runtimeRef.sendMessage(msg).catch((e) => {
+        if (isInvalidation(e)) invalidated(false);
         return null;
       });
     } catch (e) {
-      extensionAlive = false; // extension was reloaded or removed
+      // e.g. "Message exceeded maximum allowed size": drop this message, keep working
+      if (isInvalidation(e)) invalidated(false);
+      else console.debug('[MMS] message not sent', e && e.message);
       return Promise.resolve(null);
     }
   }
+
+  /**
+   * The extension was updated, reloaded, disabled or removed: stop this copy and give the
+   * page back to Facebook's normal behaviour (a newer copy, if any, takes over the page hook).
+   */
+  function invalidated(replaced) {
+    if (!extensionAlive) return;
+    extensionAlive = false;
+    for (const fn of cleanups.splice(0)) {
+      try {
+        fn();
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    if (!replaced) {
+      document.querySelectorAll('.mms-recovered, .mms-edit-history').forEach((el) => el.remove());
+      document.dispatchEvent(new CustomEvent(CHANNEL_IN, { detail: JSON.stringify({ type: 'settings', inst: instance, data: { enabled: false } }) }));
+    }
+  }
+
+  const aliveTimer = setInterval(() => {
+    if (!runtimeAlive()) invalidated(false);
+  }, 5000);
+  cleanups.push(() => clearInterval(aliveTimer));
 
   function selfId() {
     const m = /(?:^|;\s*)c_user=(\d+)/.exec(document.cookie || '');
@@ -81,7 +138,8 @@
       blockTyping: settings.enabled && settings.blockTyping,
       stealthFocus: settings.enabled && settings.blockSeen && settings.stealthFocus,
     };
-    document.dispatchEvent(new CustomEvent(CHANNEL_IN, { detail: JSON.stringify({ type: 'settings', data: forPage }) }));
+    if (!extensionAlive) return;
+    document.dispatchEvent(new CustomEvent(CHANNEL_IN, { detail: JSON.stringify({ type: 'settings', inst: instance, data: forPage }) }));
   }
 
   chrome.storage.local.get('settings').then(({ settings: stored }) => {
@@ -121,7 +179,7 @@
     send({ type: 'ingest-ls', events, ctx: { selfId: selfId(), url: location.href } });
   }
 
-  document.addEventListener(CHANNEL_OUT, (e) => {
+  const onPageMessage = (e) => {
     let m;
     try {
       m = JSON.parse(String(e.detail));
@@ -148,7 +206,9 @@
       default:
         break;
     }
-  });
+  };
+  document.addEventListener(CHANNEL_OUT, onPageMessage);
+  cleanups.push(() => document.removeEventListener(CHANNEL_OUT, onPageMessage));
 
   // The page hook buffers until it gets settings; send defaults right away so nothing
   // waits on storage (real settings follow a few milliseconds later).
@@ -580,6 +640,18 @@
     return best;
   }
 
+  const rowCache = new WeakMap(); // row element -> { fp, data }
+
+  /** readRow, but rows whose label, id and content size did not change are not read again. */
+  function readRowCached(row, log) {
+    const fp = (row.getAttribute('aria-label') || '') + '|' + (row.getAttribute('data-message-id') || '') + '|' + row.textContent.length + '|' + row.getElementsByTagName('img').length + '|' + row.querySelectorAll('[role="img"]').length;
+    const hit = rowCache.get(row);
+    if (hit && hit.fp === fp) return { ...hit.data };
+    const data = readRow(row, log);
+    rowCache.set(row, { fp, data: { ...data } });
+    return data;
+  }
+
   function readRow(row, log) {
     const domId = canonId(row.getAttribute('data-message-id'));
     let text = messageText(row);
@@ -624,11 +696,9 @@
   const rowMemory = new Map(); // message id -> what the row showed this session (live unsend detection)
   const anchorMemory = new WeakMap(); // row element -> the same, survives Messenger changing the id
   const sentSignatures = new Set(); // what was already sent to the background
-  const blobCache = new Map(); // blob: url -> data url promise
-
+  /** Copies a decrypted (blob:) photo out of the page. Nothing is cached: the copy goes straight to storage. */
   function blobToDataUrl(src, maxBytes) {
-    if (blobCache.has(src)) return blobCache.get(src);
-    const p = fetch(src)
+    return fetch(src)
       .then((r) => r.blob())
       .then(
         (b) =>
@@ -641,9 +711,6 @@
           })
       )
       .catch(() => '');
-    blobCache.set(src, p);
-    if (blobCache.size > 300) blobCache.delete(blobCache.keys().next().value);
-    return p;
   }
 
   function memoryFor(r) {
@@ -652,6 +719,7 @@
 
   async function processLog(log, state) {
     state.timer = 0;
+    if (!extensionAlive) return;
     if (!document.contains(log)) {
       state.observer.disconnect();
       logs.delete(log);
@@ -660,7 +728,7 @@
     if (!settings.enabled) return;
     const thread = identifyThread(log);
     state.thread = thread;
-    const rows = messageRows(log).map((r) => readRow(r, log));
+    const rows = messageRows(log).map((r) => readRowCached(r, log));
     domStats.rows = Math.max(domStats.rows, rows.length);
 
     // A row that showed a saved message and now shows one short line, with the label's text
@@ -747,18 +815,27 @@
       domStats.saved += outItems.length;
       // Chrome limits one message to 64 MB: send photos in chunks of about 16 MB.
       const threadInfo = { id: thread.id, name: thread.name, e2ee: !!thread.e2ee, url: thread.url, altIds: thread.altIds || [] };
+      const LIMIT = 16 * 1024 * 1024;
+      const sizeOf = (it) => (it.text || '').length + it.images.reduce((n, im) => n + (im.dataUrl ? im.dataUrl.length : 300), 0) + 1000;
+      // a row with many photos becomes its text first, then one part per photo (same message id)
+      const pieces = [];
+      outItems.forEach((it, idx) => {
+        if (sizeOf(it) <= LIMIT || !it.images.length) return pieces.push({ it, sig: items[idx].sig });
+        pieces.push({ it: { ...it, images: [] }, sig: items[idx].sig });
+        for (const im of it.images) pieces.push({ it: { ...it, text: '', extras: [], images: [im] }, sig: items[idx].sig });
+      });
       const chunks = [];
       let cur = { items: [], sigs: [], size: 0 };
-      outItems.forEach((it, idx) => {
-        const size = (it.text || '').length + it.images.reduce((n, im) => n + (im.dataUrl ? im.dataUrl.length : 200), 0) + 500;
-        if (cur.items.length && cur.size + size > 16 * 1024 * 1024) {
+      for (const { it, sig } of pieces) {
+        const size = sizeOf(it);
+        if (cur.items.length && cur.size + size > LIMIT) {
           chunks.push(cur);
           cur = { items: [], sigs: [], size: 0 };
         }
         cur.items.push(it);
-        cur.sigs.push(items[idx].sig);
+        if (!cur.sigs.includes(sig)) cur.sigs.push(sig);
         cur.size += size;
-      });
+      }
       if (cur.items.length || unsentNow.length) chunks.push(cur);
       chunks.forEach((chunk, i) => {
         send({
@@ -932,10 +1009,15 @@
 
   /* ---------------- observers ---------------- */
 
+  const NOISE = '[data-mms], [role="toolbar"], [role="timer"], [role="slider"], [role="progressbar"]';
+
+  /** True when every change is ours or inside a playing timer, slider or hover toolbar. */
   function isOwnMutation(records) {
     return records.every((r) => {
+      const target = r.target && r.target.nodeType === 1 ? r.target : r.target && r.target.parentElement;
+      if (target && target.closest && target.closest(NOISE)) return true;
       const nodes = [...r.addedNodes, ...r.removedNodes];
-      if (!nodes.length) return r.target && r.target.closest && r.target.closest('[data-mms]');
+      if (!nodes.length) return false;
       return nodes.every((n) => n.nodeType === 1 && n.hasAttribute && n.hasAttribute('data-mms'));
     });
   }
@@ -948,6 +1030,10 @@
       if (!state.timer) state.timer = setTimeout(() => processLog(log, state).catch(() => {}), 350);
     });
     state.observer.observe(log, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['src', 'alt', 'aria-label', 'data-message-id'] });
+    cleanups.push(() => {
+      state.observer.disconnect();
+      clearTimeout(state.timer);
+    });
     logs.set(log, state);
     domStats.logs = logs.size;
     state.timer = setTimeout(() => processLog(log, state).catch(() => {}), 200);
@@ -973,7 +1059,7 @@
     if (scanTimer) return;
     scanTimer = setTimeout(() => {
       scanTimer = 0;
-      if (!settings.enabled) return;
+      if (!extensionAlive || !settings.enabled) return;
       if (!settings.captureDom && !settings.showRecoveredInline && !settings.showEditHistoryInline) return;
       findLogs().forEach(watchLog);
       for (const [log, state] of logs) {
@@ -1006,12 +1092,17 @@
       rootObserver.observe(document.documentElement, { childList: true, subtree: true });
       // Messenger is a single-page app: re-check when the address changes.
       let lastUrl = location.href;
-      setInterval(() => {
+      const urlTimer = setInterval(() => {
         if (location.href !== lastUrl) {
           lastUrl = location.href;
           scheduleFullScan();
         }
       }, 1000);
+      cleanups.push(() => {
+        rootObserver.disconnect();
+        clearInterval(urlTimer);
+        clearTimeout(scanTimer);
+      });
     };
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', begin, { once: true });
     else begin();

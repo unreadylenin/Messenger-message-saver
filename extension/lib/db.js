@@ -2,7 +2,7 @@
 // Used by the background worker, the popup and the dashboard.
 
 export const DB_NAME = 'messenger-message-saver';
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 let dbPromise = null;
 
@@ -37,6 +37,8 @@ export function openDb() {
       }
       // v2: a message whose on-screen id changed (encrypted chats change it on unsend)
       if (!db.objectStoreNames.contains('aliases')) db.createObjectStore('aliases', { keyPath: 'domId' });
+      // v3: photo downloads still to do (kept here so they survive the worker being stopped)
+      if (!db.objectStoreNames.contains('pendingMedia')) db.createObjectStore('pendingMedia', { keyPath: 'id' });
       const msgStore = req.transaction.objectStore('messages');
       if (!msgStore.indexNames.contains('domId')) msgStore.createIndex('domId', 'domId');
     };
@@ -205,6 +207,21 @@ export async function recentEvents(limit = 50) {
   });
 }
 
+/** Totals from index counts only - cheap even with a very large history. */
+export async function quickTotals() {
+  return withStores(['messages', 'media'], 'readonly', async (s) => {
+    const idx = s.messages.index('status');
+    const [messages, unsent, edited, deleted, media] = await Promise.all([
+      reqP(s.messages.count()),
+      reqP(idx.count('unsent')),
+      reqP(idx.count('edited')),
+      reqP(idx.count('deleted')),
+      reqP(s.media.count()),
+    ]);
+    return { messages, unsent, edited, deleted, media };
+  });
+}
+
 /** One pass over all messages: per-thread counters + totals. */
 export async function summarize() {
   const [messages, threads, contacts] = await Promise.all([getAll('messages'), getAll('threads'), getAll('contacts')]);
@@ -292,7 +309,7 @@ export async function deleteThread(threadKey) {
 }
 
 export async function clearAll() {
-  await withStores(['messages', 'threads', 'contacts', 'media', 'notifications', 'events', 'aliases'], 'readwrite', async (s) => {
+  await withStores(['messages', 'threads', 'contacts', 'media', 'notifications', 'events', 'aliases', 'pendingMedia'], 'readwrite', async (s) => {
     for (const k of Object.keys(s)) s[k].clear();
   });
 }
@@ -356,7 +373,7 @@ export async function exportAll({ includeMedia = true } = {}) {
   const [messages, threads, contacts, notifications, events, aliases] = await Promise.all(['messages', 'threads', 'contacts', 'notifications', 'events', 'aliases'].map(getAll));
   const out = {
     format: 'messenger-message-saver',
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
     messages,
     threads,
@@ -367,19 +384,94 @@ export async function exportAll({ includeMedia = true } = {}) {
     media: [],
   };
   if (includeMedia) {
-    const media = await getAll('media');
-    for (const m of media) {
-      if (!(m.blob instanceof Blob)) continue;
-      out.media.push({ key: m.key, mime: m.mime, url: m.url, messageKey: m.messageKey, savedAt: m.savedAt, size: m.size, data: await blobToBase64(m.blob) });
+    for (const m of await getAll('media')) {
+      if (m.blob instanceof Blob) out.media.push({ key: m.key, mime: m.mime, url: m.url, messageKey: m.messageKey, savedAt: m.savedAt, size: m.size, data: await blobToBase64(m.blob) });
     }
   }
   return out;
 }
 
+/**
+ * The backup file, built from parts so photos never have to fit in one string.
+ * It is ordinary JSON, written with one photo per line:
+ *   {"format":...,"messages":[...],...,"media":[
+ *   {photo 1}
+ *   ,{photo 2}
+ *   ]}
+ */
+export async function exportBlob({ includeMedia = true } = {}) {
+  const base = await exportAll({ includeMedia: false });
+  delete base.media;
+  const head = JSON.stringify(base);
+  const parts = [new Blob([head.slice(0, -1) + ',"media":[\n'])];
+  let count = 0;
+  if (includeMedia) {
+    const keys = await withStores(['media'], 'readonly', (s) => reqP(s.media.getAllKeys()));
+    for (const key of keys) {
+      const m = await getMedia(key);
+      if (!m || !(m.blob instanceof Blob)) continue;
+      const line = JSON.stringify({ key: m.key, mime: m.mime, url: m.url, messageKey: m.messageKey, savedAt: m.savedAt, size: m.size, data: await blobToBase64(m.blob) });
+      parts.push(new Blob([(count ? ',' : '') + line + '\n']));
+      count++;
+    }
+  }
+  parts.push(new Blob([']}']));
+  return { blob: new Blob(parts, { type: 'application/json' }), photos: count };
+}
+
+/** Restores a backup file of any size: the photos are read one line at a time. */
+export async function importFile(file, onProgress, { streamAbove = 64 * 1024 * 1024 } = {}) {
+  if (file.size < streamAbove) return importAll(JSON.parse(await file.text()));
+  const reader = file.stream().pipeThrough(new TextDecoderStream()).getReader();
+  let buf = '';
+  let head = null;
+  const counts = { messages: 0, threads: 0, contacts: 0, media: 0 };
+  let batch = [];
+  const flush = async () => {
+    if (!batch.length) return;
+    const c = await importAll({ format: 'messenger-message-saver', media: batch });
+    counts.media += c.media;
+    batch = [];
+    if (onProgress) onProgress(counts);
+  };
+  const handleLine = async (line) => {
+    if (head === null) {
+      head = line;
+      if (!head.endsWith('"media":[')) throw new Error('This backup is too large to restore in one piece and is not in the expected layout.');
+      const base = JSON.parse(head + ']}');
+      const c = await importAll(base);
+      counts.messages = c.messages;
+      counts.threads = c.threads;
+      counts.contacts = c.contacts;
+      return;
+    }
+    let l = line.trim();
+    if (!l || l === ']}') return;
+    if (l.startsWith(',')) l = l.slice(1);
+    batch.push(JSON.parse(l));
+    if (batch.length >= 20) await flush();
+  };
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (value) buf += value;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      await handleLine(line);
+    }
+    if (done) break;
+  }
+  if (buf.trim()) await handleLine(buf);
+  await flush();
+  return counts;
+}
+
 export async function importAll(data) {
   if (!data || data.format !== 'messenger-message-saver') throw new Error('This file is not a Messenger Message Saver backup.');
   const counts = { messages: 0, threads: 0, contacts: 0, media: 0 };
-  const existing = new Map((await getAll('messages')).map((m) => [m.key, m]));
+  const existing = new Map();
+  if ((data.messages || []).length) for (const m of await getAll('messages')) existing.set(m.key, m);
   await withStores(['messages', 'threads', 'contacts', 'notifications', 'events', 'media', 'aliases'], 'readwrite', async (s) => {
     for (const a of data.aliases || []) if (a && a.domId && a.messageKey) s.aliases.put(a);
     for (const m of data.messages || []) {
@@ -405,7 +497,7 @@ export async function importAll(data) {
       s.events.add(rest);
     }
     for (const md of data.media || []) {
-      if (!md.data) continue;
+      if (!md || !md.data) continue;
       s.media.put({ key: md.key, mime: md.mime, url: md.url, messageKey: md.messageKey, savedAt: md.savedAt, size: md.size, blob: base64ToBlob(md.data, md.mime) });
       counts.media++;
     }

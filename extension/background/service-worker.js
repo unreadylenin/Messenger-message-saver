@@ -37,10 +37,48 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 chrome.runtime.onStartup.addListener(() => updateBadge());
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === 'mms-media') return pumpMedia();
   if (alarm.name !== 'mms-prune') return;
   const s = await settings();
   if (s.retentionDays > 0) await db.prune(s.retentionDays);
 });
+
+/* ---------------- tabs opened before an install, update or re-enable ---------------- */
+// Chrome does not inject content scripts into tabs that are already open. Do it once per
+// extension start (session storage is emptied on install, update, reload and re-enable).
+
+const PAGE_MATCHES = ['https://www.facebook.com/*', 'https://web.facebook.com/*', 'https://www.messenger.com/*'];
+
+async function injectIntoOpenTabs() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: PAGE_MATCHES });
+  } catch (e) {
+    return;
+  }
+  for (const tab of tabs) {
+    if (!tab.id || tab.discarded) continue;
+    try {
+      // the page hook does nothing if a copy is already running in that tab
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content/main-world.js'], world: 'MAIN' });
+      await chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: ['content/content.css'] });
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content/content.js'] });
+    } catch (e) {
+      console.debug('[MMS] could not refresh tab', tab.id, e && e.message);
+    }
+  }
+}
+
+(async () => {
+  try {
+    const { injected } = await chrome.storage.session.get('injected');
+    if (injected) return;
+    await chrome.storage.session.set({ injected: true });
+    await injectIntoOpenTabs();
+  } catch (e) {
+    console.debug('[MMS] tab refresh skipped', e && e.message);
+  }
+})();
 
 /* ---------------- serial write queue ---------------- */
 // All writes go through one chain so two tabs cannot overwrite each other's updates.
@@ -66,6 +104,15 @@ function hash53(str, seed = 0) {
   h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
   h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
   return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+
+/** Identifies a photo copied from the page by sampling its whole content (cheap for big photos). */
+function fingerprint(dataUrl) {
+  const n = dataUrl.length;
+  let sample = String(n);
+  const step = Math.max(1, Math.floor(n / 64));
+  for (let i = 0; i < n; i += step) sample += dataUrl.slice(i, i + 48);
+  return hash53(sample) + hash53(sample, 7);
 }
 
 function addSource(rec, src) {
@@ -148,9 +195,9 @@ async function ingestLs(ev, ctx) {
   const selfId = ctx.selfId || '';
   const now = Date.now();
   const notices = [];
-  const mediaJobs = [];
+  let queuedMedia = false;
 
-  await db.withStores(['messages', 'threads', 'contacts', 'events'], 'readwrite', async (st) => {
+  await db.withStores(['messages', 'threads', 'contacts', 'events', 'pendingMedia'], 'readwrite', async (st) => {
     for (const c of ev.contacts || []) {
       if (!c.id || !c.name) continue;
       const old = (await reqP(st.contacts.get(c.id))) || {};
@@ -233,7 +280,10 @@ async function ingestLs(ev, ctx) {
       touched.set(key, rec);
       if (s.saveMedia && isImageAttachment(att) && !att.mediaKey) {
         const url = att.previewUrl || att.playableUrl;
-        if (url) mediaJobs.push({ messageKey: key, url, fbid: att.fbid });
+        if (url) {
+          st.pendingMedia.put({ id: key + '|' + (att.fbid || url), messageKey: key, url, fbid: att.fbid || '', addedAt: now, tries: 0 });
+          queuedMedia = true;
+        }
       }
     }
 
@@ -310,7 +360,7 @@ async function ingestLs(ev, ctx) {
   });
 
   for (const n of notices) await notify(n);
-  for (const j of mediaJobs) queueMedia(j);
+  if (queuedMedia) pumpMedia();
   if (notices.some((n) => n.kind === 'unsent')) updateBadge();
 }
 
@@ -393,9 +443,10 @@ async function ingestDom(batch, ctx) {
   for (const id of thread.altIds || []) if (id && !chatKeys.includes(String(id))) chatKeys.push(String(id));
   const now = Date.now();
   const notices = [];
-  const mediaJobs = [];
+  let queuedMedia = false;
+  const maxBytes = Math.max(1, s.maxMediaMB || 15) * 1024 * 1024;
 
-  await db.withStores(['messages', 'events', 'aliases'], 'readwrite', async (st) => {
+  await db.withStores(['messages', 'events', 'aliases', 'media', 'pendingMedia'], 'readwrite', async (st) => {
     const touched = new Map();
     const byDomId = async (domId) => {
       if (!domId) return null;
@@ -479,12 +530,22 @@ async function ingestDom(batch, ctx) {
           mime: 'image/*',
           width: im.w || 0,
           height: im.h || 0,
-          fbid: im.key || (im.dataUrl ? 'data:' + hash53(im.dataUrl.slice(0, 4096) + im.dataUrl.length) : ''),
+          fbid: im.key || (im.dataUrl ? 'data:' + fingerprint(im.dataUrl) : ''),
           title: im.alt && im.alt !== 'Open photo' ? im.alt : '',
         });
         if (s.saveMedia && !att.mediaKey) {
-          if (im.dataUrl) mediaJobs.push({ messageKey: rec.key, dataUrl: im.dataUrl, fbid: att.fbid });
-          else if (im.src && /^https:\/\/[^/]*\.fbcdn\.net\//.test(im.src)) mediaJobs.push({ messageKey: rec.key, url: im.src, fbid: att.fbid });
+          if (im.dataUrl) {
+            // decrypted photos (blob:) only exist in the page: keep the copy now, in this transaction
+            const blob = dataUrlToBlob(im.dataUrl);
+            if (blob && blob.size <= maxBytes) {
+              const mediaKey = 'fbid:' + att.fbid;
+              st.media.put({ key: mediaKey, blob, mime: blob.type, size: blob.size, url: '', messageKey: rec.key, savedAt: now });
+              att.mediaKey = mediaKey;
+            }
+          } else if (im.src && /^https:\/\/[^/]*\.fbcdn\.net\//.test(im.src)) {
+            st.pendingMedia.put({ id: rec.key + '|' + (att.fbid || im.src), messageKey: rec.key, url: im.src, fbid: att.fbid || '', addedAt: now, tries: 0 });
+            queuedMedia = true;
+          }
         }
       }
       for (const x of extras) {
@@ -539,7 +600,7 @@ async function ingestDom(batch, ctx) {
   });
 
   for (const n of notices) await notify(n);
-  for (const j of mediaJobs) queueMedia(j);
+  if (queuedMedia) pumpMedia();
   if (notices.length) updateBadge();
   return { ok: true, threadKey };
 }
@@ -753,28 +814,62 @@ async function lookupEdited(req) {
 }
 
 /* ---------------- media download ---------------- */
+// Jobs live in the 'pendingMedia' store, so photos still get downloaded after Chrome
+// stops the idle worker; while downloads run, a cheap API call every 20 s keeps it awake.
 
-const mediaQueue = [];
-let mediaActive = 0;
+let mediaPumping = false;
 
-function queueMedia(job) {
-  if (mediaQueue.length > 500) return;
-  mediaQueue.push(job);
-  pumpMedia();
-}
-
-function pumpMedia() {
-  while (mediaActive < 2 && mediaQueue.length) {
-    const job = mediaQueue.shift();
-    mediaActive++;
-    saveMedia(job)
-      .catch((e) => console.debug('[MMS] media not saved', e && e.message))
-      .finally(() => {
-        mediaActive--;
-        pumpMedia();
-      });
+async function pumpMedia() {
+  if (mediaPumping) return;
+  mediaPumping = true;
+  const keepAlive = setInterval(() => chrome.runtime.getPlatformInfo().catch(() => {}), 20000);
+  try {
+    for (;;) {
+      const s = await settings();
+      if (!s.saveMedia) break;
+      const now = Date.now();
+      const { jobs, waiting } = await db.withStores(['pendingMedia'], 'readonly', (st) =>
+        new Promise((resolve, reject) => {
+          const out = [];
+          let later = 0;
+          const req = st.pendingMedia.openCursor();
+          req.onsuccess = () => {
+            const c = req.result;
+            if (!c || out.length >= 4) return resolve({ jobs: out, waiting: later });
+            if (!c.value.retryAt || c.value.retryAt <= now) out.push(c.value);
+            else later++;
+            c.continue();
+          };
+          req.onerror = () => reject(req.error);
+        })
+      );
+      if (!jobs.length) {
+        if (waiting) chrome.alarms.create('mms-media', { delayInMinutes: 5 });
+        break;
+      }
+      await Promise.all(
+        jobs.map(async (job) => {
+          let done = true;
+          try {
+            await saveMedia(job);
+          } catch (e) {
+            // network hiccup: try again in 5 minutes; give up after 3 attempts or 3 days
+            done = job.tries >= 2 || Date.now() - job.addedAt > 3 * 86400000;
+            if (!done) await db.withStores(['pendingMedia'], 'readwrite', async (st) => st.pendingMedia.put({ ...job, tries: job.tries + 1, retryAt: Date.now() + 5 * 60000 }));
+            console.debug('[MMS] photo not saved yet', e && e.message);
+          }
+          if (done) await db.withStores(['pendingMedia'], 'readwrite', async (st) => st.pendingMedia.delete(job.id));
+        })
+      );
+    }
+  } finally {
+    clearInterval(keepAlive);
+    mediaPumping = false;
   }
 }
+
+// resume anything left over from before the worker was stopped
+pumpMedia().catch(() => {});
 
 function dataUrlToBlob(dataUrl) {
   const m = /^data:([^;,]*)(;base64)?,(.*)$/s.exec(dataUrl || '');
@@ -798,19 +893,17 @@ async function saveMedia(job) {
   const s = await settings();
   if (!s.saveMedia) return;
   const maxBytes = Math.max(1, s.maxMediaMB || 15) * 1024 * 1024;
-  const mediaKey = job.fbid ? 'fbid:' + job.fbid : 'url:' + hash53(job.url || job.dataUrl.slice(0, 2000));
+  const mediaKey = job.fbid ? 'fbid:' + job.fbid : 'url:' + hash53(job.url);
   const existing = await db.getMedia(mediaKey);
   let blob = existing && existing.blob;
   if (!blob) {
-    if (job.dataUrl) blob = dataUrlToBlob(job.dataUrl);
-    else {
-      if (!/^https:\/\/([a-z0-9-]+\.)*(fbcdn\.net|facebook\.com|messenger\.com)\//i.test(job.url)) return;
-      const resp = await fetch(job.url, { credentials: 'omit', cache: 'force-cache' });
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      const len = Number(resp.headers.get('content-length') || 0);
-      if (len && len > maxBytes) return;
-      blob = await resp.blob();
-    }
+    if (!/^https:\/\/([a-z0-9-]+\.)*(fbcdn\.net|facebook\.com|messenger\.com)\//i.test(job.url)) return;
+    const resp = await fetch(job.url, { credentials: 'omit', cache: 'force-cache' });
+    if (resp.status === 403 || resp.status === 404 || resp.status === 410) return; // link expired: nothing to retry
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const len = Number(resp.headers.get('content-length') || 0);
+    if (len && len > maxBytes) return;
+    blob = await resp.blob();
     if (!blob || blob.size > maxBytes) return;
   }
   await serial(() =>

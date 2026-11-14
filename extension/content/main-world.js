@@ -889,6 +889,7 @@
         stealthFocus: true,
       },
       ready: false,
+      owner: null,
       queue: [],
       readWatermarks: new Map(),
       diag: {
@@ -955,6 +956,12 @@
         return;
       }
       if (!m || typeof m !== 'object') return;
+      // After an update a newer content-script copy takes over; an older copy's last words
+      // (e.g. "disable" from a retired copy) must not override it.
+      if (m.inst && typeof m.inst.t === 'number') {
+        if (state.owner && m.inst.id !== state.owner.id && m.inst.t < state.owner.t) return;
+        if (!state.owner || m.inst.t >= state.owner.t) state.owner = { id: String(m.inst.id), t: m.inst.t };
+      }
       if (m.type === 'settings' && m.data && typeof m.data === 'object') {
         Object.assign(state.settings, m.data);
         if (!state.ready) {

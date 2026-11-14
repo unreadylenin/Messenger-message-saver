@@ -403,6 +403,49 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     await popup.close();
   });
 
+  await t.test('a row with a large photo album is split, saved, and capture keeps going', async () => {
+    // 3 photos of ~9 MB in one row: more than one message to the background can carry at once
+    await page.evaluate(() => {
+      const big = (seed) => {
+        const bytes = new Uint8Array(9 * 1024 * 1024);
+        for (let i = 0; i < bytes.length; i += 512) bytes[i] = (i / 512 + seed * 37) & 255;
+        return URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
+      };
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000006501', sender: 'Khondoker Aurthe', time: '3:40 PM', text: 'album', photo: big(1) });
+      const row = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000006501"] .bubble');
+      for (let i = 2; i <= 3; i++) row.insertAdjacentHTML('beforeend', `<div role="presentation"><img alt="Open photo" width="800" height="600" src="${big(i)}"></div>`);
+    });
+    const album = await waitFor(async () => {
+      const m = (await dbAll('messages')).find((x) => x.domId === 'msgr.7460000000000006501');
+      return m && m.attachments.filter((a) => a.mediaKey).length === 3 ? m : null;
+    }, { timeout: 30000, what: 'all three album photos stored' });
+    assert.equal(album.text, 'album');
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006502', sender: 'Khondoker Aurthe', time: '3:41 PM', text: 'after the album' }));
+    await waitFor(async () => (await dbAll('messages')).some((m) => m.text === 'after the album'), { what: 'capture still running after a huge row' });
+  });
+
+  await t.test('backup with photos restores everything (one piece and line by line)', async () => {
+    const result = await dash.evaluate(async () => {
+      const db = await import('/lib/db.js');
+      const before = await db.quickTotals();
+      const { blob, photos } = await db.exportBlob({ includeMedia: true });
+      const file = new File([blob], 'backup.json', { type: 'application/json' });
+      await db.clearAll();
+      const emptied = await db.quickTotals();
+      await db.importFile(file, null, { streamAbove: Number.MAX_SAFE_INTEGER }); // whole-file path
+      const once = await db.quickTotals();
+      await db.clearAll();
+      await db.importFile(file, null, { streamAbove: 0 }); // line-by-line path used for huge backups
+      const twice = await db.quickTotals();
+      return { before, emptied, once, twice, photos };
+    });
+    assert.equal(result.emptied.messages, 0);
+    assert.equal(result.photos, result.before.media, 'every stored photo exported');
+    assert.ok(result.photos >= 4, 'photos exported: ' + result.photos);
+    assert.deepEqual(result.once, result.before);
+    assert.deepEqual(result.twice, result.before);
+  });
+
   await t.test('no script errors anywhere', async () => {
     assert.deepEqual(errors, []);
   });

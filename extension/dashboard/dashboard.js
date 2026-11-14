@@ -338,9 +338,14 @@ function stamp() {
 }
 
 async function exportJson(includeMedia) {
-  toast('Preparing backup…');
-  const data = await db.exportAll({ includeMedia });
-  download(`messenger-saved-${stamp()}.json`, new Blob([JSON.stringify(data)], { type: 'application/json' }));
+  try {
+    toast('Preparing backup…');
+    const { blob, photos } = await db.exportBlob({ includeMedia });
+    download(`messenger-saved-${stamp()}.json`, blob);
+    toast(includeMedia ? `Backup ready (${photos} photos)` : 'Backup ready');
+  } catch (e) {
+    toast('Backup failed: ' + e.message);
+  }
 }
 
 function csvCell(v) {
@@ -403,8 +408,8 @@ async function exportHtml() {
 
 async function importJson(file) {
   try {
-    const data = JSON.parse(await file.text());
-    const counts = await db.importAll(data);
+    toast('Restoring…');
+    const counts = await db.importFile(file, (c) => toast(`Restoring… ${c.media} photos so far`));
     toast(`Restored ${counts.messages} messages, ${counts.media} photos`);
     await refreshAll();
   } catch (e) {
@@ -509,9 +514,10 @@ async function init() {
   });
   $('#export-json').addEventListener('click', () => exportJson(true));
   $('#export-json-light').addEventListener('click', () => exportJson(false));
-  $('#export-html').addEventListener('click', exportHtml);
-  $('#export-csv').addEventListener('click', () => exportCsv(null));
-  $('#export-thread').addEventListener('click', () => state.currentThread && exportCsv(state.currentThread));
+  const guarded = (fn) => () => fn().catch((e) => toast('Export failed: ' + e.message));
+  $('#export-html').addEventListener('click', guarded(exportHtml));
+  $('#export-csv').addEventListener('click', guarded(() => exportCsv(null)));
+  $('#export-thread').addEventListener('click', guarded(() => (state.currentThread ? exportCsv(state.currentThread) : Promise.resolve())));
   $('#import-json').addEventListener('change', (e) => e.target.files[0] && importJson(e.target.files[0]));
   $('#delete-thread').addEventListener('click', async () => {
     if (!state.currentThread) return;
@@ -532,14 +538,14 @@ async function init() {
   route();
   chrome.runtime.sendMessage({ type: 'badge-seen' }).catch(() => {});
   // keep counts and lists fresh while the page is open, without jumping around
-  let lastTotals = JSON.stringify(state.summary.totals);
+  let lastTotals = JSON.stringify(await db.quickTotals());
   setInterval(async () => {
     if (document.visibilityState !== 'visible') return;
     try {
-      await loadBasics();
-      const now = JSON.stringify(state.summary.totals);
+      const now = JSON.stringify(await db.quickTotals()); // cheap: index counts only
       if (now === lastTotals) return;
       lastTotals = now;
+      await loadBasics();
       if (!$('#view-unsent').hidden) await renderUnsent();
       else if (!$('#view-edited').hidden) await renderEdited();
       else if (!$('#view-chats').hidden) renderThreadList();
