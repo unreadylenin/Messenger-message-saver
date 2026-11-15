@@ -870,6 +870,281 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* Downloads: a video's file, a photo's largest copy                   */
+  /* ------------------------------------------------------------------ */
+  // Facebook plays videos and reels through MediaSource ("blob:" addresses that cannot be
+  // saved), but its data for every video also carries ready-made MP4 files with sound:
+  //   videoDeliveryLegacyFields: browser_native_hd_url / browser_native_sd_url,
+  //                              playable_url_quality_hd / playable_url
+  //   videoDeliveryResponseResult.progressive_urls[]: { progressive_url, metadata.quality }
+  //   older pages / player props: hd_src / sd_src, hdSrc / sdSrc
+  // and DASH manifests (separate picture and sound tracks) as the last resort.
+  // Field names checked against yt-dlp's Facebook extractor (Nov 2026).
+
+  const HD_KEYS = ['browser_native_hd_url', 'playable_url_quality_hd', 'hd_src_no_ratelimit', 'hd_src', 'hdSrcNoRatelimit', 'hdSrc', 'browserNativeHdUrl', 'playableUrlQualityHd', 'hdPlaybackUrl'];
+  const SD_KEYS = ['browser_native_sd_url', 'playable_url', 'sd_src_no_ratelimit', 'sd_src', 'sdSrcNoRatelimit', 'sdSrc', 'browserNativeSdUrl', 'playableUrl', 'sdPlaybackUrl'];
+  const DASH_KEYS = ['manifest_xml', 'dash_manifest', 'dash_manifest_xml_string', 'manifestXml', 'dashManifest', 'dashManifestXml'];
+  const VIDEO_ID_KEYS = ['videoId', 'videoID', 'video_id', 'videoFBID', 'videoFbid'];
+  const WALK_SKIP = new Set(['_owner', '_debugOwner', 'return', 'child', 'sibling', 'alternate', 'stateNode', 'ref', 'environment', 'relayEnvironment', '__fragmentOwner', '__fragments', 'dispatch']);
+
+  function isFbMediaUrl(u) {
+    return typeof u === 'string' && u.length < 4000 && /^https:\/\/[a-z0-9.-]+\.(?:fbcdn\.net|fbsbx\.com|facebook\.com)\//i.test(u);
+  }
+
+  /** A whole MP4 file on Facebook's media servers (not a manifest, not one byte range of a DASH track). */
+  function isProgressiveUrl(u) {
+    return isFbMediaUrl(u) && /^https:\/\/[^/]+\.(?:fbcdn\.net|fbsbx\.com)\//i.test(u) && !/[?&](?:bytestart|byteend)=/i.test(u) && !/\.mpd(?:[?#]|$)/i.test(u);
+  }
+
+  function looksLikeMpd(s) {
+    return typeof s === 'string' && s.length > 40 && /^\s*(?:<\?xml|<MPD|%3C%3Fxml|%3CMPD)/i.test(s);
+  }
+
+  function numericId(v) {
+    const s = typeof v === 'number' ? String(v) : typeof v === 'string' ? v : '';
+    return /^\d{5,25}$/.test(s) ? s : '';
+  }
+
+  /**
+   * Walks plain objects and arrays (React props, hook state, parsed page JSON), never class
+   * instances, DOM nodes or React's fiber links. visit(obj, ctx) returns the context for the
+   * object's children (or WALK_STOP).
+   */
+  const WALK_STOP = {};
+  function walkPlain(root, visit, budget, maxDepth, ctx0, total) {
+    const seen = new Set();
+    const stack = [[root, 0, ctx0 || '']];
+    let n = 0;
+    while (stack.length && n < budget) {
+      if (total && total.n >= total.max) return; // shared cap for one whole search
+      const [v, depth, ctx] = stack.pop();
+      if (!v || typeof v !== 'object' || seen.has(v)) continue;
+      seen.add(v);
+      n++;
+      if (total) total.n++;
+      try {
+        if (Array.isArray(v)) {
+          if (depth >= maxDepth) continue;
+          for (let i = Math.min(v.length, 400) - 1; i >= 0; i--) {
+            const c = v[i];
+            if (c && typeof c === 'object') stack.push([c, depth + 1, ctx]);
+          }
+          continue;
+        }
+        const proto = Object.getPrototypeOf(v);
+        if (proto !== Object.prototype && proto !== null) continue;
+        const ctx2 = visit(v, ctx);
+        if (ctx2 === WALK_STOP) return;
+        if (depth >= maxDepth) continue;
+        const keys = Object.keys(v);
+        for (let i = keys.length - 1; i >= 0; i--) {
+          const k = keys[i];
+          if (WALK_SKIP.has(k) || k.startsWith('__react')) continue;
+          const c = v[k];
+          if (c && typeof c === 'object') stack.push([c, depth + 1, ctx2]);
+        }
+      } catch (e) {
+        /* a getter that throws: skip this object */
+      }
+    }
+  }
+
+  function firstUrl(o, keys, test) {
+    for (const k of keys) {
+      const u = o[k];
+      if (test(u)) return u;
+    }
+    return '';
+  }
+
+  /** Video files described by one object (or '' parts), with the id the object carries. */
+  function videoPartsOf(o) {
+    let hd = firstUrl(o, HD_KEYS, isProgressiveUrl);
+    let sd = firstUrl(o, SD_KEYS, isProgressiveUrl);
+    const prog = o.progressive_urls || o.progressiveUrls;
+    if (Array.isArray(prog)) {
+      for (const p of prog) {
+        if (!p || typeof p !== 'object') continue;
+        const u = p.progressive_url || p.progressiveUrl;
+        if (!isProgressiveUrl(u)) continue;
+        const q = String((p.metadata && p.metadata.quality) || p.quality || '').toLowerCase();
+        if (q === 'hd' && !hd) hd = u;
+        else if (q !== 'hd' && !sd) sd = u;
+      }
+    }
+    let dash = '';
+    for (const k of DASH_KEYS) {
+      if (looksLikeMpd(o[k])) {
+        dash = o[k];
+        break;
+      }
+    }
+    if (!hd && !sd && !dash) return null;
+    return { hd, sd, dash };
+  }
+
+  function ownVideoId(o, hasMedia) {
+    for (const k of VIDEO_ID_KEYS) {
+      const id = numericId(o[k]);
+      if (id) return id;
+    }
+    if (o.__typename === 'Video' || hasMedia) return numericId(o.id);
+    return '';
+  }
+
+  /**
+   * Every video found under `root`, merged per video id, in the order met.
+   * Returns [{ id, hd, sd, dash }].
+   */
+  function findVideoSources(root, opts) {
+    const o = opts || {};
+    const byKey = new Map();
+    let anon = 0;
+    walkPlain(
+      root,
+      (obj, ctx) => {
+        const parts = videoPartsOf(obj);
+        const id = ownVideoId(obj, !!parts) || ctx;
+        if (parts) {
+          const key = id || 'anon' + anon++;
+          const cur = byKey.get(key) || { id, hd: '', sd: '', dash: '' };
+          cur.hd = cur.hd || parts.hd;
+          cur.sd = cur.sd || parts.sd;
+          cur.dash = cur.dash || parts.dash;
+          byKey.set(key, cur);
+        }
+        return id;
+      },
+      o.budget || 3000,
+      o.maxDepth || 10,
+      o.ctxId || '',
+      o.total
+    );
+    return [...byKey.values()];
+  }
+
+  function pickVideo(list, id) {
+    if (!list || !list.length) return null;
+    if (id) {
+      const exact = list.find((v) => v.id === id);
+      if (exact) return exact;
+    }
+    return list.find((v) => v.hd || v.sd) || list[0];
+  }
+
+  /** The best picture track and the best sound track of a DASH manifest. */
+  function dashTracks(xml) {
+    let s = String(xml || '');
+    if (/^\s*%3C/i.test(s)) {
+      try {
+        s = decodeURIComponent(s.replace(/\+/g, ' '));
+      } catch (e) {
+        return null;
+      }
+    }
+    const unescapeXml = (t) => t.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'");
+    const attr = (tag, name) => {
+      const m = new RegExp('\\s' + name + '="([^"]*)"', 'i').exec(tag);
+      return m ? m[1] : '';
+    };
+    let video = null;
+    let audio = null;
+    const setRe = /<AdaptationSet\b([^>]*)>([\s\S]*?)<\/AdaptationSet>/gi;
+    let set;
+    while ((set = setRe.exec(s))) {
+      const setAttrs = set[1];
+      const repRe = /<Representation\b([^>]*)>([\s\S]*?)<\/Representation>/gi;
+      let rep;
+      while ((rep = repRe.exec(set[2]))) {
+        const repAttrs = rep[1];
+        const base = /<BaseURL[^>]*>([^<]+)<\/BaseURL>/i.exec(rep[2]);
+        if (!base) continue;
+        const url = unescapeXml(base[1].trim());
+        if (!isFbMediaUrl(url)) continue;
+        const type = (attr(repAttrs, 'mimeType') || attr(setAttrs, 'mimeType') || attr(setAttrs, 'contentType') || '').toLowerCase();
+        const bw = Number(attr(repAttrs, 'bandwidth')) || 0;
+        const h = Number(attr(repAttrs, 'height')) || 0;
+        if (type.indexOf('video') !== -1) {
+          if (!video || h > video.height || (h === video.height && bw > video.bandwidth)) video = { url, height: h, bandwidth: bw };
+        } else if (type.indexOf('audio') !== -1) {
+          if (!audio || bw > audio.bandwidth) audio = { url, bandwidth: bw };
+        }
+      }
+    }
+    if (!video && !audio) return null;
+    return { video: video ? video.url : '', height: video ? video.height : 0, audio: audio ? audio.url : '' };
+  }
+
+  /** Video id in a Facebook address: /reel/ID, /watch/?v=ID, /videos/ID, video.php?v=ID. */
+  function videoIdFromUrl(href) {
+    const s = String(href || '');
+    if (!/facebook\.com|^\//i.test(s)) return '';
+    const m = /\/reels?\/(\d{5,25})/.exec(s) || /\/watch\/?(?:live\/?)?\?(?:[^#]*&)?v=(\d{5,25})/.exec(s) || /\/video\.php\?(?:[^#]*&)?v=(\d{5,25})/.exec(s) || /\/videos\/(?:[^/?#]+\/)*?(\d{5,25})(?:[/?#]|$)/.exec(s);
+    return m ? m[1] : '';
+  }
+
+  /** Picks the JSON blocks of a page's HTML that mention a video file, parsed. */
+  function videoJsonFromHtml(html) {
+    const out = [];
+    const re = /<script\b[^>]*type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi;
+    let m;
+    while ((m = re.exec(String(html || '')))) {
+      const text = m[1];
+      if (!/progressive_url|browser_native_(?:hd|sd)_url|playable_url|"hd_src|"sd_src|manifest_xml|dash_manifest/.test(text)) continue;
+      try {
+        out.push(JSON.parse(text));
+      } catch (e) {
+        /* not JSON */
+      }
+    }
+    return out;
+  }
+
+  /** The file name of a Facebook photo, the same at every size (only ?stp= changes). */
+  function imageFileKey(u) {
+    const m = /\/([^/?#]+\.(?:jpe?g|png|webp|gif|heic|avif))(?:[?#]|$)/i.exec(String(u || ''));
+    return m ? m[1].toLowerCase() : '';
+  }
+
+  /** Width x height asked of Facebook's image server in ?stp=..._s960x960_... (0 = not stated). */
+  function stpArea(u) {
+    const m = /[?&]stp=[^&]*?(?:^|[_=-])[sp](\d{2,5})x(\d{2,5})/i.exec(String(u || ''));
+    return m ? Number(m[1]) * Number(m[2]) : 0;
+  }
+
+  /** Copies of the same photo (same file name) under `root`, with their size where known. */
+  function findImageCopies(root, key, opts) {
+    const o = opts || {};
+    const found = [];
+    if (!key) return found;
+    walkPlain(
+      root,
+      (obj) => {
+        for (const k of Object.keys(obj)) {
+          const u = obj[k];
+          if (typeof u !== 'string' || !isFbMediaUrl(u) || imageFileKey(u) !== key) continue;
+          const base = k.replace(/(?:_?ur[il]|_?src)$/i, '');
+          const w = Number(obj[base + 'Width'] || obj[base + '_width'] || obj.width) || 0;
+          const h = Number(obj[base + 'Height'] || obj[base + '_height'] || obj.height) || 0;
+          found.push({ url: u, area: w > 0 && h > 0 ? w * h : stpArea(u) });
+        }
+        return '';
+      },
+      o.budget || 2000,
+      o.maxDepth || 8,
+      '',
+      o.total
+    );
+    return found;
+  }
+
+  function bestImage(displayed, copies) {
+    let best = { url: displayed, area: stpArea(displayed) };
+    for (const c of copies || []) if (c.area > best.area) best = c;
+    return best.url;
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Installation inside the page                                        */
   /* ------------------------------------------------------------------ */
 
@@ -977,11 +1252,21 @@
       }
       if (m.type === 'settings' && m.data && typeof m.data === 'object') {
         Object.assign(state.settings, m.data);
+        if (typeof state.syncStealth === 'function') state.syncStealth();
         if (!state.ready) {
           state.ready = true;
           flushQueue();
         }
         emit('diag', state.diag);
+      } else if (m.type === 'media-resolve' && m.data && typeof m.data === 'object') {
+        const reqId = String(m.data.reqId || '');
+        if (typeof state.resolveMedia !== 'function' || !reqId) return;
+        state
+          .resolveMedia(m.data)
+          .then(
+            (result) => emit('media-result', { reqId, result }),
+            (err) => emit('media-result', { reqId, error: String((err && err.message) || err).slice(0, 200) })
+          );
       } else if (m.type === 'diag-request') {
         emit('diag', state.diag);
       }
@@ -1141,26 +1426,41 @@
 
     /* ---------------- HTTP (GraphQL) replies ---------------- */
 
-    // Only Messenger requests are read; the busy news feed is left alone.
+    // Only Messenger requests are read; the busy news feed is left alone. A GraphQL request
+    // counts as Messenger's only by its query name (fb_api_req_friendly_name), never by
+    // scanning the whole body: Facebook's long random request fields (__dyn, __csr) could
+    // match a short word by chance and make the feed's replies get copied for nothing.
     const MESSENGER_HINT = /lightspeed|LSPlatform|messenger|messaging|MAW|inbox|thread/i;
 
     function interestingUrl(url) {
       const u = String(url || '');
-      if (/lightspeed|\/messaging\/|\/messages\//i.test(u)) return 'yes';
+      if (/lightspeed|\/messaging\//i.test(u)) return 'yes';
       return /\/api\/graphql|\/ajax\//i.test(u) ? 'maybe' : '';
     }
 
-    /** Looks at a GraphQL request body for Messenger's query names. */
+    function friendlyNameOf(body) {
+      if (!body) return '';
+      if (typeof body === 'string') {
+        const m = /(?:^|&)fb_api_req_friendly_name=([^&]{1,200})/.exec(body);
+        if (!m) return '';
+        try {
+          return decodeURIComponent(m[1].replace(/\+/g, ' '));
+        } catch (e) {
+          return m[1];
+        }
+      }
+      if (body instanceof win.URLSearchParams || body instanceof win.FormData) return String(body.get('fb_api_req_friendly_name') || '');
+      return '';
+    }
+
+    /** Looks at a GraphQL request's query name for Messenger's queries. */
     function bodyLooksMessenger(body) {
       try {
-        if (!body) return false;
-        if (typeof body === 'string') return MESSENGER_HINT.test(body.slice(0, 4000));
-        if (body instanceof win.URLSearchParams) return MESSENGER_HINT.test(body.get('fb_api_req_friendly_name') || body.toString().slice(0, 4000));
-        if (body instanceof win.FormData) return MESSENGER_HINT.test(String(body.get('fb_api_req_friendly_name') || ''));
+        const name = friendlyNameOf(body);
+        return !!name && MESSENGER_HINT.test(name);
       } catch (e) {
-        /* unreadable body */
+        return false; // unreadable body
       }
-      return false;
     }
 
     function headerLooksMessenger(headers) {
@@ -1329,22 +1629,100 @@
     // The page's visibility stays real (Facebook needs it to recover its encrypted-chat
     // engine when several tabs are open); faking "hidden" as well is a separate, off-by-
     // default option, and visibilitychange events are never blocked.
+    //
+    // Only on Messenger's own pages (facebook.com/messages/..., messenger.com). Facebook's
+    // whole site shares one "is the user on this tab" flag (its UserActivity module, set
+    // from document.hasFocus() and window focus/blur events); with "no focus" everywhere the
+    // news feed, Watch and Reels treat the user as away and stop loading (the feed stays on
+    // grey placeholder cards). Facebook is a single-page app, so the route is checked on
+    // every navigation, and the flag is handed back with a window "focus" event on leaving
+    // Messenger (and taken away with a "blur" event on entering it).
+
+    function onMessengerRoute() {
+      try {
+        const loc = win.location;
+        if (/(^|\.)messenger\.com$/i.test(String(loc.hostname || ''))) return true;
+        return /^\/messages(?:\/|$)/i.test(String(loc.pathname || ''));
+      } catch (e) {
+        return false;
+      }
+    }
 
     function stealthFocus() {
       const s = state.settings;
-      return active() && !!s.blockSeen && !!s.stealthFocus;
+      return active() && !!s.blockSeen && !!s.stealthFocus && onMessengerRoute();
     }
 
     function stealthHidden() {
       return stealthFocus() && !!state.settings.stealthVisibility;
     }
 
+    let nativeHasFocus = null;
+    let nativeVisibility = null;
+    let stealthWas = false;
+    let hiddenWas = false;
+
+    /**
+     * Called after a navigation or a settings change: tells Facebook when the focus flag (and,
+     * with the extra option, the fake "hidden" state) changes, exactly as a real window
+     * blur/focus or tab switch would.
+     */
+    function syncStealth() {
+      let now;
+      let hiddenNow;
+      try {
+        now = stealthFocus();
+        hiddenNow = stealthHidden();
+      } catch (e) {
+        return;
+      }
+      if (now !== stealthWas) {
+        stealthWas = now;
+        state.diag.strongMode = now;
+        state.diagDirty = true;
+        let realFocus = false;
+        try {
+          realFocus = !!(nativeHasFocus && nativeHasFocus.call(doc));
+        } catch (e) {
+          realFocus = false;
+        }
+        // a window without real focus already counts as "away" for Facebook: nothing to tell
+        if (realFocus) {
+          try {
+            const Ctor = typeof win.FocusEvent === 'function' ? win.FocusEvent : win.Event;
+            dispatch.call(win, new Ctor(now ? 'blur' : 'focus'));
+          } catch (e) {
+            noteError(e);
+          }
+        }
+      }
+      if (hiddenNow !== hiddenWas) {
+        hiddenWas = hiddenNow;
+        let reallyVisible = true;
+        try {
+          reallyVisible = !nativeVisibility || nativeVisibility.call(doc) === 'visible';
+        } catch (e) {
+          reallyVisible = true;
+        }
+        if (reallyVisible) {
+          try {
+            dispatch.call(doc, new win.Event('visibilitychange'));
+          } catch (e) {
+            noteError(e);
+          }
+        }
+      }
+    }
+    state.syncStealth = syncStealth;
+
     try {
       const DocProto = win.Document.prototype;
-      const nativeHasFocus = DocProto.hasFocus;
+      nativeHasFocus = DocProto.hasFocus;
       DocProto.hasFocus = function hasFocus() {
         return stealthFocus() ? false : nativeHasFocus.call(this);
       };
+      const visDesc = Object.getOwnPropertyDescriptor(DocProto, 'visibilityState');
+      if (visDesc && typeof visDesc.get === 'function') nativeVisibility = visDesc.get;
       const patchGetter = (name, fakeValue) => {
         const desc = Object.getOwnPropertyDescriptor(DocProto, name);
         if (!desc || typeof desc.get !== 'function') return;
@@ -1371,6 +1749,231 @@
     } catch (e) {
       noteError(e);
     }
+
+    // Route changes inside Facebook's single-page app. pushState/replaceState are wrapped so
+    // the switch happens before the new page renders (Messenger reads the focus flag as soon
+    // as a chat opens); popstate covers Back/Forward, and a slow poll catches anything else.
+    try {
+      // Added at page start: Facebook reads the (already faked) state itself. Added later (a tab
+      // open before an install or update): Facebook started with the real focus, so the first
+      // check below tells it, if this is a Messenger page, that the window is not focused.
+      stealthWas = lateInjected ? false : stealthFocus();
+      hiddenWas = lateInjected ? false : stealthHidden();
+      state.diag.strongMode = stealthWas;
+      syncStealth();
+      const HistoryProto = win.History && win.History.prototype;
+      for (const name of ['pushState', 'replaceState']) {
+        const orig = HistoryProto && HistoryProto[name];
+        if (typeof orig !== 'function') continue;
+        HistoryProto[name] = function () {
+          const r = orig.apply(this, arguments);
+          try {
+            syncStealth();
+          } catch (e) {
+            noteError(e);
+          }
+          return r;
+        };
+      }
+      win.addEventListener('popstate', syncStealth, true);
+      win.addEventListener('hashchange', syncStealth, true);
+      win.setInterval(syncStealth, 1000);
+    } catch (e) {
+      noteError(e);
+    }
+
+    /* ---------------- Downloads: find the file behind a photo or video ---------------- */
+    // The content script marks the element the user pointed at (data-mms-pick) and asks
+    // here, because only the page's own JavaScript world can read React's data on it.
+    // Everything is read-only: nothing on the page is changed.
+
+    const FUNCTION_FIBER_TAGS = new Set([0, 11, 14, 15]); // function, forwardRef, memo components
+
+    function fiberOf(el) {
+      try {
+        for (const k of Object.keys(el)) {
+          if (k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$')) return el[k];
+        }
+      } catch (e) {
+        /* ignore */
+      }
+      return null;
+    }
+
+    /** Calls scan(value) on each React props / hook value from the element upward. */
+    function eachFiberValue(el, levels, scan) {
+      let f = fiberOf(el);
+      for (let i = 0; f && i < levels; i++, f = f.return) {
+        try {
+          if (f.memoizedProps && typeof f.memoizedProps === 'object' && scan(f.memoizedProps, i) === true) return;
+          if (FUNCTION_FIBER_TAGS.has(f.tag)) {
+            let h = f.memoizedState;
+            for (let j = 0; h && typeof h === 'object' && j < 80; j++, h = h.next) {
+              const v = h.memoizedState;
+              if (v && typeof v === 'object' && scan(v, i) === true) return;
+            }
+          } else if (f.memoizedState && typeof f.memoizedState === 'object' && f.tag === 1) {
+            if (scan(f.memoizedState, i) === true) return;
+          }
+        } catch (e) {
+          /* a getter that throws: go on upward */
+        }
+      }
+    }
+
+    /**
+     * The video files in React's data nearest to the element. With `wantId` (a video the
+     * user's link points to) only that video counts; without it the closest one wins.
+     */
+    function videoFromFibers(el, wantId) {
+      let knownId = '';
+      let found = null;
+      const allowAnon = el.tagName === 'VIDEO';
+      const total = { n: 0, max: 120000 }; // keeps one click's search to a few dozen milliseconds
+      eachFiberValue(el, 45, (value) => {
+        if (total.n >= total.max) return true;
+        if (!knownId) {
+          for (const k of VIDEO_ID_KEYS) {
+            const id = numericId(value[k]);
+            if (id) {
+              knownId = id;
+              break;
+            }
+          }
+        }
+        const list = findVideoSources(value, { budget: 1500, maxDepth: 9, total });
+        if (!list.length) return false;
+        if (wantId) {
+          const exact = list.find((v) => v.id === wantId) || (allowAnon ? list.find((v) => !v.id) : null);
+          if (!exact) return false; // someone else's video: keep looking further up
+          found = exact;
+          return true;
+        }
+        found = pickVideo(list, knownId);
+        return true;
+      });
+      return { video: found, knownId: knownId || (found && found.id) || '' };
+    }
+
+    function videoIdNear(el) {
+      try {
+        const a = el.closest && el.closest('a[href]');
+        const own = a && videoIdFromUrl(a.getAttribute('href'));
+        if (own) return own;
+        let box = el;
+        for (let i = 0; box && i < 14; i++) {
+          if (box.getAttribute && box.getAttribute('role') === 'article') break;
+          box = box.parentElement;
+        }
+        if (!box) return '';
+        for (const link of box.querySelectorAll('a[href*="/videos/"], a[href*="/watch"], a[href*="/reel/"], a[href*="video.php"]')) {
+          const id = videoIdFromUrl(link.getAttribute('href'));
+          if (id) return id;
+        }
+      } catch (e) {
+        /* ignore */
+      }
+      return '';
+    }
+
+    function videoFromScripts(id) {
+      try {
+        for (const s of doc.querySelectorAll('script[type="application/json"]')) {
+          const text = s.textContent || '';
+          if (text.indexOf(id) === -1 || !/progressive_url|browser_native_|playable_url|hd_src|sd_src|manifest_xml|dash_manifest/.test(text)) continue;
+          let data;
+          try {
+            data = JSON.parse(text);
+          } catch (e) {
+            continue;
+          }
+          const hit = findVideoSources(data, { budget: 400000, maxDepth: 90 }).find((v) => v.id === id);
+          if (hit) return hit;
+        }
+      } catch (e) {
+        noteError(e);
+      }
+      return null;
+    }
+
+    /** Last resort for a video id: read the video's own page, as opening it would. */
+    async function videoFromVideoPage(id) {
+      if (!/(^|\.)facebook\.com$/i.test(String(win.location.hostname || ''))) return null;
+      for (const path of ['/reel/' + id + '/', '/watch/?v=' + id, '/video.php?v=' + id]) {
+        try {
+          const resp = await nativeFetch.call(win, path, { credentials: 'include' });
+          if (!resp.ok) continue;
+          const html = await resp.text();
+          const list = [];
+          for (const data of videoJsonFromHtml(html)) list.push(...findVideoSources(data, { budget: 400000, maxDepth: 90 }));
+          const exact = list.find((v) => v.id === id && (v.hd || v.sd || v.dash));
+          if (exact) return exact;
+          const withFiles = list.filter((v) => v.hd || v.sd || v.dash);
+          const ids = new Set(withFiles.map((v) => v.id));
+          if (withFiles.length && ids.size === 1) return withFiles[0]; // a page with just this one video
+        } catch (e) {
+          /* try the next address */
+        }
+      }
+      return null;
+    }
+
+    function imageFor(el) {
+      let shown = '';
+      try {
+        shown = el.currentSrc || el.src || (el.href && el.href.baseVal) || el.getAttribute('href') || el.getAttribute('xlink:href') || '';
+      } catch (e) {
+        shown = '';
+      }
+      if (!isFbMediaUrl(shown)) return shown;
+      const key = imageFileKey(shown);
+      const copies = [];
+      const total = { n: 0, max: 60000 };
+      eachFiberValue(el, 30, (value) => {
+        copies.push(...findImageCopies(value, key, { budget: 800, maxDepth: 7, total }));
+        return copies.length > 60 || total.n >= total.max;
+      });
+      return bestImage(shown, copies);
+    }
+
+    function mergeVideo(a, b) {
+      if (!a) return b || null;
+      if (!b) return a;
+      return { id: a.id || b.id, hd: a.hd || b.hd, sd: a.sd || b.sd, dash: a.dash || b.dash };
+    }
+
+    state.resolveMedia = async function resolveMedia(d) {
+      let el = null;
+      const pick = String(d.pick || '').replace(/[^a-z0-9_-]/gi, '');
+      if (pick) el = doc.querySelector('[data-mms-pick="' + pick + '"]');
+      if (d.kind === 'image') return el ? { kind: 'image', url: imageFor(el) } : null;
+
+      let id = numericId(d.id);
+      let found = null;
+      if (el) {
+        const r = videoFromFibers(el, id);
+        found = r.video;
+        if (!id) id = numericId(r.knownId) || (found && found.id) || videoIdNear(el);
+      }
+      if (!id && !found) id = videoIdFromUrl(win.location.href);
+      if (found && id && found.id && found.id !== id) found = null; // never another video's file
+      if (!(found && (found.hd || found.sd)) && id) found = mergeVideo(found, videoFromScripts(id));
+      if (!(found && (found.hd || found.sd)) && id) found = mergeVideo(found, await videoFromVideoPage(id));
+      const result = { kind: 'video', id: id || (found && found.id) || '', hd: '', sd: '', dashVideo: '', dashAudio: '', dashHeight: 0 };
+      if (found) {
+        result.hd = found.hd || '';
+        result.sd = found.sd || '';
+        if (!result.hd && !result.sd && found.dash) {
+          const tracks = dashTracks(found.dash);
+          if (tracks) {
+            result.dashVideo = tracks.video;
+            result.dashAudio = tracks.audio;
+            result.dashHeight = tracks.height;
+          }
+        }
+      }
+      return result;
+    };
 
     /* ---------------- periodic diagnostics ---------------- */
     win.setInterval(function () {
@@ -1400,6 +2003,16 @@
     socketKind,
     emptyEvents,
     hasEvents,
+    findVideoSources,
+    pickVideo,
+    dashTracks,
+    videoIdFromUrl,
+    videoJsonFromHtml,
+    imageFileKey,
+    stpArea,
+    findImageCopies,
+    bestImage,
+    isProgressiveUrl,
     CHANNEL_OUT,
     CHANNEL_IN,
   };

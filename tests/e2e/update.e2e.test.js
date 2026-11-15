@@ -112,6 +112,8 @@ test('open Messenger tab survives an extension update and a disable', { timeout:
     assert.equal(await readReceiptLeaving(), 1731571860000, '"Seen" goes out untouched when Unseen is off');
 
     await setSettings(dash, { blockSeen: true, stealthFocus: true, blockTyping: true });
+    // Strong mode works on Messenger's own pages only (the news feed keeps real focus)
+    await page.evaluate((t) => history.pushState({}, '', '/messages/t/' + t + '/'), THREAD);
     await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).hasFocus === false, { what: 'tab follows "Unseen on" after the update' });
     // the server now has 1731571860000 (sent while Unseen was off): a newer read is held there, never lower
     assert.equal(await readReceiptLeaving(1731571990000), 1731571860000, '"Seen" held at the server value');
@@ -136,7 +138,10 @@ test('open Messenger tab survives an extension update and a disable', { timeout:
     await ext.waitForTimeout(500);
     await ext.close();
     await waitFor(async () => (await readReceiptLeaving()) === 1731571860000, { timeout: 15000, what: '"Seen" no longer changed once the extension is off' });
-    assert.notEqual(await page.evaluate(() => fb.focusInfo().hasFocus === false && document.visibilityState === 'hidden'), true);
-    assert.equal(await page.evaluate(() => document.querySelectorAll('.mms-recovered').length), 0, 'boxes removed');
+    // the tab notices within a few seconds (it checks every 5 s, or at its next message)
+    await waitFor(async () => (await page.evaluate(() => document.querySelectorAll('.mms-recovered').length)) === 0, { timeout: 15000, what: 'boxes removed' });
+    await page.bringToFront();
+    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).hasFocus === true, { timeout: 15000, what: 'real focus back on the Messenger page' });
+    assert.equal(await page.evaluate(() => document.visibilityState), 'visible');
   });
 });

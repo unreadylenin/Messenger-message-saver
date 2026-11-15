@@ -19,9 +19,13 @@ export const DEFAULT_SETTINGS = Object.freeze({
   badge: true,
   // --- unseen ---
   blockSeen: true, // don't tell others you've read their messages
-  stealthFocus: true, // strong mode: the page reports "no focus" so encrypted chats don't send Seen
+  stealthFocus: true, // strong mode (Messenger pages only): the page reports "no focus" so encrypted chats don't send Seen
   stealthVisibility: false, // also report the tab as hidden (can break encrypted chats with several tabs)
   blockTyping: true, // don't show "typing..." to others
+  // --- downloads ---
+  downloadButtons: true, // a Download button on photos, videos and reels, plus a right-click menu item
+  downloadQuality: 'hd', // 'hd' = best quality, 'sd' = smaller file
+  downloadAsk: false, // ask where to save each file (otherwise Downloads/Facebook)
 });
 
 export async function getSettings() {

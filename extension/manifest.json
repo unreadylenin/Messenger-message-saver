@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Messenger Message Saver",
   "short_name": "Msg Saver",
-  "version": "1.0.0",
-  "description": "Saves Messenger messages on facebook.com and messenger.com so unsent, deleted and edited messages stay readable. Adds Unseen mode (no Seen, no typing).",
+  "version": "1.1.0",
+  "description": "Saves Messenger messages on facebook.com and messenger.com so unsent, deleted and edited messages stay readable. Adds Unseen mode (no Seen, no typing) and downloads photos, videos and reels.",
   "minimum_chrome_version": "114",
   "icons": {
     "16": "icons/icon16.png",
@@ -29,7 +29,9 @@
     "unlimitedStorage",
     "notifications",
     "alarms",
-    "scripting"
+    "scripting",
+    "downloads",
+    "contextMenus"
   ],
   "host_permissions": [
     "https://*.facebook.com/*",

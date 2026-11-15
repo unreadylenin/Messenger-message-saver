@@ -227,3 +227,119 @@ test('socketKind classifies Messenger sockets', () => {
   assert.equal(mw.socketKind('wss://web-chat-e2ee.facebook.com/ws/chat'), 'e2ee');
   assert.equal(mw.socketKind('wss://example.com/'), 'other');
 });
+
+/* ---------------- downloads ---------------- */
+
+const V = 'https://video-sin6-1.xx.fbcdn.net/v/t42.1790-2/';
+
+test('downloads: video files are found in every data layout Facebook uses', () => {
+  // player props (implementations[].data.hdSrc / sdSrc)
+  let list = mw.findVideoSources({ videoID: '111', implementations: [{ data: {} }, { data: { hdSrc: V + 'h.mp4?a=1', sdSrc: V + 's.mp4?a=1' } }] });
+  assert.equal(list.length, 1);
+  assert.equal(list[0].hd, V + 'h.mp4?a=1');
+  assert.equal(list[0].sd, V + 's.mp4?a=1');
+  // page data: video { __typename: Video, id, videoDeliveryLegacyFields }
+  list = mw.findVideoSources({ data: { video: { __typename: 'Video', id: '22222', videoDeliveryLegacyFields: { browser_native_hd_url: V + 'h2.mp4', browser_native_sd_url: V + 's2.mp4' } } } });
+  assert.deepEqual(list, [{ id: '22222', hd: V + 'h2.mp4', sd: V + 's2.mp4', dash: '' }]);
+  // older names: playable_url / playable_url_quality_hd, hd_src / sd_src
+  assert.equal(mw.findVideoSources({ id: '33333', playable_url_quality_hd: V + 'h3.mp4', playable_url: V + 's3.mp4' })[0].hd, V + 'h3.mp4');
+  assert.equal(mw.findVideoSources({ video_id: '44444', sd_src: V + 's4.mp4' })[0].sd, V + 's4.mp4');
+  // newer: videoDeliveryResponseResult.progressive_urls with metadata.quality
+  list = mw.findVideoSources({ video: { __typename: 'Video', id: '55555', videoDeliveryResponseFragment: { videoDeliveryResponseResult: { progressive_urls: [{ progressive_url: V + 's5.mp4', metadata: { quality: 'SD' } }, { progressive_url: V + 'h5.mp4', metadata: { quality: 'HD' } }] } } } });
+  assert.deepEqual(list, [{ id: '55555', hd: V + 'h5.mp4', sd: V + 's5.mp4', dash: '' }]);
+});
+
+test('downloads: never a DASH byte range, a manifest address, or a non-Facebook host', () => {
+  assert.equal(mw.isProgressiveUrl(V + 'x.mp4?bytestart=0&byteend=999'), false);
+  assert.equal(mw.isProgressiveUrl(V + 'x.mpd?a=1'), false);
+  assert.equal(mw.isProgressiveUrl('https://evil.example/x.mp4'), false);
+  assert.equal(mw.isProgressiveUrl('http://video.xx.fbcdn.net/x.mp4'), false);
+  assert.equal(mw.isProgressiveUrl(V + 'x.mp4?_nc_ht=1'), true);
+  assert.deepEqual(mw.findVideoSources({ id: '66666', playable_url: V + 'x.mp4?bytestart=0&byteend=1' }), []);
+});
+
+test('downloads: the right video among several, and React/class objects are not walked', () => {
+  const list = mw.findVideoSources({
+    feed: [
+      { __typename: 'Video', id: '70001', videoDeliveryLegacyFields: { browser_native_hd_url: V + 'a.mp4' } },
+      { __typename: 'Video', id: '70002', videoDeliveryLegacyFields: { browser_native_hd_url: V + 'b.mp4' } },
+    ],
+  });
+  assert.equal(mw.pickVideo(list, '70002').hd, V + 'b.mp4');
+  assert.equal(mw.pickVideo(list, '').hd, V + 'a.mp4', 'closest (first met) without an id');
+  class Store {
+    constructor() {
+      this.video = { id: '70003', hd_src: V + 'c.mp4' };
+    }
+  }
+  assert.deepEqual(mw.findVideoSources({ environment: { video: { id: '70004', hd_src: V + 'd.mp4' } }, store: new Store() }), [], 'Relay environment and class instances skipped');
+  // cycles do not hang the walk
+  const a = { id: '70005' };
+  a.self = a;
+  a.list = [a];
+  assert.deepEqual(mw.findVideoSources(a), []);
+});
+
+test('downloads: DASH manifest gives the best picture and best sound tracks', () => {
+  const xml =
+    '<?xml version="1.0"?><MPD><Period><AdaptationSet contentType="video">' +
+    `<Representation mimeType="video/mp4" bandwidth="400000" height="360"><BaseURL>${V}v360.mp4?a=1&amp;b=2</BaseURL></Representation>` +
+    `<Representation mimeType="video/mp4" bandwidth="900000" height="720"><BaseURL>${V}v720.mp4?a=1</BaseURL></Representation>` +
+    '</AdaptationSet><AdaptationSet><Representation mimeType="audio/mp4" bandwidth="64000"><BaseURL>' + V + 'a64.mp4</BaseURL></Representation>' +
+    `<Representation mimeType="audio/mp4" bandwidth="128000"><BaseURL>${V}a128.mp4</BaseURL></Representation></AdaptationSet></Period></MPD>`;
+  assert.deepEqual(mw.dashTracks(xml), { video: V + 'v720.mp4?a=1', height: 720, audio: V + 'a128.mp4' });
+  assert.deepEqual(mw.dashTracks(encodeURIComponent(xml)), { video: V + 'v720.mp4?a=1', height: 720, audio: V + 'a128.mp4' }, 'URL-encoded manifests too');
+  assert.equal(mw.dashTracks('<MPD></MPD>'), null);
+  const found = mw.findVideoSources({ video: { __typename: 'Video', id: '80001', videoDeliveryResponseFragment: { videoDeliveryResponseResult: { dash_manifests: [{ manifest_xml: xml }] } } } });
+  assert.equal(found[0].id, '80001');
+  assert.equal(found[0].dash, xml);
+});
+
+test('downloads: video ids in Facebook addresses', () => {
+  assert.equal(mw.videoIdFromUrl('https://www.facebook.com/reel/1234567890123456/?s=ifu'), '1234567890123456');
+  assert.equal(mw.videoIdFromUrl('/reel/987654321/'), '987654321');
+  assert.equal(mw.videoIdFromUrl('https://www.facebook.com/watch/?v=24680246802468&ref=x'), '24680246802468');
+  assert.equal(mw.videoIdFromUrl('https://www.facebook.com/watch/live/?v=13579135791'), '13579135791');
+  assert.equal(mw.videoIdFromUrl('https://www.facebook.com/SomePage/videos/a-title-here/112233445566/'), '112233445566');
+  assert.equal(mw.videoIdFromUrl('https://www.facebook.com/SomePage/videos/112233445566'), '112233445566');
+  assert.equal(mw.videoIdFromUrl('https://web.facebook.com/video.php?v=99887766554'), '99887766554');
+  assert.equal(mw.videoIdFromUrl('https://www.facebook.com/photo/?fbid=1234567'), '');
+  assert.equal(mw.videoIdFromUrl('https://evil.example/reel/123456789'), '');
+});
+
+test('downloads: page HTML JSON blocks are parsed (escaped slashes), others skipped', () => {
+  const data = { video: { __typename: 'Video', id: '424242424', videoDeliveryLegacyFields: { browser_native_hd_url: V + 'r.mp4?x=1' } } };
+  const html = `<html><script type="application/json" data-sjs>{"nothing":"here"}</script><script type="application/json" data-content-len="9" data-sjs>${JSON.stringify(data).replace(/\//g, '\\/')}</script><script>var x = "browser_native_hd_url";</script></html>`;
+  const blocks = mw.videoJsonFromHtml(html);
+  assert.equal(blocks.length, 1);
+  assert.equal(mw.pickVideo(mw.findVideoSources(blocks[0], { budget: 1e5, maxDepth: 80 }), '424242424').hd, V + 'r.mp4?x=1');
+});
+
+test('downloads: photos — same picture (file name), largest copy wins', () => {
+  const small = 'https://scontent.xx.fbcdn.net/v/t39.30808-6/123_456_789_n.jpg?stp=dst-jpg_s320x320_tt6&oh=1';
+  const big = 'https://scontent.xx.fbcdn.net/v/t39.30808-6/123_456_789_n.jpg?stp=dst-jpg_s2048x2048&oh=2';
+  const other = 'https://scontent.xx.fbcdn.net/v/t39.30808-6/999_888_777_n.jpg?stp=dst-jpg_s4096x4096&oh=3';
+  assert.equal(mw.imageFileKey(small), '123_456_789_n.jpg');
+  assert.equal(mw.stpArea(small), 320 * 320);
+  assert.equal(mw.stpArea('https://x.fbcdn.net/a.jpg?stp=c0.5000x0.5000f_dst-jpg_e15_p480x480_q65&oh=1'), 480 * 480);
+  assert.equal(mw.stpArea('https://x.fbcdn.net/a.jpg?oh=1'), 0);
+  const copies = mw.findImageCopies({ photo: { image: { uri: small, width: 320, height: 213 }, viewer_image: { uri: big, width: 2048, height: 1365 } }, next: { image: { uri: other, width: 4096, height: 4096 } } }, mw.imageFileKey(small));
+  assert.equal(copies.length, 2, 'a different photo is never picked');
+  assert.equal(mw.bestImage(small, copies), big);
+  // Messenger attachment style keys (largePreviewUrl + largePreviewWidth)
+  const msgr = mw.findImageCopies({ previewUrl: small, previewWidth: 320, previewHeight: 213, largePreviewUrl: big, largePreviewWidth: 1600, largePreviewHeight: 1066 }, mw.imageFileKey(small));
+  assert.equal(mw.bestImage(small, msgr), big);
+  assert.equal(mw.bestImage(small, []), small, 'the shown copy when nothing larger is known');
+});
+
+test('downloads: file names stay inside Downloads/Facebook with a media extension', async () => {
+  const { downloadFileName, isDownloadableUrl } = await import('../../extension/lib/downloads.js');
+  assert.equal(downloadFileName('facebook-video-123-hd.mp4', V + 'a.mp4'), 'Facebook/facebook-video-123-hd.mp4');
+  assert.equal(downloadFileName('../../Windows/System32/evil.exe', 'https://scontent.xx.fbcdn.net/a.jpg'), 'Facebook/Windows-System32-evil.jpg');
+  assert.equal(downloadFileName('', V + 'a.mp4').endsWith('.mp4'), true);
+  assert.equal(downloadFileName('con. ', 'https://x.fbcdn.net/a').startsWith('Facebook/con'), true);
+  assert.equal(isDownloadableUrl(V + 'a.mp4'), true);
+  assert.equal(isDownloadableUrl('https://cdn.fbsbx.com/v/t59/file.jpg'), true);
+  assert.equal(isDownloadableUrl('https://fbcdn.net.evil.example/a.mp4'), false);
+  assert.equal(isDownloadableUrl('javascript:alert(1)'), false);
+});

@@ -57,6 +57,9 @@
     stealthFocus: true,
     stealthVisibility: false,
     blockTyping: true,
+    downloadButtons: true,
+    downloadQuality: 'hd',
+    downloadAsk: false,
   };
 
   let settings = { ...DEFAULT_SETTINGS };
@@ -156,6 +159,7 @@
     pushSettingsToPage();
     if (!settings.enabled || !settings.showRecoveredInline) removeInline('.mms-recovered');
     if (!settings.enabled || !settings.showEditHistoryInline) removeInline('.mms-edit-history');
+    if (!downloadsOn()) hideDownloadButton(true, true);
     scheduleFullScan();
   });
 
@@ -204,6 +208,9 @@
         break;
       case 'diag':
         send({ type: 'diag', diag: { ...(m.data || {}), dom: domStats } });
+        break;
+      case 'media-result':
+        onMediaResult(m.data);
         break;
       default:
         break;
@@ -1138,4 +1145,447 @@
     else begin();
   }
 
+  /* ================================================================== */
+  /* Downloads: photos, videos and reels                                */
+  /* ================================================================== */
+  // Pointing at a photo, video or reel shows a small "Download" button on it; the right-
+  // click menu has the same action. The button is one element outside Facebook's own page
+  // tree (so Facebook never re-renders around it), and it is looked for only when the
+  // pointer moves onto something new.
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const MIN_MEDIA_PX = 120;
+  const pendingMedia = new Map(); // request id -> callback
+  let mediaSeq = 0;
+  let dl = null; // { host, btn, toast }
+  let dlTarget = null; // { el, kind: 'image'|'video', id? }
+  let dlHideTimer = 0;
+  let dlToastTimer = 0;
+  let dlBusy = false;
+  let pointerRaf = 0;
+  let lastPointer = { x: -1, y: -1 };
+  let lastContext = null; // where the right-click menu was opened
+
+  function downloadsOn() {
+    return extensionAlive && settings.enabled !== false && settings.downloadButtons !== false;
+  }
+
+  function onMediaResult(data) {
+    if (!data || typeof data !== 'object' || !data.reqId) return;
+    const done = pendingMedia.get(data.reqId);
+    if (!done) return;
+    pendingMedia.delete(data.reqId);
+    done(data);
+  }
+
+  /** Asks the page hook (which can read Facebook's own data) for the file behind an element. */
+  function askPage(kind, el, extra) {
+    const reqId = 'm' + Date.now().toString(36) + (mediaSeq++).toString(36);
+    if (el) el.setAttribute('data-mms-pick', reqId);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingMedia.delete(reqId);
+        resolve(null);
+      }, 30000);
+      pendingMedia.set(reqId, (data) => {
+        clearTimeout(timer);
+        resolve(data.result || null);
+      });
+      const msg = { type: 'media-resolve', inst: instance, data: { reqId, pick: el ? reqId : '', kind, ...(extra || {}) } };
+      document.dispatchEvent(new CustomEvent(CHANNEL_IN, { detail: JSON.stringify(msg) }));
+    }).finally(() => {
+      if (el) el.removeAttribute('data-mms-pick');
+    });
+  }
+
+  /** Same rules as the page hook: /reel/ID, /watch/?v=ID, /videos/ID, video.php?v=ID. */
+  function videoIdFromHref(href) {
+    const s = String(href || '');
+    if (!/facebook\.com|^\//i.test(s)) return '';
+    const m = /\/reels?\/(\d{5,25})/.exec(s) || /\/watch\/?(?:live\/?)?\?(?:[^#]*&)?v=(\d{5,25})/.exec(s) || /\/video\.php\?(?:[^#]*&)?v=(\d{5,25})/.exec(s) || /\/videos\/(?:[^/?#]+\/)*?(\d{5,25})(?:[/?#]|$)/.exec(s);
+    return m ? m[1] : '';
+  }
+
+  function mediaUrlOf(el) {
+    try {
+      if (el.tagName === 'IMG' || el.tagName === 'VIDEO') return el.currentSrc || el.src || '';
+      if (el.namespaceURI === SVG_NS) return (el.href && el.href.baseVal) || el.getAttribute('href') || el.getAttribute('xlink:href') || '';
+    } catch (e) {
+      /* ignore */
+    }
+    return '';
+  }
+
+  function bigEnough(el) {
+    const r = el.getBoundingClientRect();
+    return r.width >= MIN_MEDIA_PX && r.height >= MIN_MEDIA_PX;
+  }
+
+  /** The photo or video under a point of the window, if any ('overlay' = our own button). */
+  function mediaAt(x, y) {
+    let stack;
+    try {
+      stack = document.elementsFromPoint(x, y);
+    } catch (e) {
+      return null;
+    }
+    for (const el of stack) {
+      if (dl && el === dl.host) return 'overlay';
+      const tag = el.tagName;
+      if (tag === 'VIDEO') {
+        if (!bigEnough(el)) continue;
+        const link = el.closest && el.closest('a[href]');
+        return { el, kind: 'video', id: link ? videoIdFromHref(link.getAttribute('href')) : '' };
+      }
+      const isImg = tag === 'IMG' || (el.namespaceURI === SVG_NS && String(tag).toLowerCase() === 'image');
+      if (!isImg || !bigEnough(el)) continue;
+      const url = mediaUrlOf(el);
+      if (!url || /^data:image\/svg/i.test(url)) continue;
+      // a reel or video thumbnail: download the video it opens, not the picture
+      const link = el.closest && el.closest('a[href]');
+      const vid = link ? videoIdFromHref(link.getAttribute('href')) : '';
+      return vid ? { el, kind: 'video', id: vid, thumb: true } : { el, kind: 'image' };
+    }
+    return null;
+  }
+
+  function ensureOverlay() {
+    if (dl) return dl;
+    const host = document.createElement('div');
+    host.setAttribute('data-mms', 'download');
+    host.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;margin:0;padding:0;border:0;z-index:2147483647;';
+    const root = host.attachShadow({ mode: 'open' });
+    const style = document.createElement('style');
+    style.textContent = `
+      .btn, .toast { position: fixed; z-index: 2147483647; box-sizing: border-box; font: 600 13px/1.2 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
+      .btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 12px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+             background: rgba(24,25,26,.82); color: #fff; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.35); }
+      .btn:hover { background: rgba(0,0,0,.92); }
+      .btn:focus-visible { outline: 2px solid #4cc2ff; outline-offset: 2px; }
+      .btn[aria-busy="true"] { cursor: progress; opacity: .85; }
+      .toast { max-width: 300px; padding: 9px 12px; border-radius: 10px; background: #242526; color: #e4e6eb; font-weight: 500;
+               box-shadow: 0 4px 14px rgba(0,0,0,.4); pointer-events: none; }
+      .toast.bad { background: #5c1e24; color: #ffe3e6; }
+      [hidden] { display: none !important; }`;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn';
+    btn.hidden = true;
+    const toastBox = document.createElement('div');
+    toastBox.className = 'toast';
+    toastBox.setAttribute('role', 'status');
+    toastBox.setAttribute('aria-live', 'polite');
+    toastBox.hidden = true;
+    root.append(style, btn, toastBox);
+    // Facebook must not treat a press on the button as a press on the photo or video
+    for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'dblclick', 'contextmenu']) {
+      btn.addEventListener(type, (e) => e.stopPropagation());
+    }
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (dlTarget) startDownload(dlTarget);
+    });
+    (document.documentElement || document.body).appendChild(host);
+    dl = { host, btn, toast: toastBox };
+    return dl;
+  }
+
+  function labelFor(target) {
+    if (target.kind === 'image') return { text: '⬇ Photo', title: 'Download this photo (largest size available)' };
+    const reel = /\/reels?\//.test(location.pathname) || (target.thumb && target.id);
+    return { text: reel ? '⬇ Reel' : '⬇ Video', title: settings.downloadQuality === 'sd' ? 'Download this video (smaller file)' : 'Download this video (best quality)' };
+  }
+
+  function placeButton() {
+    if (!dl || !dlTarget) return;
+    const r = dlTarget.el.getBoundingClientRect();
+    if (!dlTarget.el.isConnected || r.width < MIN_MEDIA_PX || r.height < MIN_MEDIA_PX) {
+      hideDownloadButton(false);
+      return;
+    }
+    const b = dl.btn;
+    b.hidden = false;
+    const bw = b.offsetWidth || 96;
+    const bh = b.offsetHeight || 32;
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    const vh = document.documentElement.clientHeight || window.innerHeight;
+    const left = Math.max(6, Math.min(Math.min(r.right, vw) - bw - 10, vw - bw - 6));
+    const top = Math.max(6, Math.min(Math.max(r.top, 0) + 10, vh - bh - 6));
+    b.style.left = left + 'px';
+    b.style.top = top + 'px';
+  }
+
+  function showButtonFor(hit) {
+    ensureOverlay();
+    clearTimeout(dlHideTimer);
+    if (!dlTarget || dlTarget.el !== hit.el || dlTarget.kind !== hit.kind) {
+      dlTarget = hit;
+      const label = labelFor(hit);
+      dl.btn.textContent = label.text;
+      dl.btn.title = label.title;
+      dl.btn.setAttribute('aria-label', label.title);
+    }
+    placeButton();
+  }
+
+  function hideDownloadButton(now, force) {
+    clearTimeout(dlHideTimer);
+    const hide = () => {
+      if (!force) {
+        // while a download is being prepared the button stays (it shows progress); look again after
+        if (dlBusy) {
+          dlHideTimer = setTimeout(hide, 300);
+          return;
+        }
+        if (dl && dl.btn.matches(':hover')) return; // the pointer is on it
+      }
+      if (dl) dl.btn.hidden = true;
+      dlTarget = null;
+    };
+    if (now) hide();
+    else dlHideTimer = setTimeout(hide, 300);
+  }
+
+  function onPointerOver(e) {
+    if (!downloadsOn()) return;
+    lastPointer = { x: e.clientX, y: e.clientY };
+    if (pointerRaf) return;
+    pointerRaf = requestAnimationFrame(() => {
+      pointerRaf = 0;
+      const hit = mediaAt(lastPointer.x, lastPointer.y);
+      if (hit === 'overlay') clearTimeout(dlHideTimer);
+      else if (hit) showButtonFor(hit);
+      else if (dlTarget) hideDownloadButton(false);
+    });
+  }
+
+  function onPointerOut(e) {
+    if (!e.relatedTarget && dlTarget) hideDownloadButton(false); // the pointer left the window
+  }
+
+  let scrollRaf = 0;
+  /** Scrolling moves the photo or video: the button follows it (other scrolling lists are ignored). */
+  function onScroll(e) {
+    if (!dlTarget || dlBusy) return;
+    const t = e.target;
+    const movesTarget = t === document || t === window || t === document.documentElement || t === document.body || (t && t.nodeType === 1 && t.contains(dlTarget.el));
+    if (!movesTarget || scrollRaf) return;
+    scrollRaf = requestAnimationFrame(() => {
+      scrollRaf = 0;
+      if (!dlTarget || dlBusy) return;
+      const hit = mediaAt(lastPointer.x, lastPointer.y);
+      if (hit === 'overlay' || (hit && hit.el === dlTarget.el)) placeButton();
+      else if (hit) showButtonFor(hit);
+      else hideDownloadButton(true);
+    });
+  }
+
+  function onContextMenu(e) {
+    lastContext = { x: e.clientX, y: e.clientY, t: Date.now() };
+  }
+
+  document.addEventListener('pointerover', onPointerOver, { capture: true, passive: true });
+  document.addEventListener('pointerout', onPointerOut, { capture: true, passive: true });
+  document.addEventListener('contextmenu', onContextMenu, { capture: true, passive: true });
+  window.addEventListener('scroll', onScroll, { capture: true, passive: true });
+  cleanups.push(() => {
+    document.removeEventListener('pointerover', onPointerOver, { capture: true });
+    document.removeEventListener('pointerout', onPointerOut, { capture: true });
+    document.removeEventListener('contextmenu', onContextMenu, { capture: true });
+    window.removeEventListener('scroll', onScroll, { capture: true });
+    clearTimeout(dlHideTimer);
+    clearTimeout(dlToastTimer);
+    if (pointerRaf) cancelAnimationFrame(pointerRaf);
+    if (scrollRaf) cancelAnimationFrame(scrollRaf);
+    if (dl) dl.host.remove();
+    dl = null;
+    dlTarget = null;
+  });
+
+  function showToast(text, bad, near) {
+    ensureOverlay();
+    const t = dl.toast;
+    t.textContent = text;
+    t.classList.toggle('bad', !!bad);
+    t.hidden = false;
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    const vh = document.documentElement.clientHeight || window.innerHeight;
+    let x = vw - 316;
+    let y = 16;
+    if (!dl.btn.hidden) {
+      const r = dl.btn.getBoundingClientRect();
+      x = r.right - 300;
+      y = r.bottom + 8;
+    } else if (near) {
+      x = near.x - 150;
+      y = near.y + 16;
+    }
+    t.style.left = Math.max(8, Math.min(x, vw - 308)) + 'px';
+    t.style.top = Math.max(8, Math.min(y, vh - 80)) + 'px';
+    clearTimeout(dlToastTimer);
+    dlToastTimer = setTimeout(() => {
+      if (dl) dl.toast.hidden = true;
+    }, bad ? 9000 : 5000);
+  }
+
+  function siteWord() {
+    return /(^|\.)messenger\.com$/i.test(location.hostname) || /^\/messages(\/|$)/.test(location.pathname) ? 'messenger' : 'facebook';
+  }
+
+  function stamp() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  }
+
+  function extOf(url, fallback) {
+    const m = /\.(mp4|m4a|jpe?g|png|webp|gif)(?:$)/i.exec(String(url || '').split(/[?#]/)[0]);
+    return m ? m[1].toLowerCase().replace('jpeg', 'jpg') : fallback;
+  }
+
+  function extOfType(type, fallback) {
+    const t = String(type || '').toLowerCase();
+    if (/jpe?g/.test(t)) return 'jpg';
+    if (/png/.test(t)) return 'png';
+    if (/webp/.test(t)) return 'webp';
+    if (/gif/.test(t)) return 'gif';
+    if (/mp4|quicktime|video/.test(t)) return 'mp4';
+    if (/audio/.test(t)) return 'm4a';
+    return fallback;
+  }
+
+  /** Hands a Facebook file address to the background worker, which saves it to Downloads/Facebook. */
+  async function saveUrl(url, filename) {
+    const res = await send({ type: 'download', url, filename });
+    if (!res) throw new Error('The extension did not answer. Reload this tab and try again.');
+    if (!res.ok) throw new Error(res.error || 'The download did not start.');
+    return res;
+  }
+
+  /**
+   * Saves a file that only exists inside this tab (photos and videos of encrypted chats).
+   * Facebook's own video player uses MediaSource addresses, which cannot be read: false then.
+   */
+  async function saveBlobUrl(blobUrl, nameNoExt, fallbackExt) {
+    let blob;
+    try {
+      const resp = await fetch(blobUrl);
+      blob = await resp.blob();
+    } catch (e) {
+      return false;
+    }
+    if (!blob || !blob.size) return false;
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objectUrl;
+    a.download = `${nameNoExt}.${extOfType(blob.type, fallbackExt)}`;
+    a.click(); // never added to the page, so Facebook's link handling never sees it
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 120000);
+    return true;
+  }
+
+  async function downloadImage(target) {
+    const shown = mediaUrlOf(target.el);
+    const base = `${siteWord()}-photo-`;
+    if (/^(blob|data):/i.test(shown)) {
+      if (await saveBlobUrl(shown, base + stamp(), 'jpg')) return 'Photo saved to your Downloads folder.';
+      throw new Error('This photo could not be read. Open it (click it) and try again.');
+    }
+    const res = await askPage('image', target.el);
+    const url = (res && res.url) || shown;
+    if (!/^https:\/\//i.test(url)) throw new Error('This picture cannot be saved.');
+    const key = (/\/([^/?#]+?)\.(?:jpe?g|png|webp|gif)(?:[?#]|$)/i.exec(url) || [])[1];
+    await saveUrl(url, `${base}${key || stamp()}.${extOf(url, 'jpg')}`);
+    return 'Photo saved to Downloads › Facebook.';
+  }
+
+  async function downloadVideo(target) {
+    const video = target.el && target.el.tagName === 'VIDEO' ? target.el : null;
+    const direct = video ? video.currentSrc || video.src || '' : '';
+    const what = /\/reels?\//.test(location.pathname) || (target.thumb && target.id) ? 'reel' : 'video';
+    const site = siteWord();
+    // chat videos are often plain files already
+    if (/^https:\/\//i.test(direct) && !/[?&]byte(?:start|end)=/i.test(direct)) {
+      await saveUrl(direct, `${site}-${what}-${stamp()}.${extOf(direct, 'mp4')}`);
+      return 'Video saved to Downloads › Facebook.';
+    }
+    if (/^blob:/i.test(direct) && (await saveBlobUrl(direct, `${site}-${what}-${stamp()}`, 'mp4'))) return 'Video saved to your Downloads folder.';
+
+    const res = await askPage('video', video && video.isConnected ? video : target.el && target.el.isConnected ? target.el : null, { id: target.id || '' });
+    if (!res) throw new Error('No answer from the page. Reload this tab and try again.');
+    const id = res.id || target.id || '';
+    const name = `${site}-${what}-${id || stamp()}`;
+    const wantSd = settings.downloadQuality === 'sd';
+    const url = wantSd ? res.sd || res.hd : res.hd || res.sd;
+    if (url) {
+      const quality = url === res.hd ? 'hd' : 'sd';
+      await saveUrl(url, `${name}-${quality}.mp4`);
+      return `${what === 'reel' ? 'Reel' : 'Video'} (${quality.toUpperCase()}) saved to Downloads › Facebook.`;
+    }
+    if (res.dashVideo) {
+      await saveUrl(res.dashVideo, `${name}-picture-only.mp4`);
+      if (res.dashAudio) await saveUrl(res.dashAudio, `${name}-sound-only.m4a`);
+      return 'Facebook only offers this video as separate picture and sound files. Both were saved to Downloads › Facebook.';
+    }
+    throw new Error('Facebook did not give a file for this video. Open the video on its own page (click its date or time) and try again.');
+  }
+
+  async function startDownload(target, near) {
+    if (!downloadsOn() || dlBusy) return;
+    dlBusy = true;
+    if (dl) dl.btn.setAttribute('aria-busy', 'true');
+    showToast(target.kind === 'image' ? 'Saving the photo…' : 'Finding the video file…', false, near);
+    try {
+      const done = target.kind === 'image' ? await downloadImage(target) : await downloadVideo(target);
+      showToast('✓ ' + done, false, near);
+    } catch (e) {
+      showToast(String((e && e.message) || e), true, near);
+    } finally {
+      dlBusy = false;
+      if (dl) dl.btn.removeAttribute('aria-busy');
+    }
+  }
+
+  /** The right-click menu item ("Download this photo or video"). */
+  function onContextDownload(msg) {
+    if (!downloadsOn()) return;
+    const near = lastContext && Date.now() - lastContext.t < 120000 ? lastContext : null;
+    const linkId = videoIdFromHref(msg.linkUrl);
+    let target = near ? mediaAt(near.x, near.y) : null;
+    if (target === 'overlay') target = dlTarget;
+    if (target && linkId && target.kind === 'image') target = { el: target.el, kind: 'video', id: linkId, thumb: true };
+    if (!target && linkId) target = { el: null, kind: 'video', id: linkId, thumb: /\/reels?\//.test(msg.linkUrl || '') };
+    if (!target && /^https:\/\//i.test(msg.srcUrl || '') && msg.mediaType === 'image') {
+      saveUrl(msg.srcUrl, `${siteWord()}-photo-${stamp()}.${extOf(msg.srcUrl, 'jpg')}`).then(
+        () => showToast('✓ Photo saved to Downloads › Facebook.', false, near),
+        (e) => showToast(String((e && e.message) || e), true, near)
+      );
+      return;
+    }
+    if (!target) {
+      showToast('No photo or video was found where you right-clicked.', true, near);
+      return;
+    }
+    startDownload(target, near);
+  }
+
+  const onRuntimeMessage = (msg, sender, sendResponse) => {
+    if (!msg || msg.type !== 'download-context') return false;
+    try {
+      onContextDownload(msg);
+    } catch (e) {
+      /* ignore */
+    }
+    sendResponse({ ok: true });
+    return false;
+  };
+  chrome.runtime.onMessage.addListener(onRuntimeMessage);
+  cleanups.push(() => {
+    try {
+      chrome.runtime.onMessage.removeListener(onRuntimeMessage);
+    } catch (e) {
+      /* context gone */
+    }
+  });
 })();

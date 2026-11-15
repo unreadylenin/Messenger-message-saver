@@ -195,6 +195,55 @@
           focusInfo() {
             return { hasFocus: document.hasFocus(), visibilityState: document.visibilityState, hidden: document.hidden };
           },
+          // A feed post with a video played through MediaSource (a blob: address that cannot be
+          // saved), as Facebook does. React's data on it is imitated with a __reactFiber$ property;
+          // `shape` picks which of Facebook's data layouts carries the files.
+          addFeedVideo({ id, hd, sd, dash, shape = 'player', link }) {
+            const art = document.createElement('div');
+            art.setAttribute('role', 'article');
+            art.innerHTML =
+              '<div style="position:relative;width:480px;height:270px;background:#000;margin:10px 0">' +
+              '<video muted playsinline style="width:480px;height:270px;display:block"></video>' +
+              '<div class="player-overlay" style="position:absolute;inset:0"></div></div>' +
+              (link ? `<a href="${link}">2 h</a>` : '');
+            document.getElementById('page-main').appendChild(art);
+            const video = art.querySelector('video');
+            video.src = URL.createObjectURL(new MediaSource());
+            let props;
+            if (shape === 'legacy') props = { video: { __typename: 'Video', id, videoDeliveryLegacyFields: { browser_native_hd_url: hd, browser_native_sd_url: sd } } };
+            else if (shape === 'progressive')
+              props = { video: { __typename: 'Video', id, videoDeliveryResponseFragment: { videoDeliveryResponseResult: { progressive_urls: [{ progressive_url: sd, metadata: { quality: 'SD' } }, { progressive_url: hd, metadata: { quality: 'HD' } }] } } } };
+            else if (shape === 'dash') props = { video: { __typename: 'Video', id, videoDeliveryResponseFragment: { videoDeliveryResponseResult: { dash_manifests: [{ manifest_xml: dash }] } } } };
+            else if (shape === 'none') props = { videoID: id };
+            else props = { videoID: id, implementations: [{ typename: 'VideoPlayerShakaImplementationData', data: {} }, { typename: 'VideoPlayerProgressiveImplementationData', data: { hdSrc: hd, sdSrc: sd } }] };
+            const root = { tag: 3, memoizedProps: null, memoizedState: null, return: null };
+            const player = { tag: 0, memoizedProps: props, memoizedState: null, return: root };
+            video['__reactFiber$mmstest'] = { tag: 5, memoizedProps: { src: video.src }, memoizedState: null, return: player };
+            return true;
+          },
+          // A feed photo: the page shows a smaller copy; React's data also lists a larger one
+          addPhoto({ src, big, link = '/photo/?fbid=1001', bigWidth = 2048, bigHeight = 1365 }) {
+            const art = document.createElement('div');
+            art.setAttribute('role', 'article');
+            art.innerHTML = `<a href="${link}"><img alt="" style="width:300px;height:200px;display:block;margin:10px 0" /></a>`;
+            document.getElementById('page-main').appendChild(art);
+            const img = art.querySelector('img');
+            img.src = src;
+            const post = { tag: 0, memoizedProps: { photo: { image: { uri: src, width: 300, height: 200 }, viewer_image: big ? { uri: big, width: bigWidth, height: bigHeight } : null } }, memoizedState: null, return: null };
+            img['__reactFiber$mmstest'] = { tag: 5, memoizedProps: { src }, memoizedState: null, return: post };
+            return true;
+          },
+          // A photo from an encrypted chat: only a blob: copy exists in the tab
+          addBlobPhoto(b64) {
+            const art = document.createElement('div');
+            art.innerHTML = '<img alt="" style="width:200px;height:150px;display:block;margin:10px 0" />';
+            document.getElementById('page-main').appendChild(art);
+            art.querySelector('img').src = window.fb.blobPng(b64);
+            return true;
+          },
+          clearMain() {
+            document.getElementById('page-main').textContent = '';
+          },
           receivedCount() {
             return state.received.length;
           },

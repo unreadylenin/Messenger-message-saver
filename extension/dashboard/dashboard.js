@@ -329,8 +329,9 @@ async function bindSettings() {
   for (const input of document.querySelectorAll('[data-setting]')) {
     const key = input.dataset.setting;
     input.addEventListener('change', async () => {
-      const value = input.type === 'checkbox' ? input.checked : Math.max(Number(input.min || 0), Math.min(Number(input.max || 1e9), Number(input.value) || 0));
-      if (input.type !== 'checkbox') input.value = value;
+      const value =
+        input.type === 'checkbox' ? input.checked : input.tagName === 'SELECT' ? input.value : Math.max(Number(input.min || 0), Math.min(Number(input.max || 1e9), Number(input.value) || 0));
+      if (input.type !== 'checkbox' && input.tagName !== 'SELECT') input.value = value;
       await setSettings({ [key]: value });
       toast('Saved');
     });
@@ -358,7 +359,7 @@ async function renderDiagnostics() {
         el('td', { text: `${sockets.dgw || 0} gateway, ${sockets.mqtt || 0} legacy, ${sockets.e2ee || 0} encrypted` }),
         el('td', { text: `${d.messages || 0} msgs, ${d.unsent || 0} unsends, ${d.edits || 0} edits` }),
         el('td', { text: d.dom ? `${d.dom.logs} chat(s) open, ${d.dom.saved} saved, ${d.dom.recovered} shown` : '-' }),
-        el('td', { text: `${d.seenBlocked || 0} / ${d.typingBlocked || 0}` + (d.seenUnknown ? ` (${d.seenUnknown} not held back: reload this tab)` : '') + (d.lateInjected ? ' · started late: reload this tab' : '') }),
+        el('td', { text: `${d.seenBlocked || 0} / ${d.typingBlocked || 0}` + (d.seenUnknown ? ` (${d.seenUnknown} not held back: reload this tab)` : '') + (d.lateInjected ? ' · started late: reload this tab' : '') + (d.strongMode ? ' · Strong mode on here' : '') }),
         el('td', { text: d.errors ? `${d.errors}: ${d.lastError}` : 'none' })
       )
     );

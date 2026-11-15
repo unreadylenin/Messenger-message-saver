@@ -437,6 +437,12 @@ main {
   font: inherit;
 }
 
+.num.sel {
+  width: auto;
+  min-width: 120px;
+  cursor: pointer;
+}
+
 .btn-col {
   display: flex;
   flex-direction: column;

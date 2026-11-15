@@ -20,6 +20,11 @@ const THREAD = '100012345678901';
 const ME = '100099999999999';
 const PNG_1x1 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
 const dec = new TextDecoder();
+// Shape of a reel page's data (RelayPrefetchedStreamCache -> creation_story -> playback_video), test values only
+const REEL_DATA = {
+  require: [['ScheduledServerJS', 'handle', null, [{ __bbox: { require: [['RelayPrefetchedStreamCache', 'next', [], ['adp_FBReelsRootWithEntrypointQueryRelayPreloader_1', { __bbox: { complete: true, result: { data: { video: { creation_story: { short_form_video_context: { playback_video: { __typename: 'Video', id: '987654321', videoDeliveryLegacyFields: { browser_native_hd_url: 'https://video-x.xx.fbcdn.net/v/t42/reelhd.mp4?_nc=1&oh=9', browser_native_sd_url: 'https://video-x.xx.fbcdn.net/v/t42/reelsd.mp4?_nc=1&oh=9' } } } } } } } } }]]] } }]]],
+};
+const REEL_HTML = `<!doctype html><html><head><title>Reel</title></head><body><script type="application/json" data-content-len="999" data-sjs>${JSON.stringify(REEL_DATA).replace(/\//g, '\\/')}</script></body></html>`;
 
 async function waitFor(fn, { timeout = 10000, interval = 150, what = 'condition' } = {}) {
   const end = Date.now() + timeout;
@@ -57,10 +62,16 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
   // fake facebook.com (GraphQL answers with whatever the current test put in graphqlReply)
   let graphqlReply = '{}';
   await ctx.route('https://www.facebook.com/**', (route) => {
+    // a reel's own page, as the downloader reads it (data in a <script type="application/json">, slashes escaped)
+    if (route.request().url().includes('/reel/987654321')) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: REEL_HTML });
     if (route.request().resourceType() === 'document') return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: FIXTURE });
     if (route.request().url().includes('/api/graphql/')) return route.fulfill({ status: 200, contentType: 'text/javascript; charset=utf-8', body: 'for (;;);' + graphqlReply });
     return route.fulfill({ status: 204, body: '' });
   });
+  // pictures the test page shows from Facebook's image servers
+  await ctx.route(/^https:\/\/[^/]*fbcdn\.net\//, (route) =>
+    route.request().resourceType() === 'image' ? route.fulfill({ status: 200, contentType: 'image/png', body: Buffer.from(PNG_1x1, 'base64') }) : route.fulfill({ status: 404, body: '' })
+  );
   await ctx.grantPermissions(['notifications'], { origin: 'https://www.facebook.com' });
 
   // fake gateway.facebook.com
@@ -92,12 +103,36 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     assert.equal(await page.evaluate(() => typeof window.fb), 'object');
   });
 
-  await t.test('Unseen strong mode reports "no focus" but keeps the real visibility', async () => {
-    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).hasFocus === false, { what: 'no focus' });
+  await t.test('Strong mode: the news feed keeps real focus; Messenger pages report "no focus"', async () => {
+    const focusEventsReach = () =>
+      page.evaluate(() => {
+        let n = 0;
+        const f = () => n++;
+        window.addEventListener('focus', f);
+        window.dispatchEvent(new Event('focus'));
+        window.removeEventListener('focus', f);
+        return n;
+      });
+    await page.bringToFront();
+    // feed (/): Facebook must see the real focus, or its feed, Watch and Reels stop loading
+    await page.evaluate(() => fb.focusInfo()); // settings have arrived by now or shortly
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal((await page.evaluate(() => fb.focusInfo())).hasFocus, true, 'real focus on the feed');
+    assert.equal(await focusEventsReach(), 1, 'focus events reach the feed');
+
+    // into Messenger without a reload (Facebook is a single-page app): Facebook is told the window lost focus
+    const entered = await page.evaluate((thread) => {
+      window.__mmsBlurs = 0;
+      window.__mmsFocuses = 0;
+      window.addEventListener('blur', () => window.__mmsBlurs++);
+      window.addEventListener('focus', () => window.__mmsFocuses++);
+      history.pushState({}, '', '/messages/t/' + thread + '/');
+      return { hasFocus: document.hasFocus(), blurs: window.__mmsBlurs };
+    }, THREAD);
+    assert.deepEqual(entered, { hasFocus: false, blurs: 1 }, 'switch happens during the navigation itself');
     const info = await page.evaluate(() => fb.focusInfo());
-    assert.equal(info.hasFocus, false);
     assert.equal(info.visibilityState, 'visible', 'visibility is real by default (Facebook needs it)');
-    assert.equal(await page.evaluate(() => { let n = 0; window.addEventListener('focus', () => n++); window.dispatchEvent(new Event('focus')); return n; }), 0, 'window focus events held back');
+    assert.equal(await focusEventsReach(), 0, 'window focus events held back on Messenger pages');
     // visibilitychange always reaches the page
     assert.equal(await page.evaluate(() => { let n = 0; document.addEventListener('visibilitychange', () => n++); document.dispatchEvent(new Event('visibilitychange')); return n; }), 1);
 
@@ -105,9 +140,37 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).visibilityState === 'hidden', { what: 'optional hidden mode' });
     await setSettings({ stealthVisibility: false, stealthFocus: false });
     await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).visibilityState === 'visible', { what: 'visible again' });
-    assert.equal(await page.evaluate(() => { let n = 0; window.addEventListener('focus', () => n++); window.dispatchEvent(new Event('focus')); return n; }), 1, 'focus events pass when Strong mode is off');
+    assert.equal(await focusEventsReach(), 1, 'focus events pass when Strong mode is off');
+    assert.equal((await page.evaluate(() => fb.focusInfo())).hasFocus, true, 'real focus when Strong mode is off');
     await setSettings({ stealthFocus: true });
     await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).hasFocus === false, { what: 'no focus again' });
+
+    // Back/Forward and links out of Messenger: the feed gets its focus back at once
+    const left = await page.evaluate(() => {
+      const before = window.__mmsFocuses;
+      history.pushState({}, '', '/');
+      return { hasFocus: document.hasFocus(), focuses: window.__mmsFocuses - before };
+    });
+    assert.deepEqual(left, { hasFocus: true, focuses: 1 }, 'focus handed back on leaving Messenger');
+    assert.equal(await focusEventsReach(), 1);
+    await page.goBack(); // popstate back to /messages/t/...
+    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).hasFocus === false, { what: 'Back into Messenger' });
+    await page.evaluate(() => history.pushState({}, '', '/'));
+    assert.equal((await page.evaluate(() => fb.focusInfo())).hasFocus, true);
+
+    // A Messenger tab open before an install/update gets the hook late, after Facebook read the
+    // real focus: the hook tells it once that the window is not focused.
+    const late = await ctx.newPage();
+    await late.route('https://late.example/**', (route) =>
+      route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>late</title><script>window.__blurs = 0; addEventListener("blur", () => window.__blurs++);</script>' })
+    );
+    await late.goto('https://late.example/messages/t/123456789/');
+    await late.bringToFront();
+    assert.equal(await late.evaluate(() => document.hasFocus()), true);
+    await late.addScriptTag({ path: path.join(EXT, 'content/main-world.js') });
+    assert.deepEqual(await late.evaluate(() => ({ blurs: window.__blurs, hasFocus: document.hasFocus() })), { blurs: 1, hasFocus: false });
+    await late.close();
+    await page.bringToFront();
   });
 
   await t.test('network: message saved, then kept after the sender unsends it', async () => {
@@ -145,8 +208,14 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
       x.onload = resolve;
       x.send('fb_api_req_friendly_name=CometNewsFeedPaginationQuery');
     }));
+    // Facebook's long random request fields can contain a word like "thread" or "MAW" by chance
+    await page.evaluate(() => fetch('/api/graphql/', { method: 'POST', body: '__dyn=7AzHxqU5a5Q1ryaxG4VuC0BVU98nwgU29zEdEc8co5S3O2Saw8i2S1DwUx60xU8E3Qwb-q7oc81EEbbwto88422y11xmfz83WwgEcEhwnU1e42C2203xMAW1xthread0&__csr=g4thread&fb_api_req_friendly_name=CometNewsFeedPaginationQuery&variables=%7B%7D' }).then((r) => r.text()));
     await new Promise((r) => setTimeout(r, 800));
     assert.equal((await dbAll('messages')).some((m) => m.key === 'fb:mid.$feed1'), false, 'feed requests are not read');
+    // a string body is recognised by its query name too
+    graphqlReply = lsDoc('string body', 'mid.$gql2');
+    await page.evaluate(() => fetch('/api/graphql/', { method: 'POST', body: 'av=1&__dyn=abc&fb_api_req_friendly_name=LSPlatformGraphQLLightspeedRequestQuery&variables=%7B%7D' }).then((r) => r.text()));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$gql2'), { what: 'string-body Messenger query read' });
   });
 
   await t.test('Unseen: "Seen" is rewound and "typing" is cleared before leaving the browser', async () => {
@@ -597,6 +666,170 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     await opt.goto(`chrome-extension://${extId}/dashboard/options.html`);
     await waitFor(async () => opt.url().endsWith('#settings') && (await opt.isVisible('#view-settings')), { what: 'options -> settings' });
     await opt.close();
+  });
+
+  await t.test('downloads: feed videos (every data layout), reels, photos, encrypted-chat photos, right-click', async () => {
+    await setSettings({ enabled: true, downloadButtons: true, downloadQuality: 'hd', downloadAsk: false });
+    await page.bringToFront();
+    const worker = () => ctx.serviceWorkers().find((w) => w.url().startsWith(`chrome-extension://${extId}/`)) || sw;
+    // record what the extension hands to Chrome's downloader
+    const patch = () =>
+      worker().evaluate(() => {
+        if (self.__mmsDlPatched) return true;
+        self.__mmsDlPatched = true;
+        self.__mmsDl = [];
+        const orig = chrome.downloads.download.bind(chrome.downloads);
+        chrome.downloads.download = (opts) => {
+          self.__mmsDl.push(opts);
+          return orig(opts);
+        };
+        return true;
+      });
+    await patch();
+    const calls = () => worker().evaluate(() => self.__mmsDl || []);
+    const button = page.locator('[data-mms="download"] .btn');
+    const toast = page.locator('[data-mms="download"] .toast');
+    const pressDownload = async (selector) => {
+      await page.mouse.move(5, 5);
+      await button.waitFor({ state: 'hidden', timeout: 5000 });
+      await page.hover(selector);
+      await button.waitFor({ state: 'visible', timeout: 5000 });
+      const label = await button.textContent();
+      const n = (await calls()).length;
+      await button.click();
+      return { label, n };
+    };
+    const nextCall = async (n, what) => {
+      try {
+        return await waitFor(async () => (await calls())[n], { what });
+      } catch (e) {
+        throw new Error(e.message + ' | message on screen: ' + (await toast.textContent().catch(() => '?')) + ' | calls: ' + JSON.stringify((await calls()).map((c) => c.url)));
+      }
+    };
+
+    const V = 'https://video-sin6-1.xx.fbcdn.net/v/t42.1790-2/';
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate((V) => fb.addFeedVideo({ id: '1111111111', hd: V + 'hd1.mp4?_nc_ht=x&oh=1', sd: V + 'sd1.mp4?_nc_ht=x&oh=1' }), V);
+    let r = await pressDownload('[role="article"] .player-overlay');
+    assert.equal(r.label, '⬇ Video');
+    let call = await nextCall(r.n, 'player-props video download');
+    assert.equal(call.url, V + 'hd1.mp4?_nc_ht=x&oh=1', 'HD file from the player data, not the blob: address');
+    assert.equal(call.filename, 'Facebook/facebook-video-1111111111-hd.mp4');
+    assert.equal(call.saveAs, false);
+    await waitFor(async () => /saved to Downloads/.test(await toast.textContent()), { what: 'success message' });
+
+    // the layout Facebook uses in its page data (videoDeliveryLegacyFields)
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate((V) => fb.addFeedVideo({ id: '1111111112', hd: V + 'hd2.mp4?x=1', sd: V + 'sd2.mp4?x=1', shape: 'legacy' }), V);
+    r = await pressDownload('[role="article"] .player-overlay');
+    call = await nextCall(r.n, 'legacy-fields download');
+    assert.equal(call.url, V + 'hd2.mp4?x=1');
+
+    // the newer layout (progressive_urls), with "Smaller (SD)" chosen
+    await setSettings({ downloadQuality: 'sd' });
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate((V) => fb.addFeedVideo({ id: '1111111113', hd: V + 'hd3.mp4?x=1', sd: V + 'sd3.mp4?x=1', shape: 'progressive' }), V);
+    r = await pressDownload('[role="article"] .player-overlay');
+    call = await nextCall(r.n, 'progressive_urls download');
+    assert.equal(call.url, V + 'sd3.mp4?x=1', 'SD when the user chose smaller files');
+    assert.equal(call.filename, 'Facebook/facebook-video-1111111113-sd.mp4');
+    await setSettings({ downloadQuality: 'hd' });
+
+    // only DASH: separate picture and sound tracks, best of each
+    const mpd =
+      '<?xml version="1.0"?><MPD><Period><AdaptationSet mimeType="video/mp4">' +
+      `<Representation bandwidth="400000" height="360"><BaseURL>${V}v360.mp4?a=1&amp;b=2</BaseURL></Representation>` +
+      `<Representation bandwidth="2000000" height="1080"><BaseURL>${V}v1080.mp4?a=1&amp;b=2</BaseURL></Representation>` +
+      '</AdaptationSet><AdaptationSet mimeType="audio/mp4">' +
+      `<Representation bandwidth="64000"><BaseURL>${V}a64.mp4?a=1</BaseURL></Representation>` +
+      `<Representation bandwidth="128000"><BaseURL>${V}a128.mp4?a=1</BaseURL></Representation>` +
+      '</AdaptationSet></Period></MPD>';
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate(({ mpd }) => fb.addFeedVideo({ id: '1111111114', dash: mpd, shape: 'dash' }), { mpd });
+    r = await pressDownload('[role="article"] .player-overlay');
+    await nextCall(r.n + 1, 'two DASH downloads');
+    const two = (await calls()).slice(r.n, r.n + 2);
+    assert.deepEqual(
+      two.map((c) => [c.url, c.filename]),
+      [
+        [V + 'v1080.mp4?a=1&b=2', 'Facebook/facebook-video-1111111114-picture-only.mp4'],
+        [V + 'a128.mp4?a=1', 'Facebook/facebook-video-1111111114-sound-only.m4a'],
+      ]
+    );
+
+    // a reel thumbnail (a picture linking to /reel/ID): the reel's own page is read for its file
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate(() => fb.addPhoto({ src: 'https://scontent.xx.fbcdn.net/v/t15/reelthumb_n.jpg?stp=dst-jpg_s320x320&oh=1', link: '/reel/987654321/' }));
+    r = await pressDownload('[role="article"] img');
+    assert.equal(r.label, '⬇ Reel');
+    call = await nextCall(r.n, 'reel download');
+    assert.equal(call.url, 'https://video-x.xx.fbcdn.net/v/t42/reelhd.mp4?_nc=1&oh=9');
+    assert.equal(call.filename, 'Facebook/facebook-reel-987654321-hd.mp4');
+
+    // a photo: the largest copy in the page's data, same picture (same file name)
+    await page.evaluate(() => fb.clearMain());
+    const small = 'https://scontent.xx.fbcdn.net/v/t39.30808-6/123_456_789_n.jpg?stp=dst-jpg_s320x320&oh=1';
+    const big = 'https://scontent.xx.fbcdn.net/v/t39.30808-6/123_456_789_n.jpg?stp=dst-jpg_s2048x2048&oh=2';
+    await page.evaluate(({ small, big }) => fb.addPhoto({ src: small, big }), { small, big });
+    r = await pressDownload('[role="article"] img');
+    assert.equal(r.label, '⬇ Photo');
+    call = await nextCall(r.n, 'photo download');
+    assert.equal(call.url, big, 'largest copy');
+    assert.equal(call.filename, 'Facebook/facebook-photo-123_456_789_n.jpg');
+
+    // a photo from an encrypted chat exists only inside the tab: saved by the tab itself
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate((b64) => fb.addBlobPhoto(b64), PNG_1x1);
+    await page.mouse.move(5, 5);
+    await button.waitFor({ state: 'hidden', timeout: 5000 });
+    await page.hover('#page-main img');
+    await button.waitFor({ state: 'visible', timeout: 5000 });
+    const [file] = await Promise.all([page.waitForEvent('download', { timeout: 10000 }), button.click()]);
+    assert.match(file.suggestedFilename(), /^facebook-photo-\d{8}-\d{6}\.png$/);
+
+    // no file anywhere: an honest message, no download
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate(() => fb.addFeedVideo({ id: '2222222222', shape: 'none' }));
+    r = await pressDownload('[role="article"] .player-overlay');
+    await waitFor(async () => /did not give a file/.test(await toast.textContent()), { what: 'no-file message' });
+    assert.equal((await calls()).length, r.n, 'nothing downloaded');
+
+    // right-click → "Download this photo or video" on a link to a reel
+    const before = (await calls()).length;
+    await worker().evaluate(async () => {
+      const [tab] = await chrome.tabs.query({ url: 'https://www.facebook.com/*' });
+      await chrome.tabs.sendMessage(tab.id, { type: 'download-context', linkUrl: 'https://www.facebook.com/reel/987654321/?s=ifu', srcUrl: '', mediaType: '' });
+    });
+    call = await nextCall(before, 'right-click reel download');
+    assert.equal(call.url, 'https://video-x.xx.fbcdn.net/v/t42/reelhd.mp4?_nc=1&oh=9');
+
+    // only Facebook's own servers, and the button goes away when turned off
+    const guard = await dash.evaluate(async () => {
+      const m = await import('/lib/downloads.js');
+      return [m.isDownloadableUrl('https://video.xx.fbcdn.net/v/a.mp4'), m.isDownloadableUrl('https://evil.example/x.fbcdn.net/a.mp4'), m.isDownloadableUrl('https://fbcdn.net.evil.example/a.mp4'), m.isDownloadableUrl('http://video.xx.fbcdn.net/a.mp4')];
+    });
+    assert.deepEqual(guard, [true, false, false, false]);
+    await setSettings({ downloadButtons: false });
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate((V) => fb.addFeedVideo({ id: '1111111115', hd: V + 'hd5.mp4?x=1' }), V);
+    await new Promise((res) => setTimeout(res, 300));
+    await page.mouse.move(5, 5);
+    await page.hover('[role="article"] .player-overlay');
+    await new Promise((res) => setTimeout(res, 500));
+    assert.equal(await button.isVisible().catch(() => false), false, 'no button when turned off');
+    const menus = await worker().evaluate(() => new Promise((res) => chrome.contextMenus.update('mms-download', {}, () => res(chrome.runtime.lastError ? 'gone' : 'there'))));
+    assert.equal(menus, 'gone', 'right-click entry removed too');
+    await setSettings({ downloadButtons: true });
+    await page.evaluate(() => fb.clearMain());
+
+    // Settings → Downloads: the quality choice is stored as 'hd' / 'sd'
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#settings`);
+    const quality = '#view-settings select[data-setting="downloadQuality"]';
+    assert.equal(await dash.inputValue(quality), 'hd');
+    await dash.selectOption(quality, 'sd');
+    await waitFor(async () => (await dash.evaluate(async () => (await import('/lib/settings.js')).getSettings())).downloadQuality === 'sd', { what: 'quality saved' });
+    await dash.selectOption(quality, 'hd');
+    await waitFor(async () => (await dash.evaluate(async () => (await import('/lib/settings.js')).getSettings())).downloadQuality === 'hd', { what: 'quality back to HD' });
   });
 
   await t.test('no script errors anywhere', async () => {

@@ -5,6 +5,7 @@
 
 import { DEFAULT_SETTINGS, getSettings } from '../lib/settings.js';
 import * as db from '../lib/db.js';
+import { downloadFileName, isDownloadableUrl } from '../lib/downloads.js';
 
 const { normalizeText, finalizeMessage, reqP } = db;
 
@@ -24,6 +25,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     updateBadge();
     // a new "delete older than N days" applies now, not at the next 6-hourly run
     if (settingsCache.retentionDays > 0 && settingsCache.retentionDays !== before.retentionDays) pruneNow(settingsCache.retentionDays);
+    if (settingsCache.enabled !== before.enabled || settingsCache.downloadButtons !== before.downloadButtons) updateMenus();
   }
 });
 
@@ -43,9 +45,54 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     chrome.tabs.create({ url: chrome.runtime.getURL('dashboard/dashboard.html#welcome') });
   }
   updateBadge();
+  updateMenus();
 });
 
-chrome.runtime.onStartup.addListener(() => updateBadge());
+chrome.runtime.onStartup.addListener(() => {
+  updateBadge();
+  updateMenus();
+});
+
+/* ---------------- downloads: photos, videos and reels ---------------- */
+// The tab works out which file is behind a photo or video; this saves it with Chrome's own
+// downloader into Downloads/Facebook. Only files on Facebook's servers are accepted, so a
+// page can never use this to download anything else.
+
+const MENU_ID = 'mms-download';
+async function updateMenus() {
+  try {
+    await chrome.contextMenus.removeAll();
+    const s = await settings();
+    if (!s.enabled || !s.downloadButtons) return;
+    chrome.contextMenus.create({
+      id: MENU_ID,
+      title: 'Download this photo or video',
+      contexts: ['image', 'video', 'link', 'page'],
+      documentUrlPatterns: PAGE_MATCHES,
+    });
+  } catch (e) {
+    console.debug('[MMS] menu not updated', e && e.message);
+  }
+}
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId !== MENU_ID || !tab || typeof tab.id !== 'number') return;
+  const msg = { type: 'download-context', srcUrl: info.srcUrl || '', linkUrl: info.linkUrl || '', mediaType: info.mediaType || '' };
+  chrome.tabs.sendMessage(tab.id, msg, { frameId: info.frameId || 0 }).catch(() => {});
+});
+
+async function startDownload(msg) {
+  const url = String((msg && msg.url) || '');
+  if (!isDownloadableUrl(url)) return { ok: false, error: 'Only photos and videos stored by Facebook can be downloaded.' };
+  const s = await settings();
+  if (!s.enabled || !s.downloadButtons) return { ok: false, error: 'Downloads are turned off in Messenger Message Saver’s settings.' };
+  try {
+    const id = await chrome.downloads.download({ url, filename: downloadFileName(msg.filename, url), conflictAction: 'uniquify', saveAs: !!s.downloadAsk });
+    return { ok: true, id };
+  } catch (e) {
+    return { ok: false, error: 'Chrome could not start the download: ' + String((e && e.message) || e) };
+  }
+}
 
 /** Old messages removed by the retention setting: tell open Saved Messages tabs to refresh. */
 async function pruneNow(days) {
@@ -1127,6 +1174,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'refresh-badge':
         await updateBadge();
         return true;
+      case 'download':
+        if (fromTab === null) return { ok: false, error: 'not from a tab' };
+        return startDownload(msg);
       default:
         return undefined;
     }
