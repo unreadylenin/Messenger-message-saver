@@ -1,0 +1,80 @@
+{
+  "manifest_version": 3,
+  "name": "Messenger Message Saver",
+  "short_name": "Msg Saver",
+  "version": "1.1.0",
+  "description": "Saves Messenger messages on facebook.com and messenger.com so unsent, deleted and edited messages stay readable. Adds Unseen mode (no Seen, no typing) and downloads photos, videos and reels.",
+  "minimum_chrome_version": "114",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Messenger Message Saver",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "notifications",
+    "alarms",
+    "scripting",
+    "downloads",
+    "contextMenus"
+  ],
+  "host_permissions": [
+    "https://*.facebook.com/*",
+    "https://*.messenger.com/*",
+    "https://*.fbcdn.net/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.facebook.com/*",
+        "https://web.facebook.com/*",
+        "https://www.messenger.com/*"
+      ],
+      "js": [
+        "content/main-world.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://www.facebook.com/*",
+        "https://web.facebook.com/*",
+        "https://www.messenger.com/*"
+      ],
+      "js": [
+        "content/content.js"
+      ],
+      "css": [
+        "content/content.css"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  "options_page": "dashboard/options.html",
+  "commands": {
+    "toggle-unseen": {
+      "suggested_key": {
+        "default": "Alt+Shift+U"
+      },
+      "description": "Turn Unseen mode on or off"
+    }
+  }
+}
