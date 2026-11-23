@@ -27,13 +27,13 @@
          message area is a generic "Messages" -->
     <div class="popup" id="popup">
       <div class="popup-head">
-        <div role="button"><a href="/100012345678901/" role="link"><h2 dir="auto"><span>Khondoker Aurthe</span></h2></a></div>
+        <div role="button"><a href="/100012345678901/" role="link"><h2 dir="auto"><span>Alex Example</span></h2></a></div>
         <span>Active 1h ago</span>
       </div>
       <div data-mw-file-dropzone="1" style="display: flex; flex-direction: column; flex: 1; min-height: 0">
         <h2 dir="auto">Messages</h2>
         <div role="status"></div>
-        <div role="log" id="log" aria-label="Messages in conversation with Khondoker Aurthe"></div>
+        <div role="log" id="log" aria-label="Messages in conversation with Alex Example"></div>
       </div>
       <div role="textbox" contenteditable="true" aria-label="Message">Aa</div>
     </div>
@@ -58,10 +58,11 @@
             : m.text
             ? `${lead} ${m.time}, ${m.sender}: ${m.text}`
             : `${lead} ${m.time}, ${m.sender}`;
-          const avatar = m.mine
+          const avatar = m.mine || m.noAvatar
             ? ''
             : `<div role="presentation"><div aria-hidden="true"><span><div aria-expanded="false" aria-haspopup="dialog" role="button" tabindex="-1"><img alt="${m.sender}" src="https://scontent.xx.fbcdn.net/v/t1.6435-1/avatar.jpg?stp=dst-jpg_s100x100_tt6" width="28" height="28"></div></span></div></div>`;
-          const heading = m.heading ? `<div role="presentation"><div><div><span aria-hidden="true"><h3 dir="auto">${m.heading}</h3></span></div></div></div>` : '';
+          const htag = m.headingTag || 'h3';
+          const heading = m.heading ? `<div role="presentation"><div><div><span aria-hidden="true"><${htag} dir="auto">${m.heading}</${htag}></span></div></div></div>` : '';
           const textPart = m.placeholder
             ? `<span dir="auto"><div dir="auto">${m.placeholder}</div></span>`
             : m.text

@@ -41,7 +41,7 @@ async function waitFor(fn, { timeout = 10000, interval = 150, what = 'condition'
   throw new Error('Timed out waiting for ' + what + (last instanceof Error ? ': ' + last.message : ''));
 }
 
-test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
+test('Messenger Message Saver end to end', { timeout: 420000 }, async (t) => {
   const userDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mms-e2e-'));
   const ctx = await chromium.launchPersistentContext(userDir, {
     channel: 'chromium',
@@ -68,6 +68,20 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     if (route.request().url().includes('/api/graphql/')) return route.fulfill({ status: 200, contentType: 'text/javascript; charset=utf-8', body: 'for (;;);' + graphqlReply });
     return route.fulfill({ status: 204, body: '' });
   });
+  // records what the extension hands to Chrome's downloader (shared by the download and security checks)
+  const patchDownloads = () =>
+    (ctx.serviceWorkers().find((w) => w.url().startsWith(`chrome-extension://${extId}/`)) || sw).evaluate(() => {
+      if (self.__mmsDlPatched) return true;
+      self.__mmsDlPatched = true;
+      self.__mmsDl = [];
+      const orig = chrome.downloads.download.bind(chrome.downloads);
+      chrome.downloads.download = (opts) => {
+        self.__mmsDl.push(opts);
+        return orig(opts);
+      };
+      return true;
+    });
+
   // pictures the test page shows from Facebook's image servers
   await ctx.route(/^https:\/\/[^/]*fbcdn\.net\//, (route) =>
     route.request().resourceType() === 'image' ? route.fulfill({ status: 200, contentType: 'image/png', body: Buffer.from(PNG_1x1, 'base64') }) : route.fulfill({ status: 404, body: '' })
@@ -177,7 +191,7 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     await page.evaluate(() => fb.connect());
     await waitFor(() => gw.socket, { what: 'gateway connection' });
     const steps = [
-      h.call('verifyContactRowExists', { 0: h.i64(THREAD), 2: '', 3: 'Khondoker Aurthe' }, 22),
+      h.call('verifyContactRowExists', { 0: h.i64(THREAD), 2: '', 3: 'Alex Example' }, 22),
       h.call('deleteThenInsertThread', { 0: h.i64(1731571860000), 1: h.i64(1731571000000), 2: 'hi', 3: '', 7: h.i64(THREAD), 9: h.i64(1) }, 50),
       h.insertMessage({ text: 'network secret', threadKey: THREAD, ts: 1731571860000, id: 'mid.$net1', senderId: THREAD }),
     ];
@@ -190,7 +204,7 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     const after = await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$net1' && m.unsent), { what: 'unsent flag' });
     assert.equal(after.text, 'network secret', 'original text kept');
     const contacts = await dbAll('contacts');
-    assert.ok(contacts.some((c) => c.id === THREAD && c.name === 'Khondoker Aurthe'));
+    assert.ok(contacts.some((c) => c.id === THREAD && c.name === 'Alex Example'));
     const notes = await sw.evaluate(() => new Promise((r) => chrome.notifications.getAll(r)));
     assert.ok(Object.keys(notes).some((k) => k.startsWith('mms|')), 'desktop alert shown for the unsend');
   });
@@ -264,37 +278,37 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
   await t.test('screen: incoming and own messages are saved with sender and direction', async () => {
     await page.evaluate(() => {
       fb.dateBreak('Today');
-      fb.addMessage({ domId: '100012345678901@msgr.7001', sender: 'Khondoker Aurthe', time: '3:11 PM', text: 'screen secret' });
+      fb.addMessage({ domId: '100012345678901@msgr.7001', sender: 'Alex Example', time: '3:11 PM', text: 'screen secret' });
       fb.addMessage({ domId: '100099999999999@msgr.7002', sender: 'You', time: '3:12 PM', text: 'Good afternoon', mine: true });
     });
     const rec = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100012345678901@msgr.7001'), { what: 'screen message saved' });
     assert.equal(rec.text, 'screen secret');
-    assert.equal(rec.senderName, 'Khondoker Aurthe');
+    assert.equal(rec.senderName, 'Alex Example');
     assert.equal(rec.isMine, false);
     assert.ok(rec.ts > 0);
     const mine = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100099999999999@msgr.7002'), { what: 'own message saved' });
     assert.equal(mine.isMine, true);
     // Messenger puts the same number before "@msgr" on everyone's messages: it must not decide direction
-    await page.evaluate(() => fb.addMessage({ domId: '100099999999999@msgr.7005', sender: 'Khondoker Aurthe', time: '3:13 PM', text: 'same prefix, still incoming' }));
+    await page.evaluate(() => fb.addMessage({ domId: '100099999999999@msgr.7005', sender: 'Alex Example', time: '3:13 PM', text: 'same prefix, still incoming' }));
     const incoming = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100099999999999@msgr.7005'), { what: 'prefixed incoming saved' });
     assert.equal(incoming.isMine, false);
-    assert.equal(incoming.senderName, 'Khondoker Aurthe');
+    assert.equal(incoming.senderName, 'Alex Example');
   });
 
   await t.test('the same message seen on the network and on screen is stored once', async () => {
     gw.socket.send(Buffer.from(h.dgwData(3, h.responseEnvelope([h.insertMessage({ text: 'dedupe me', threadKey: THREAD, ts: 1731571870000, id: 'mid.$dup1', senderId: THREAD })]))));
     await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$dup1'), { what: 'network copy' });
-    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000007777', sender: 'Khondoker Aurthe', time: '3:12 PM', text: 'dedupe me' }));
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000007777', sender: 'Alex Example', time: '3:12 PM', text: 'dedupe me' }));
     const merged = await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$dup1' && m.domId === 'msgr.7460000000000007777'), { what: 'screen copy merged into network record' });
     assert.deepEqual(merged.sources.sort(), ['network', 'screen']);
     assert.equal((await dbAll('messages')).filter((m) => m.text === 'dedupe me').length, 1);
     const threads = await dbAll('threads');
     const popupThread = threads.find((t) => t.threadKey === THREAD);
-    assert.equal(popupThread && popupThread.domName, 'Khondoker Aurthe', 'pop-up keyed by the profile id and named from its header');
+    assert.equal(popupThread && popupThread.domName, 'Alex Example', 'pop-up keyed by the profile id and named from its header');
   });
 
   await t.test('screen: live unsend shows the original under "unsent a message"', async () => {
-    await page.evaluate(() => fb.unsend('100012345678901@msgr.7001', 'Khondoker Aurthe unsent a message'));
+    await page.evaluate(() => fb.unsend('100012345678901@msgr.7001', 'Alex Example unsent a message'));
     const box = await waitFor(async () => {
       const txt = await page.evaluate(() => {
         const b = document.querySelector('[data-message-id="100012345678901@msgr.7001"] .mms-recovered');
@@ -308,7 +322,7 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
   });
 
   await t.test('screen: edits keep the earlier text and show it in the chat', async () => {
-    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7003', sender: 'Khondoker Aurthe', time: '3:14 PM', text: 'original words' }));
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7003', sender: 'Alex Example', time: '3:14 PM', text: 'original words' }));
     await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100012345678901@msgr.7003'), { what: 'message before edit' });
     await page.evaluate(() => fb.edit('100012345678901@msgr.7003', 'changed words'));
     const rec = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100012345678901@msgr.7003' && m.edited), { what: 'edit saved' });
@@ -321,19 +335,19 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
   });
 
   await t.test('screen: photos are saved and shown again after an unsend', async () => {
-    await page.evaluate((png) => fb.addMessage({ domId: '100012345678901@msgr.7004', sender: 'Khondoker Aurthe', time: '3:15 PM', text: '', photo: 'data:image/png;base64,' + png }), PNG_1x1);
+    await page.evaluate((png) => fb.addMessage({ domId: '100012345678901@msgr.7004', sender: 'Alex Example', time: '3:15 PM', text: '', photo: 'data:image/png;base64,' + png }), PNG_1x1);
     const rec = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === '100012345678901@msgr.7004' && m.attachments.some((a) => a.mediaKey)), { what: 'photo stored' });
     assert.ok(rec.attachments.length >= 1);
     const media = await dbAll('media');
     assert.ok(media.some((x) => x.key === rec.attachments[0].mediaKey && x.size > 0));
-    await page.evaluate(() => fb.unsend('100012345678901@msgr.7004', 'Khondoker Aurthe unsent a message'));
+    await page.evaluate(() => fb.unsend('100012345678901@msgr.7004', 'Alex Example unsent a message'));
     await waitFor(async () => page.evaluate(() => !!document.querySelector('[data-message-id="100012345678901@msgr.7004"] .mms-recovered img')), { what: 'recovered photo' });
   });
 
   await t.test('encrypted chats: unsent row gets a NEW id - still matched, live and after reload', async () => {
-    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000008001', sender: 'Khondoker Aurthe', time: '3:16 PM', text: 'id will change' }));
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000008001', sender: 'Alex Example', time: '3:16 PM', text: 'id will change' }));
     await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008001'), { what: 'saved under canonical id' });
-    await page.evaluate(() => fb.unsendInPlace('100012345678901@msgr.7460000000000008001', '100012345678901@msgr.7460000000000009999', 'Khondoker Aurthe deleted a message'));
+    await page.evaluate(() => fb.unsendInPlace('100012345678901@msgr.7460000000000008001', '100012345678901@msgr.7460000000000009999', 'Alex Example deleted a message'));
     await waitFor(async () => page.evaluate(() => {
       const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000009999"] .mms-recovered');
       return b && b.textContent.includes('id will change');
@@ -347,14 +361,14 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
 
   await t.test('stickers, blob photos and the "Edited" button are understood', async () => {
     await page.evaluate((png) => {
-      fb.addMessage({ domId: '100012345678901@msgr.7460000000000008101', sender: 'Khondoker Aurthe', time: '3:17 PM', text: '', photo: fb.blobPng(png) });
-      fb.addMessage({ domId: '100012345678901@msgr.7460000000000008102', sender: 'Khondoker Aurthe', time: '3:17 PM', text: '', sticker: 'data:image/png;base64,' + png });
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000008101', sender: 'Alex Example', time: '3:17 PM', text: '', photo: fb.blobPng(png) });
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000008102', sender: 'Alex Example', time: '3:17 PM', text: '', sticker: 'data:image/png;base64,' + png });
     }, PNG_1x1);
     const blobRec = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008101' && m.attachments.some((a) => a.mediaKey)), { what: 'blob photo stored' });
     assert.ok(blobRec);
     const stickerRec = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008102' && m.attachments.length), { what: 'sticker saved' });
     assert.ok(stickerRec.attachments[0]);
-    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000008103', sender: 'Khondoker Aurthe', time: '3:18 PM', text: 'before button edit' }));
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000008103', sender: 'Alex Example', time: '3:18 PM', text: 'before button edit' }));
     await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008103'), { what: 'pre-edit saved' });
     await page.evaluate(() => fb.edit('100012345678901@msgr.7460000000000008103', 'after button edit', true));
     await waitFor(async () => page.evaluate(() => {
@@ -364,10 +378,10 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
   });
 
   await t.test('other UI languages: the unsent wording is learned from the page', async () => {
-    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000008201', sender: 'Khondoker Aurthe', time: '3:19 PM', text: 'learn me' }));
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000008201', sender: 'Alex Example', time: '3:19 PM', text: 'learn me' }));
     await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000008201'), { what: 'saved before unsend' });
     // a wording no built-in pattern knows
-    await page.evaluate(() => fb.unsendInPlace('100012345678901@msgr.7460000000000008201', '100012345678901@msgr.7460000000000008201', 'Khondoker Aurthe zz-unsendword-zz'));
+    await page.evaluate(() => fb.unsendInPlace('100012345678901@msgr.7460000000000008201', '100012345678901@msgr.7460000000000008201', 'Alex Example zz-unsendword-zz'));
     await waitFor(async () => page.evaluate(() => {
       const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000008201"] .mms-recovered');
       return b && b.textContent.includes('learn me');
@@ -378,20 +392,20 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
 
   await t.test('after a reload, old placeholders are filled from the saved copy', async () => {
     await page.evaluate(() =>
-      fb.addMessage({ domId: '100012345678901@msgr.7101', sender: 'Khondoker Aurthe', time: '3:20 PM', text: 'alpha one' }) ||
-      fb.addMessage({ domId: '100012345678901@msgr.7102', sender: 'Khondoker Aurthe', time: '3:20 PM', text: 'beta two' }) ||
-      fb.addMessage({ domId: '100012345678901@msgr.7103', sender: 'Khondoker Aurthe', time: '3:21 PM', text: 'gamma three' })
+      fb.addMessage({ domId: '100012345678901@msgr.7101', sender: 'Alex Example', time: '3:20 PM', text: 'alpha one' }) ||
+      fb.addMessage({ domId: '100012345678901@msgr.7102', sender: 'Alex Example', time: '3:20 PM', text: 'beta two' }) ||
+      fb.addMessage({ domId: '100012345678901@msgr.7103', sender: 'Alex Example', time: '3:21 PM', text: 'gamma three' })
     );
     await waitFor(async () => (await dbAll('messages')).some((m) => m.text === 'gamma three'), { what: 'context rows saved' });
     await page.reload();
     await page.evaluate(() => {
-      fb.addMessage({ domId: '100012345678901@msgr.7001', sender: 'Khondoker Aurthe', time: '3:11 PM', placeholder: 'Khondoker Aurthe unsent a message' });
-      fb.addMessage({ domId: '100012345678901@msgr.7101', sender: 'Khondoker Aurthe', time: '3:20 PM', text: 'alpha one' });
+      fb.addMessage({ domId: '100012345678901@msgr.7001', sender: 'Alex Example', time: '3:11 PM', placeholder: 'Alex Example unsent a message' });
+      fb.addMessage({ domId: '100012345678901@msgr.7101', sender: 'Alex Example', time: '3:20 PM', text: 'alpha one' });
       // same position, but Messenger gave the placeholder a different id: matched by its neighbours
-      fb.addMessage({ domId: '100012345678901@msgr.9999', sender: 'Khondoker Aurthe', time: '3:20 PM', placeholder: 'Khondoker Aurthe unsent a message' });
-      fb.addMessage({ domId: '100012345678901@msgr.7103', sender: 'Khondoker Aurthe', time: '3:21 PM', text: 'gamma three' });
-      fb.addMessage({ domId: '100012345678901@msgr.7460000000000009999', sender: 'Khondoker Aurthe', time: '3:16 PM', placeholder: 'Khondoker Aurthe deleted a message' });
-      fb.addMessage({ domId: '100012345678901@msgr.7460000000000008201', sender: 'Khondoker Aurthe', time: '3:19 PM', placeholder: 'Khondoker Aurthe zz-unsendword-zz' });
+      fb.addMessage({ domId: '100012345678901@msgr.9999', sender: 'Alex Example', time: '3:20 PM', placeholder: 'Alex Example unsent a message' });
+      fb.addMessage({ domId: '100012345678901@msgr.7103', sender: 'Alex Example', time: '3:21 PM', text: 'gamma three' });
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000009999', sender: 'Alex Example', time: '3:16 PM', placeholder: 'Alex Example deleted a message' });
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000008201', sender: 'Alex Example', time: '3:19 PM', placeholder: 'Alex Example zz-unsendword-zz' });
     });
     await waitFor(async () => page.evaluate(() => {
       const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000009999"] .mms-recovered');
@@ -442,17 +456,17 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     assert.match(otherBox, /No saved copy/);
 
     // a typed sentence that looks like a placeholder is a normal message
-    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006201', sender: 'Khondoker Aurthe', time: '3:30 PM', text: 'wait, Alice deleted a message' }));
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006201', sender: 'Alex Example', time: '3:30 PM', text: 'wait, Alice deleted a message' }));
     await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000006201' && m.text === 'wait, Alice deleted a message'), { what: 'typed look-alike saved' });
     assert.equal(await page.evaluate(() => !!document.querySelector('[data-message-id="100012345678901@msgr.7460000000000006201"] .mms-recovered')), false);
 
     // the photo in a reply's quote belongs to the quoted message
-    await page.evaluate((png) => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006301', sender: 'Khondoker Aurthe', time: '3:31 PM', text: 'reply with quote', quotePhoto: 'data:image/png;base64,' + png }), PNG_1x1);
+    await page.evaluate((png) => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006301', sender: 'Alex Example', time: '3:31 PM', text: 'reply with quote', quotePhoto: 'data:image/png;base64,' + png }), PNG_1x1);
     const reply = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000006301'), { what: 'reply saved' });
     assert.equal(reply.attachments.length, 0, 'quoted photo not attached to the reply');
 
     // the big thumbs-up "like"
-    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006401', sender: 'Khondoker Aurthe', time: '3:32 PM', like: true }));
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006401', sender: 'Alex Example', time: '3:32 PM', like: true }));
     const like = await waitFor(async () => (await dbAll('messages')).find((m) => m.domId === 'msgr.7460000000000006401'), { what: 'like saved' });
     assert.equal(like.text, '👍');
   });
@@ -501,13 +515,13 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
   await t.test('Messenger notifications are kept as a backup copy', async () => {
     await page.evaluate(() => {
       try {
-        new Notification('Khondoker Aurthe', { body: 'notification text' });
+        new Notification('Alex Example', { body: 'notification text' });
       } catch (e) {
         /* permission */
       }
     });
     const n = await waitFor(async () => (await dbAll('notifications')).find((x) => x.body === 'notification text'), { what: 'notification saved' });
-    assert.equal(n.title, 'Khondoker Aurthe');
+    assert.equal(n.title, 'Alex Example');
   });
 
   await t.test('dashboard lists recovered messages; popup shows counts', async () => {
@@ -540,7 +554,7 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
         for (let i = 0; i < bytes.length; i += 512) bytes[i] = (i / 512 + seed * 37) & 255;
         return URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
       };
-      fb.addMessage({ domId: '100012345678901@msgr.7460000000000006501', sender: 'Khondoker Aurthe', time: '3:40 PM', text: 'album', photo: big(1) });
+      fb.addMessage({ domId: '100012345678901@msgr.7460000000000006501', sender: 'Alex Example', time: '3:40 PM', text: 'album', photo: big(1) });
       const row = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000006501"] .bubble');
       for (let i = 2; i <= 3; i++) row.insertAdjacentHTML('beforeend', `<div role="presentation"><img alt="Open photo" width="800" height="600" src="${big(i)}"></div>`);
     });
@@ -549,7 +563,7 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
       return m && m.attachments.filter((a) => a.mediaKey).length === 3 ? m : null;
     }, { timeout: 30000, what: 'all three album photos stored' });
     assert.equal(album.text, 'album');
-    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006502', sender: 'Khondoker Aurthe', time: '3:41 PM', text: 'after the album' }));
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000006502', sender: 'Alex Example', time: '3:41 PM', text: 'after the album' }));
     await waitFor(async () => (await dbAll('messages')).some((m) => m.text === 'after the album'), { what: 'capture still running after a huge row' });
   });
 
@@ -830,6 +844,171 @@ test('Messenger Message Saver end to end', { timeout: 240000 }, async (t) => {
     await waitFor(async () => (await dash.evaluate(async () => (await import('/lib/settings.js')).getSettings())).downloadQuality === 'sd', { what: 'quality saved' });
     await dash.selectOption(quality, 'hd');
     await waitFor(async () => (await dash.evaluate(async () => (await import('/lib/settings.js')).getSettings())).downloadQuality === 'hd', { what: 'quality back to HD' });
+  });
+
+  await t.test('security: planted data stays harmless (export page, links, pictures, clicks, wording, sizes, diagnostics, backups)', async () => {
+    const worker = () => ctx.serviceWorkers().find((w) => w.url().startsWith(`chrome-extension://${extId}/`)) || sw;
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#unsent`);
+
+    // 1) a saved photo whose type tries to break out of the exported page's <img src="…">
+    await dash.evaluate(async () => {
+      const db = await import('/lib/db.js');
+      const blob = new Blob([new Uint8Array([137, 80, 78, 71])], { type: 'image/png" onerror="window.__pwned=1' });
+      await db.withStores(['messages', 'media', 'threads'], 'readwrite', async (s) => {
+        s.media.put({ key: 'fbid:evil-type', blob, mime: blob.type, size: blob.size, url: '', messageKey: 'dm:evil1', savedAt: Date.now() });
+        s.threads.put({ threadKey: 'evilchat', domName: 'Planted chat' });
+        s.messages.put(
+          db.finalizeMessage({
+            key: 'dm:evil1',
+            threadKey: 'evilchat',
+            text: '<script>window.__pwned=2</script><img src=x onerror="window.__pwned=3">',
+            ts: Date.now(),
+            capturedAt: Date.now(),
+            unsent: true,
+            unsentAt: Date.now(),
+            history: [],
+            sources: ['screen'],
+            attachments: [
+              { kind: 'screen-image', type: 2, fbid: 'evil-type', mediaKey: 'fbid:evil-type' },
+              { kind: 'link', type: 7, title: 'Click me', actionUrl: 'javascript:window.__pwned=4' },
+              { kind: 'screen-image', type: 2, title: 'tracker', previewUrl: 'https://evil.example/track.gif' },
+            ],
+          })
+        );
+      });
+    });
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#settings`);
+    const [exported] = await Promise.all([dash.waitForEvent('download', { timeout: 15000 }), dash.click('#export-html')]);
+    const exportPath = path.join(userDir, 'export-check.html');
+    await exported.saveAs(exportPath);
+    const html = fs.readFileSync(exportPath, 'utf8');
+    assert.match(html, /<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:/, 'the exported page can never run code');
+    assert.ok(!/onerror="window/.test(html), 'the planted photo type cannot add an attribute');
+    assert.ok(html.includes('src="data:image/jpeg;base64,'), 'the photo is embedded with a plain image type');
+    assert.ok(html.includes('&lt;script&gt;window.__pwned=2&lt;/script&gt;'), 'message text is escaped');
+    const viewer = await ctx.newPage();
+    let dialogs = 0;
+    viewer.on('dialog', (d) => {
+      dialogs++;
+      d.dismiss().catch(() => {});
+    });
+    await viewer.goto('file://' + exportPath);
+    await viewer.waitForTimeout(300);
+    assert.equal(await viewer.evaluate(() => window.__pwned), undefined, 'nothing ran in the exported page');
+    assert.equal(dialogs, 0);
+    await viewer.close();
+
+    // 2) the Saved Messages page: no javascript: link, no picture from another server
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#unsent`);
+    await waitFor(async () => (await dash.textContent('#unsent-list')).includes('Click me'), { what: 'planted card shown' });
+    assert.equal(await dash.locator('a[href^="javascript:"]').count(), 0, 'javascript: is never a link');
+    assert.equal(await dash.locator('img[src*="evil.example"]').count(), 0, 'no picture from another server');
+    assert.equal(await dash.evaluate(() => window.__pwned), undefined);
+
+    // 3) a script on the page cannot press the download button
+    await patchDownloads();
+    await page.bringToFront();
+    await page.evaluate(() => fb.clearMain());
+    await page.evaluate(() => fb.addFeedVideo({ id: '3333333333', hd: 'https://video-x.xx.fbcdn.net/v/t42/synthetic.mp4?x=1' }));
+    await page.mouse.move(5, 5);
+    await page.hover('[role="article"] .player-overlay');
+    await page.locator('[data-mms="download"] .btn').waitFor({ state: 'visible', timeout: 5000 });
+    const callsBefore = (await worker().evaluate(() => self.__mmsDl || [])).length;
+    await page.evaluate(() => document.querySelector('[data-mms="download"]').shadowRoot.querySelector('.btn').click());
+    await page.waitForTimeout(1200);
+    assert.equal((await worker().evaluate(() => self.__mmsDl || [])).length, callsBefore, 'a synthetic click downloads nothing');
+    await page.evaluate(() => fb.clearMain());
+
+    // 4) a row whose new text is the sender's name plus a common word must not teach a broad "unsent"
+    //    wording ("^.{1,80}? ok$" would make every message ending in " ok" look unsent)
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000007001', sender: 'Alex Example', time: '4:01 PM', text: 'a message that becomes a name' }));
+    await waitFor(async () => (await dbAll('messages')).some((m) => m.text === 'a message that becomes a name'), { what: 'message before poisoning' });
+    // same row, same id, text replaced by one short line: the "learn this language's wording" path
+    await page.evaluate(() => fb.unsendInPlace('100012345678901@msgr.7460000000000007001', '100012345678901@msgr.7460000000000007001', 'Alex ok'));
+    await waitFor(async () => page.evaluate(() => {
+      const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000007001"] .mms-recovered');
+      return b && b.textContent.includes('a message that becomes a name');
+    }), { what: 'the change was handled as an unsend' });
+    const learned = await dash.evaluate(async () => (await chrome.storage.local.get('learnedPlaceholders')).learnedPlaceholders || []);
+    assert.ok(!learned.some((src) => /ok\$$/.test(src)), 'no broad pattern learned: ' + JSON.stringify(learned));
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000007003', sender: 'Alex Example', time: '4:02 PM', text: 'that is ok' }));
+    await waitFor(async () => (await dbAll('messages')).some((m) => m.domId === 'msgr.7460000000000007003' && m.text === 'that is ok'), { what: 'a message ending in "ok" is still saved' });
+
+    // 5) "You" in another language counts only on a page in that language; Bangla headings work
+    await page.evaluate(() => fb.addMessage({ domId: '200000000000002@msgr.7460000000000007004', sender: 'Tu', time: '4:03 PM', text: 'hello from a friend named Tu' }));
+    const tu = await waitFor(async () => (await dbAll('messages')).find((m) => m.text === 'hello from a friend named Tu'), { what: 'message from "Tu"' });
+    assert.equal(tu.isMine, false, 'a friend named "Tu" is not you on an English page');
+    assert.equal(tu.senderName, 'Tu');
+    await page.evaluate(() => fb.addMessage({ domId: '100099999999999@msgr.7460000000000007005', sender: 'আপনি', labelPrefix: 'সময়', time: '৪:০৪', text: 'নিজের পাঠানো বাংলা মেসেজ', heading: 'আপনি পাঠিয়েছেন', headingTag: 'h4', noAvatar: true }));
+    const own = await waitFor(async () => (await dbAll('messages')).find((m) => m.text === 'নিজের পাঠানো বাংলা মেসেজ'), { what: 'Bangla own message' });
+    assert.equal(own.isMine, true, 'the Bangla "আপনি পাঠিয়েছেন" heading marks your own message');
+
+    // 6) one oversized message is capped (earlier checks reloaded the page: connect again first)
+    const oldSocket = gw.socket;
+    await page.evaluate(() => fb.connect());
+    await waitFor(() => gw.socket && gw.socket !== oldSocket, { what: 'fresh gateway connection' });
+    gw.socket.send(Buffer.from(h.dgwData(3, h.responseEnvelope([h.insertMessage({ text: 'y'.repeat(30000), threadKey: THREAD, ts: 1731571869000, id: 'mid.$big1', senderId: THREAD })]))));
+    const bigRec = await waitFor(async () => (await dbAll('messages')).find((m) => m.key === 'fb:mid.$big1'), { what: 'oversized message saved' });
+    assert.equal(bigRec.text.length, 20000);
+
+    // 7) a fake diagnostics report full of junk is trimmed before it is stored
+    await page.evaluate(() =>
+      document.dispatchEvent(new CustomEvent('__mms_page_to_ext__', { detail: JSON.stringify({ type: 'diag', data: { messages: 1, junk: 'z'.repeat(1000000), lastError: 'e'.repeat(5000) } }) }))
+    );
+    await waitFor(
+      async () => {
+        const all = await dash.evaluate(() => chrome.storage.session.get(null));
+        const entry = Object.entries(all).find(([k, v]) => k.startsWith('diag:') && v && v.lastError && v.lastError.startsWith('eee'));
+        return entry && entry[1];
+      },
+      { what: 'trimmed diagnostics' }
+    ).then((d) => {
+      assert.equal(d.junk, undefined);
+      assert.equal(d.lastError.length, 200);
+    });
+
+    // 8) a hand-made hostile backup restores safely
+    const hostile = {
+      format: 'messenger-message-saver',
+      messages: [
+        { key: 'dm:restored1', threadKey: 'evilchat', text: 'restored text', history: 'not a list', attachments: [{ previewUrl: 'javascript:1', mediaKey: 'fbid:r1' }], ts: 1 },
+        { text: 'no key: dropped' },
+        { key: 'dm:restored2', text: { obj: 1 }, threadKey: 'evilchat' },
+      ],
+      media: [{ key: 'fbid:r1', mime: 'image/png"><script>x</script>', data: Buffer.from([1, 2, 3]).toString('base64'), messageKey: 'dm:restored1' }],
+      threads: [{ threadKey: 'evilchat', pic: 'http://evil.example/p.png' }],
+      contacts: [{ id: '42', name: 'Planted', pic: 'javascript:1' }],
+    };
+    const backupPath = path.join(userDir, 'hostile-backup.json');
+    fs.writeFileSync(backupPath, JSON.stringify(hostile));
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#settings`);
+    await dash.setInputFiles('#import-json', backupPath);
+    await waitFor(async () => /Restored/.test(await dash.textContent('#toast')), { what: 'hostile backup restored' });
+    const restored = await dash.evaluate(async () => {
+      const db = await import('/lib/db.js');
+      const m1 = await db.getMessage('dm:restored1');
+      const m2 = await db.getMessage('dm:restored2');
+      const media = await db.getMedia('fbid:r1');
+      const t = (await db.getAll('threads')).find((x) => x.threadKey === 'evilchat');
+      const c = (await db.getAll('contacts')).find((x) => x.id === '42');
+      return { m1, m2, mime: media && media.mime, blobType: media && media.blob.type, pic: t && t.pic, cpic: c && c.pic };
+    });
+    assert.deepEqual(restored.m1.history, []);
+    assert.equal(restored.m1.attachments[0].previewUrl, '');
+    assert.equal(restored.m2.text, '');
+    assert.equal(restored.mime, 'image/jpeg');
+    assert.equal(restored.blobType, 'image/jpeg');
+    assert.notEqual(restored.pic, 'http://evil.example/p.png');
+    assert.equal(restored.cpic, undefined);
+    await dash.goto(`chrome-extension://${extId}/dashboard/dashboard.html#unsent`);
+    await dash.waitForTimeout(300);
+    assert.equal(await dash.locator('img[src*="evil.example"]').count(), 0);
+
+    // clean up the planted records so later checks see a normal database
+    await dash.evaluate(async () => {
+      const db = await import('/lib/db.js');
+      await db.deleteThread('evilchat', { name: 'Planted chat' });
+    });
   });
 
   await t.test('no script errors anywhere', async () => {

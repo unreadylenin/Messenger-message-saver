@@ -244,8 +244,31 @@
   let learnedPlaceholders = []; // RegExps learned on this computer for other UI languages
 
   const EDITED_LABELS = new Set(['edited', 'hide edits', 'edytowano', 'সম্পাদিত', 'modifié', 'bearbeitet', 'editado', 'modificato', 'diedit', 'đã chỉnh sửa']);
-  const YOU_LABELS = new Set(['you', 'ty', 'আপনি', 'vous', 'du', 'tú', 'tu', 'você', 'anda', 'bạn']);
-  const YOU_HEADINGS = /^(?:you sent|you replied to|wysłano|bạn đã gửi|আপনি পাঠিয়েছেন)\b/i;
+  // Messenger's word for "you" in its labels, per UI language (the page's <html lang>). Only the
+  // page's own language counts, so a friend actually named "Tu" or "Du" is not saved as "You".
+  const YOU_BY_LANG = {
+    en: ['you'],
+    pl: ['ty'],
+    bn: ['আপনি'],
+    fr: ['vous', 'tu'],
+    de: ['du'],
+    es: ['tú', 'tu'],
+    pt: ['você'],
+    it: ['tu'],
+    id: ['anda'],
+    vi: ['bạn'],
+  };
+  const YOU_ALL = new Set(Object.values(YOU_BY_LANG).flat());
+  function youLabels() {
+    const lang = String(document.documentElement.getAttribute('lang') || '')
+      .toLowerCase()
+      .split(/[-_]/)[0];
+    const own = YOU_BY_LANG[lang];
+    // unknown page language: every form, as before
+    return own ? new Set(['you', ...own]) : YOU_ALL;
+  }
+  // a Unicode-aware end of word: \b does not work after Bangla letters
+  const YOU_HEADINGS = /^(?:you sent|you replied to|wysłano|bạn đã gửi|আপনি পাঠিয়েছেন)(?![\p{L}\p{M}\p{N}])/iu;
 
   function isPlaceholderText(text) {
     const t = String(text || '').trim();
@@ -258,25 +281,46 @@
   }
 
   /** Remembers this UI language's "X unsent a message" wording (sender name masked). */
-  function learnPlaceholder(text, senderName) {
+  function learnPlaceholder(text, senderName, previousText) {
     const t = norm(text);
     if (!t || t.length > 120 || isPlaceholderText(t)) return;
     // Messenger's wording names the sender ("Alpha unsent…", "You unsent…"); anything else is not learned
     const name = norm(senderName);
-    const tokens = [name, name.split(' ')[0], ...YOU_LABELS].filter((x) => x && x.length >= 2);
+    const tokens = [name, name.split(' ')[0], ...youLabels()].filter((x) => x && x.length >= 2);
     const lower = t.toLowerCase();
     const hit = tokens.find((x) => lower.includes(x.toLowerCase()));
     if (!hit) return;
     const at = lower.indexOf(hit.toLowerCase());
     const src = '^' + escapeRe(t.slice(0, at)) + '.{1,80}?' + escapeRe(t.slice(at + hit.length)) + '$';
+    if (!safeLearned(src, previousText)) return;
     chrome.storage.local.get('learnedPlaceholders').then(({ learnedPlaceholders: list = [] }) => {
       if (list.includes(src)) return;
       chrome.storage.local.set({ learnedPlaceholders: [...list, src].slice(-20) });
     });
   }
 
+  // A learned wording must name the action in words: a row whose text was just the sender's name
+  // (or a page script faking one) would otherwise teach "^.{1,80}?$" and every short message
+  // would look like "unsent" and stop being saved.
+  const ORDINARY_TEXTS = ['ok', 'okay', 'hi', 'hello', 'hey', 'yes', 'no', 'thanks', 'thank you', 'haha', 'lol', 'good morning', 'good night', 'ঠিক আছে', 'হ্যাঁ', 'না', 'ধন্যবাদ', 'আচ্ছা', 'kemon acho', 'acha'];
+  function safeLearned(src, previousText) {
+    if (typeof src !== 'string' || src.length > 400) return false;
+    const literal = src.replace(/\.\{1,80\}\?/g, '').replace(/\\(.)/g, '$1');
+    if ((literal.match(/[\p{L}\p{N}]/gu) || []).length < 6) return false;
+    let re;
+    try {
+      re = new RegExp(src, 'i');
+    } catch (e) {
+      return false;
+    }
+    if (ORDINARY_TEXTS.some((x) => re.test(x))) return false;
+    if (previousText && re.test(norm(previousText))) return false;
+    return true;
+  }
+
   function loadLearned(list) {
     learnedPlaceholders = (list || [])
+      .filter((src) => safeLearned(src))
       .map((src) => {
         try {
           return new RegExp(src, 'i');
@@ -491,7 +535,7 @@
     const colon = rest.indexOf(': ');
     if (colon > 0 && colon < 80) return rest.slice(0, colon).trim();
     if (avatarName && rest.toLowerCase().startsWith(avatarName.toLowerCase())) return avatarName;
-    for (const you of YOU_LABELS) if (rest.toLowerCase() === you || rest.toLowerCase().startsWith(you + ' ')) return rest.slice(0, you.length);
+    for (const you of youLabels()) if (rest.toLowerCase() === you || rest.toLowerCase().startsWith(you + ' ')) return rest.slice(0, you.length);
     return rest.length <= 60 ? rest : '';
   }
 
@@ -525,7 +569,7 @@
 
   function rowDirection(row, log, sender) {
     const lower = norm(sender).toLowerCase();
-    if (YOU_LABELS.has(lower)) return true;
+    if (youLabels().has(lower)) return true;
     // (the number before "@msgr" in data-message-id is NOT the sender, so it is not used here)
     if (lower && /^at /i.test(row.getAttribute('aria-label') || '')) return false;
     for (const h of row.querySelectorAll('h1,h2,h4,h5,h6,[role="heading"]')) {
@@ -698,7 +742,7 @@
       text: placeholder ? '' : text,
       placeholderText: placeholder ? text : '',
       placeholder,
-      senderName: YOU_LABELS.has(norm(sender).toLowerCase()) ? '' : sender,
+      senderName: youLabels().has(norm(sender).toLowerCase()) ? '' : sender,
       isMine,
       timeLabel: when,
       ts: parseTimeLabel(when),
@@ -758,7 +802,7 @@
       if (!before || !before.text || before.unsent || !before.labelHasBody) continue;
       const leaves = messageTextNodes(r.row);
       if (r.text && r.text !== before.text && !r.labelHasBody && r.labelLen && leaves.length === 1 && r.text.length <= 120 && !r.images.length && !r.extras.length) {
-        learnPlaceholder(r.text, before.senderName || r.senderName);
+        learnPlaceholder(r.text, before.senderName || r.senderName, before.text);
         r.placeholderText = r.text;
         r.text = '';
         r.placeholder = true;
@@ -1284,6 +1328,8 @@
     btn.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
+      // only a real click or key press: a script on the page cannot start downloads by itself
+      if (!e.isTrusted) return;
       if (dlTarget) startDownload(dlTarget);
     });
     (document.documentElement || document.body).appendChild(host);

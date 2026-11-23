@@ -1,6 +1,17 @@
 // Local database (IndexedDB in the extension's own storage - never sent anywhere).
 // Used by the background worker, the popup and the dashboard.
 
+import {
+  capMessage,
+  cleanImportedMessage,
+  cleanImportedThread,
+  cleanImportedContact,
+  cleanImportedNotification,
+  cleanImportedEvent,
+  cleanImportedMedia,
+  cleanImportedAlias,
+} from './sanitize.js';
+
 export const DB_NAME = 'messenger-message-saver';
 export const DB_VERSION = 3;
 
@@ -121,8 +132,9 @@ export function statusOf(m) {
   return 'normal';
 }
 
-/** Recomputes derived fields before a message is written. */
+/** Recomputes derived fields before a message is written (and caps its size). */
 export function finalizeMessage(m) {
+  capMessage(m);
   m.status = statusOf(m);
   m.textKey = textKeyOf(m.threadKey, m.text);
   if (typeof m.ts !== 'number' || !Number.isFinite(m.ts)) m.ts = m.capturedAt || Date.now();
@@ -460,7 +472,11 @@ export async function importFile(file, onProgress, { streamAbove = 64 * 1024 * 1
   const handleLine = async (line) => {
     if (head === null) {
       head = line;
-      if (!head.endsWith('"media":[')) throw new Error('This backup is too large to restore in one piece and is not in the expected layout.');
+      if (!head.endsWith('"media":[')) {
+        const err = new Error('This backup is too large to restore in one piece and is not in the expected layout.');
+        err.code = 'bad-layout';
+        throw err;
+      }
       const base = JSON.parse(head + ']}');
       const c = await importAll(base);
       counts.messages = c.messages;
@@ -490,8 +506,23 @@ export async function importFile(file, onProgress, { streamAbove = 64 * 1024 * 1
   return counts;
 }
 
-export async function importAll(data) {
-  if (!data || data.format !== 'messenger-message-saver') throw new Error('This file is not a Messenger Message Saver backup.');
+export async function importAll(raw) {
+  if (!raw || raw.format !== 'messenger-message-saver') {
+    const err = new Error('This file is not a Messenger Message Saver backup.');
+    err.code = 'not-backup';
+    throw err;
+  }
+  // a backup file may have been edited by anyone: every record is rebuilt from known fields
+  const list = (v, clean) => (Array.isArray(v) ? v.map(clean).filter(Boolean) : []);
+  const data = {
+    aliases: list(raw.aliases, cleanImportedAlias),
+    messages: list(raw.messages, cleanImportedMessage),
+    threads: list(raw.threads, cleanImportedThread),
+    contacts: list(raw.contacts, cleanImportedContact),
+    notifications: list(raw.notifications, cleanImportedNotification),
+    events: list(raw.events, cleanImportedEvent),
+    media: list(raw.media, cleanImportedMedia),
+  };
   const counts = { messages: 0, threads: 0, contacts: 0, media: 0 };
   const existing = new Map();
   if ((data.messages || []).length) for (const m of await getAll('messages')) existing.set(m.key, m);
@@ -500,7 +531,7 @@ export async function importAll(data) {
   const notifSeen = new Set((data.notifications || []).length ? (await getAll('notifications')).map((n) => [n.ts, n.title, n.body].join('|')) : []);
   const eventSeen = new Set((data.events || []).length ? (await getAll('events')).map((e) => [e.type, e.messageKey, e.at].join('|')) : []);
   await withStores(['messages', 'threads', 'contacts', 'notifications', 'events', 'media', 'aliases'], 'readwrite', async (s) => {
-    for (const a of data.aliases || []) if (a && a.domId && a.messageKey) s.aliases.put(a);
+    for (const a of data.aliases) s.aliases.put(a);
     for (const m of data.messages || []) {
       const old = existing.get(m.key);
       const merged = old ? mergeImported(old, m) : m;
@@ -529,9 +560,14 @@ export async function importAll(data) {
       const { id, ...rest } = e;
       s.events.add(rest);
     }
-    for (const md of data.media || []) {
-      if (!md || !md.data) continue;
-      s.media.put({ key: md.key, mime: md.mime, url: md.url, messageKey: md.messageKey, savedAt: md.savedAt, size: md.size, blob: base64ToBlob(md.data, md.mime) });
+    for (const md of data.media) {
+      let blob;
+      try {
+        blob = base64ToBlob(md.data, md.mime); // md.mime is already a plain image type
+      } catch (e) {
+        continue; // not base64
+      }
+      s.media.put({ key: md.key, mime: md.mime, url: md.url, messageKey: md.messageKey, savedAt: md.savedAt, size: blob.size, blob });
       counts.media++;
     }
   });

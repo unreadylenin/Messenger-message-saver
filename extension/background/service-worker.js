@@ -6,6 +6,7 @@
 import { DEFAULT_SETTINGS, getSettings } from '../lib/settings.js';
 import * as db from '../lib/db.js';
 import { downloadFileName, isDownloadableUrl } from '../lib/downloads.js';
+import { LIMITS, clip, httpsUrl, isFbUrl, safeImageMime, retypeImageBlob, cleanDiag } from '../lib/sanitize.js';
 
 const { normalizeText, finalizeMessage, reqP } = db;
 
@@ -228,21 +229,23 @@ function mergeAttachment(rec, a) {
   rec.attachments = rec.attachments || [];
   const id = a.fbid || a.previewUrl || a.playableUrl || a.src || '';
   const existing = rec.attachments.find((x) => (x.fbid && x.fbid === a.fbid) || (id && (x.previewUrl === id || x.playableUrl === id || x.src === id)));
+  // addresses are kept only when they are https (never javascript:, data: or file:)
   const clean = {
-    kind: a.kind || 'attachment',
+    kind: clip(a.kind, 40) || 'attachment',
     type: a.type || 0,
-    fbid: a.fbid || '',
-    filename: a.filename || '',
-    mime: a.mime || a.previewMime || a.playableMime || '',
-    previewUrl: a.previewUrl || a.src || '',
-    playableUrl: a.playableUrl || '',
+    fbid: clip(a.fbid, 300),
+    filename: clip(a.filename, LIMITS.name),
+    mime: clip(a.mime || a.previewMime || a.playableMime || '', 100),
+    previewUrl: httpsUrl(a.previewUrl || a.src || ''),
+    playableUrl: httpsUrl(a.playableUrl),
     width: a.width || 0,
     height: a.height || 0,
-    title: a.title || '',
-    subtitle: a.subtitle || '',
-    actionUrl: a.actionUrl || '',
+    title: clip(a.title, LIMITS.name),
+    subtitle: clip(a.subtitle, LIMITS.name),
+    actionUrl: httpsUrl(a.actionUrl),
     durationMs: a.durationMs || 0,
   };
+  if ((rec.attachments.length >= LIMITS.attachments) && !existing) return clean; // not stored
   if (existing) {
     for (const [k, v] of Object.entries(clean)) if (v && !existing[k]) existing[k] = v;
     return existing;
@@ -272,30 +275,39 @@ async function ingestLs(ev, ctx) {
   const now = Date.now();
   const notices = [];
   let queuedMedia = false;
+  // the page hook's events can be sent by any script on the page: cap what one message may store
+  for (const m of ev.messages || []) {
+    m.text = clip(m.text, LIMITS.text);
+    m.replyText = clip(m.replyText, LIMITS.text);
+    m.replySnippet = clip(m.replySnippet, LIMITS.text);
+  }
+  for (const e of ev.edits || []) e.text = clip(e.text, LIMITS.text);
+  for (const h of ev.editHistory || []) h.text = clip(h.text, LIMITS.text);
 
   await db.withStores(['messages', 'threads', 'contacts', 'events', 'pendingMedia'], 'readwrite', async (st) => {
+    let pendingRoom = LIMITS.pendingMedia - (await reqP(st.pendingMedia.count()));
     for (const c of ev.contacts || []) {
       if (!c.id || !c.name) continue;
       const old = (await reqP(st.contacts.get(c.id))) || {};
-      st.contacts.put({ ...old, id: c.id, name: c.name, pic: c.pic || old.pic || '', updatedAt: now });
+      st.contacts.put({ ...old, id: c.id, name: clip(c.name, LIMITS.name), pic: httpsUrl(c.pic) || old.pic || '', updatedAt: now });
     }
     for (const t of ev.threads || []) {
       if (!t.threadKey) continue;
       const old = (await reqP(st.threads.get(t.threadKey))) || { threadKey: t.threadKey };
       st.threads.put({
         ...old,
-        name: t.name || old.name || '',
-        pic: t.pic || old.pic || '',
+        name: clip(t.name, LIMITS.name) || old.name || '',
+        pic: httpsUrl(t.pic) || old.pic || '',
         type: t.type || old.type || 0,
         lastActivity: Math.max(t.lastActivity || 0, old.lastActivity || 0),
-        snippet: t.snippet || old.snippet || '',
+        snippet: clip(t.snippet, 2000) || old.snippet || '',
         updatedAt: now,
       });
     }
     for (const sn of ev.snippets || []) {
       if (!sn.threadKey || !sn.snippet) continue;
       const old = (await reqP(st.threads.get(sn.threadKey))) || { threadKey: sn.threadKey };
-      st.threads.put({ ...old, snippet: sn.snippet, updatedAt: now });
+      st.threads.put({ ...old, snippet: clip(sn.snippet, 2000), updatedAt: now });
     }
 
     const touched = new Map();
@@ -357,7 +369,8 @@ async function ingestLs(ev, ctx) {
       touched.set(key, rec);
       if (s.saveMedia && isImageAttachment(att) && !att.mediaKey) {
         const url = att.previewUrl || att.playableUrl;
-        if (url) {
+        if (url && isFbUrl(url) && pendingRoom > 0) {
+          pendingRoom--;
           st.pendingMedia.put({ id: key + '|' + (att.fbid || url), messageKey: key, url, fbid: att.fbid || '', addedAt: now, tries: 0 });
           queuedMedia = true;
         }
@@ -525,6 +538,7 @@ async function ingestDom(batch, ctx) {
   const maxBytes = Math.max(1, s.maxMediaMB || 15) * 1024 * 1024;
 
   await db.withStores(['messages', 'events', 'aliases', 'media', 'pendingMedia'], 'readwrite', async (st) => {
+    let pendingRoom = LIMITS.pendingMedia - (await reqP(st.pendingMedia.count()));
     const touched = new Map();
     const byDomId = async (domId) => {
       if (!domId) return null;
@@ -551,7 +565,7 @@ async function ingestDom(batch, ctx) {
     };
 
     for (const it of batch.items || []) {
-      const text = normalizeText(it.text);
+      const text = clip(normalizeText(it.text), LIMITS.text);
       const images = (it.images || []).filter((im) => im && (im.src || im.dataUrl));
       const extras = (it.extras || []).filter((x) => x && x.kind);
       if (!text && !images.length && !extras.length) continue;
@@ -618,7 +632,8 @@ async function ingestDom(batch, ctx) {
               st.media.put({ key: mediaKey, blob, mime: blob.type, size: blob.size, url: '', messageKey: rec.key, savedAt: now });
               att.mediaKey = mediaKey;
             }
-          } else if (im.src && /^https:\/\/[^/]*\.fbcdn\.net\//.test(im.src)) {
+          } else if (im.src && /^https:\/\/[^/]*\.fbcdn\.net\//.test(im.src) && pendingRoom > 0) {
+            pendingRoom--;
             st.pendingMedia.put({ id: rec.key + '|' + (att.fbid || im.src), messageKey: rec.key, url: im.src, fbid: att.fbid || '', addedAt: now, tries: 0 });
             queuedMedia = true;
           }
@@ -639,7 +654,7 @@ async function ingestDom(batch, ctx) {
 
     // a message turned into "unsent" while it was on screen
     for (const u of batch.unsentNow || []) {
-      const text = normalizeText(u.text);
+      const text = clip(normalizeText(u.text), LIMITS.text);
       let rec = (await byDomId(u.domId)) || null;
       if (!rec && text) {
         let matches = [];
@@ -688,7 +703,12 @@ async function ingestNotification(n) {
   if (!s.enabled || !s.saveMessages || !s.captureNotifications) return;
   if (!n || (!n.body && !n.title)) return;
   await db.withStores(['notifications'], 'readwrite', async (st) => {
-    st.notifications.add({ title: n.title || '', body: n.body || '', tag: n.tag || '', ts: n.ts || Date.now() });
+    st.notifications.add({
+      title: clip(n.title, LIMITS.notificationTitle),
+      body: clip(n.body, LIMITS.notificationBody),
+      tag: clip(n.tag, 300),
+      ts: typeof n.ts === 'number' && Number.isFinite(n.ts) ? n.ts : Date.now(),
+    });
   });
 }
 
@@ -722,7 +742,8 @@ async function mediaPreview(rec, budget = { bytes: 16 * 1024 * 1024 }, maxItems 
         continue;
       }
     }
-    if (a.previewUrl) out.push({ url: a.previewUrl, title: a.title || a.filename || '' });
+    // shown inside Facebook's page: only pictures from Facebook's own servers
+    if (a.previewUrl && isFbUrl(a.previewUrl)) out.push({ url: a.previewUrl, title: a.title || a.filename || '' });
     else if (a.title || a.filename) out.push({ title: a.title || a.filename });
   }
   return out;
@@ -1002,10 +1023,11 @@ async function pumpMedia() {
 // resume anything left over from before the worker was stopped
 pumpMedia().catch(() => {});
 
+/** A photo copied from the page; its type is forced to a plain image type (it came from the page). */
 function dataUrlToBlob(dataUrl) {
   const m = /^data:([^;,]*)(;base64)?,(.*)$/s.exec(dataUrl || '');
   if (!m) return null;
-  const mime = m[1] || 'application/octet-stream';
+  const mime = safeImageMime(m[1]);
   if (!m[2]) return new Blob([decodeURIComponent(m[3])], { type: mime });
   const bin = atob(m[3]);
   const bytes = new Uint8Array(bin.length);
@@ -1017,7 +1039,7 @@ async function blobToDataUrl(blob) {
   const buf = new Uint8Array(await blob.arrayBuffer());
   let bin = '';
   for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
-  return `data:${blob.type || 'application/octet-stream'};base64,${btoa(bin)}`;
+  return `data:${safeImageMime(blob.type)};base64,${btoa(bin)}`;
 }
 
 async function saveMedia(job) {
@@ -1034,7 +1056,7 @@ async function saveMedia(job) {
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const len = Number(resp.headers.get('content-length') || 0);
     if (len && len > maxBytes) return;
-    blob = await resp.blob();
+    blob = retypeImageBlob(await resp.blob());
     if (!blob || blob.size > maxBytes) return;
   }
   await serial(() =>
@@ -1158,7 +1180,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'unseen-actions':
         return serial(() => countUnseen(msg.actions));
       case 'diag':
-        if (fromTab !== null) await chrome.storage.session.set({ ['diag:' + fromTab]: { ...msg.diag, at: Date.now(), url: (sender.tab && sender.tab.url) || '' } });
+        // only the known counters are kept: the numbers come from the page and must not fill session storage
+        if (fromTab !== null) await chrome.storage.session.set({ ['diag:' + fromTab]: { ...cleanDiag(msg.diag), at: Date.now(), url: clip((sender.tab && sender.tab.url) || '', 500) } });
         return true;
       case 'lookup-placeholders':
         return lookupPlaceholders(msg);
@@ -1166,12 +1189,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return lookupEdited(msg);
       case 'badge-seen':
         await chrome.storage.local.set({ badgeSince: Date.now() });
-        await updateBadge();
-        return true;
-      case 'open-dashboard':
-        await chrome.tabs.create({ url: chrome.runtime.getURL('dashboard/dashboard.html' + (msg.hash || '')) });
-        return true;
-      case 'refresh-badge':
         await updateBadge();
         return true;
       case 'download':

@@ -28,7 +28,7 @@ test('DGW: rejects non-DGW bytes', () => {
 
 test('LightSpeed: incoming message, unsend, edit, photo, contact, thread', () => {
   const steps = [
-    h.call('verifyContactRowExists', { 0: h.i64(THREAD), 2: 'https://scontent.xx.fbcdn.net/p.jpg', 3: 'Khondoker Aurthe' }, 22),
+    h.call('verifyContactRowExists', { 0: h.i64(THREAD), 2: 'https://scontent.xx.fbcdn.net/p.jpg', 3: 'Alex Example' }, 22),
     h.call('deleteThenInsertThread', { 0: h.i64(1731571860000), 1: h.i64(1731571000000), 2: 'hello', 3: '', 7: h.i64(THREAD), 9: h.i64(1) }, 50),
     h.insertMessage({ text: 'Good afternoon', threadKey: THREAD, ts: 1731571860000, id: 'mid.$abc1', senderId: THREAD }),
     h.call(
@@ -57,7 +57,7 @@ test('LightSpeed: incoming message, unsend, edit, photo, contact, thread', () =>
   const ev = mw.eventsFromIncomingBytes(buf, 'dgw');
 
   assert.equal(ev.contacts.length, 1);
-  assert.equal(ev.contacts[0].name, 'Khondoker Aurthe');
+  assert.equal(ev.contacts[0].name, 'Alex Example');
   assert.equal(ev.threads[0].threadKey, THREAD);
   assert.equal(ev.threads[0].readWatermark, 1731571000000);
 

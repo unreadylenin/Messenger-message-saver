@@ -1,12 +1,12 @@
 // Rules for the photo / video / reel downloader, shared by the background worker and tests.
 
-const DOWNLOAD_URL = /^https:\/\/(?:[a-z0-9-]+\.)*(?:fbcdn\.net|fbsbx\.com|facebook\.com|messenger\.com)(?::443)?\//i;
+import { isFbUrl } from './sanitize.js';
+
 const DOWNLOAD_EXT = /\.(mp4|m4a|jpg|jpeg|png|webp|gif)$/i;
 
 /** Only files on Facebook's own servers may be downloaded (a page cannot misuse the downloader). */
 export function isDownloadableUrl(url) {
-  const u = String(url || '');
-  return u.length <= 8000 && DOWNLOAD_URL.test(u);
+  return isFbUrl(String(url || ''));
 }
 
 /** A safe file name inside Downloads/Facebook, ending in a photo, video or sound extension. */

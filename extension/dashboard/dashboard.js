@@ -1,6 +1,7 @@
 import { getSettings, setSettings } from '../lib/settings.js';
 import * as db from '../lib/db.js';
 import { el, fmtTime, fmtAgo, senderOf, threadTitle } from '../lib/format.js';
+import { safeImgSrc, safeLinkHref, retypeImageBlob } from '../lib/sanitize.js';
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -84,14 +85,17 @@ function mediaBlock(m) {
           img.addEventListener('keydown', (e) => (e.key === 'Enter' || e.key === ' ') && openLightbox(u));
         } else img.replaceWith(el('span', { class: 'muted small', text: '🖼️ photo (not in this browser — it was not saved, or not included in a restored backup)' }));
       });
-    } else if (isImage && a.previewUrl) {
-      const img = el('img', { alt: a.title || 'photo', loading: 'lazy', referrerpolicy: 'no-referrer', src: a.previewUrl });
+    } else if (isImage && safeImgSrc(a.previewUrl)) {
+      // pictures load only from Facebook's servers (a planted address could reveal you to another site)
+      const src = safeImgSrc(a.previewUrl);
+      const img = el('img', { alt: a.title || 'photo', loading: 'lazy', referrerpolicy: 'no-referrer', src });
       img.addEventListener('error', () => img.replaceWith(el('span', { class: 'muted small', text: '🖼️ photo (link expired, not downloaded)' })));
-      img.addEventListener('click', () => openLightbox(a.previewUrl));
+      img.addEventListener('click', () => openLightbox(src));
       wrap.appendChild(img);
     } else {
       const label = a.title || a.filename || (a.type === 4 ? 'video' : a.type === 5 ? 'voice message' : a.type === 6 ? 'file' : 'attachment');
-      const href = a.actionUrl || a.playableUrl || a.previewUrl || '';
+      // links open only for https addresses (never javascript:, data: or file:)
+      const href = safeLinkHref(a.actionUrl) || safeLinkHref(a.playableUrl) || safeLinkHref(a.previewUrl);
       wrap.appendChild(href ? el('a', { class: 'att', href, target: '_blank', rel: 'noopener noreferrer', text: '📎 ' + label }) : el('span', { class: 'att', text: '📎 ' + label }));
     }
   }
@@ -207,8 +211,8 @@ function renderThreadList() {
     const name = nameOfThread(t.threadKey);
     const info = threadInfo(t.threadKey);
     const avatar = el('span', { class: 'avatar' });
-    if (info.pic) {
-      const img = el('img', { src: info.pic, alt: '', referrerpolicy: 'no-referrer' });
+    if (safeImgSrc(info.pic)) {
+      const img = el('img', { src: safeImgSrc(info.pic), alt: '', referrerpolicy: 'no-referrer' });
       img.addEventListener('error', () => {
         img.remove();
         avatar.textContent = (name[0] || '?').toUpperCase();
@@ -469,14 +473,17 @@ async function exportHtml() {
         const media = a.mediaKey && (m.unsent || m.deleted) ? await db.getMedia(a.mediaKey) : null;
         if (media && media.blob && media.blob.size <= photoBudget) {
           photoBudget -= media.blob.size;
-          atts.push(`<img class="p" alt="" src="${await blobToDataUrl(media.blob)}">`);
+          // the photo's type is forced to a plain image type: a crafted type could otherwise end the attribute
+          atts.push(`<img class="p" alt="" src="${esc(await blobToDataUrl(retypeImageBlob(media.blob)))}">`);
         } else atts.push(`<div class="a">📎 ${esc(a.title || a.filename || (a.mediaKey ? 'photo (in the JSON backup)' : 'attachment'))}</div>`);
       }
       const body = m.text ? esc(m.text) : m.unsent && !hasContent(m) ? '<i>Unsent before it could be saved.</i>' : '';
       parts.push(`<div class="m ${cls}"><div class="t">${esc(senderOf(m, state.contacts, tName))} · ${esc(new Date(m.ts).toLocaleString())} ${tags ? `<b>${tags}</b>` : ''}</div><div>${body}</div>${hist}${atts.join('')}</div>`);
     }
   }
-  const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Saved Messenger messages</title><style>body{font:14px system-ui,sans-serif;max-width:860px;margin:20px auto;padding:0 12px}h2{border-bottom:1px solid #ccc;padding-bottom:4px;margin-top:28px}.m{padding:6px 10px;margin:4px 0;border-radius:8px;background:#f3f4f6;white-space:pre-wrap;overflow-wrap:anywhere}.m.u{background:#fde8ee;border-left:4px solid #e0245e}.m.e{border-left:4px solid #0a7cff}.t{font-size:12px;color:#555}.h{font-size:12px;color:#0a7cff}.a{font-size:12px;color:#555}.p{display:block;max-width:100%;max-height:360px;margin-top:6px;border-radius:6px}</style><h1>Saved Messenger messages</h1><p>Exported ${esc(new Date().toLocaleString())} by Messenger Message Saver.</p>${parts.join('\n')}`;
+  // the page may contain anything people wrote: it can show text and the embedded photos, never run code
+  const csp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'";
+  const html = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Saved Messenger messages</title><style>body{font:14px system-ui,sans-serif;max-width:860px;margin:20px auto;padding:0 12px}h2{border-bottom:1px solid #ccc;padding-bottom:4px;margin-top:28px}.m{padding:6px 10px;margin:4px 0;border-radius:8px;background:#f3f4f6;white-space:pre-wrap;overflow-wrap:anywhere}.m.u{background:#fde8ee;border-left:4px solid #e0245e}.m.e{border-left:4px solid #0a7cff}.t{font-size:12px;color:#555}.h{font-size:12px;color:#0a7cff}.a{font-size:12px;color:#555}.p{display:block;max-width:100%;max-height:360px;margin-top:6px;border-radius:6px}</style><h1>Saved Messenger messages</h1><p>Exported ${esc(new Date().toLocaleString())} by Messenger Message Saver.</p>${parts.join('\n')}`;
   download(`messenger-saved-${stamp()}.html`, new Blob([html], { type: 'text/html' }));
 }
 

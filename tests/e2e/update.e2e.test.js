@@ -93,7 +93,7 @@ test('open Messenger tab survives an extension update and a disable', { timeout:
   };
 
   let dash = await extPage();
-  await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000005001', sender: 'Khondoker Aurthe', time: '3:11 PM', text: 'saved before update' }));
+  await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000005001', sender: 'Alex Example', time: '3:11 PM', text: 'saved before update' }));
   await waitFor(async () => (await dash.evaluate(async () => (await import('/lib/db.js')).getAll('messages'))).some((m) => m.text === 'saved before update'), { what: 'saved before update' });
   await dash.close();
 
@@ -121,9 +121,9 @@ test('open Messenger tab survives an extension update and a disable', { timeout:
 
   await t.test('after a reload, the open tab keeps saving and recovering', async () => {
     const dbAll = (s) => dash.evaluate(async (s) => (await import('/lib/db.js')).getAll(s), s);
-    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000005002', sender: 'Khondoker Aurthe', time: '3:12 PM', text: 'saved after update' }));
+    await page.evaluate(() => fb.addMessage({ domId: '100012345678901@msgr.7460000000000005002', sender: 'Alex Example', time: '3:12 PM', text: 'saved after update' }));
     await waitFor(async () => (await dbAll('messages')).some((m) => m.text === 'saved after update'), { what: 'saved after update' });
-    await page.evaluate(() => fb.unsend('100012345678901@msgr.7460000000000005001', 'Khondoker Aurthe unsent a message'));
+    await page.evaluate(() => fb.unsend('100012345678901@msgr.7460000000000005001', 'Alex Example unsent a message'));
     await waitFor(async () => page.evaluate(() => {
       const b = document.querySelector('[data-message-id="100012345678901@msgr.7460000000000005001"] .mms-recovered');
       return b && b.textContent.includes('saved before update');
