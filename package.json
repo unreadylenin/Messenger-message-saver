@@ -1,13 +1,14 @@
 {
   "name": "messenger-message-saver",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
-  "description": "Chrome extension that saves Messenger messages on facebook.com and messenger.com, keeps unsent/edited messages readable, and adds Unseen mode.",
+  "description": "Chrome extension that saves Messenger messages on facebook.com and messenger.com, keeps unsent/edited messages readable, adds Unseen mode, downloads photos/videos/reels, and has an English/Bangla interface and an optional PIN lock.",
   "scripts": {
-    "test": "node --test tests/unit/main-world.test.js && node --test tests/e2e/extension.e2e.test.js && node --test tests/e2e/update.e2e.test.js",
-    "test:unit": "node --test tests/unit/main-world.test.js",
-    "test:e2e": "node --test tests/e2e/extension.e2e.test.js && node --test tests/e2e/update.e2e.test.js",
+    "test": "npm run test:unit && npm run test:e2e",
+    "test:unit": "node --no-warnings --test \"tests/unit/*.test.js\"",
+    "test:e2e": "node --test tests/e2e/extension.e2e.test.js && node --test tests/e2e/update.e2e.test.js && node --test tests/e2e/privacy-language.e2e.test.js && node --test tests/e2e/package.e2e.test.js",
     "package": "node scripts/package.js",
+    "store-assets": "node scripts/store-assets.js",
     "icons": "node scripts/make-icons.js"
   },
   "devDependencies": {

@@ -1,9 +1,12 @@
 import { getSettings, setSettings } from '../lib/settings.js';
 import * as db from '../lib/db.js';
-import { el, fmtTime, fmtAgo, senderOf, threadTitle } from '../lib/format.js';
+import { el, fmtTime, fmtAgo, senderOf, threadTitle, t, lang, setUiLanguage, applyI18n, attTitle } from '../lib/format.js';
 import { safeImgSrc, safeLinkHref, retypeImageBlob } from '../lib/sanitize.js';
+import * as lock from '../lib/lock.js';
 
 const $ = (sel) => document.querySelector(sel);
+const I18N = globalThis.MMS_I18N; // loaded by lib/format.js
+const num = (n) => I18N.num(n, lang());
 
 // every Saved Messages tab (and the background worker) announces deletions here
 const dataChannel = new BroadcastChannel('mms-data');
@@ -16,6 +19,8 @@ const state = {
   msgFilter: 'all',
   unsentFilter: 'recovered',
   objectUrls: [],
+  busy: 0, // exports / restores running
+  ready: false, // set once the page has loaded the saved data (never while locked)
 };
 
 /* ---------------- data ---------------- */
@@ -25,11 +30,11 @@ async function loadBasics() {
   state.contacts = contacts;
   state.threads = new Map(threads.map((t) => [t.threadKey, t]));
   state.summary = summary;
-  const t = totals; // same definitions as the lists below
-  $('#totals-line').textContent = `${t.messages} messages saved · ${t.unsent} unsent kept · ${t.edited} edited · ${t.media} photos`;
-  const unsentTab = t.unsent + t.deleted;
-  $('#c-unsent').textContent = unsentTab ? String(unsentTab) : '';
-  $('#c-edited').textContent = t.edited ? String(t.edited) : '';
+  const tot = totals; // same definitions as the lists below
+  $('#totals-line').textContent = t('totals', { messages: tot.messages, unsent: tot.unsent, edited: tot.edited, media: tot.media });
+  const unsentTab = tot.unsent + tot.deleted;
+  $('#c-unsent').textContent = unsentTab ? num(unsentTab) : '';
+  $('#c-edited').textContent = tot.edited ? num(tot.edited) : '';
 }
 
 function threadInfo(threadKey) {
@@ -62,7 +67,7 @@ function openLightbox(src) {
     if (before && before.focus) before.focus();
   };
   const onKey = (e) => e.key === 'Escape' && close();
-  const box = el('div', { class: 'lightbox', role: 'dialog', 'aria-label': 'Photo (press Escape to close)', tabindex: '-1', onclick: close }, el('img', { src, alt: '' }));
+  const box = el('div', { class: 'lightbox', role: 'dialog', 'aria-label': t('lightbox'), tabindex: '-1', onclick: close }, el('img', { src, alt: '' }));
   document.body.appendChild(box);
   document.addEventListener('keydown', onKey);
   box.focus();
@@ -73,7 +78,7 @@ function mediaBlock(m) {
   for (const a of m.attachments || []) {
     const isImage = a.type === 1 || a.type === 2 || a.type === 3 || /^image\//.test(a.mime || '') || a.kind === 'sticker' || a.kind === 'screen-image';
     if (a.mediaKey) {
-      const img = el('img', { alt: a.title || a.filename || 'saved photo', loading: 'lazy' });
+      const img = el('img', { alt: attTitle(a.title) || a.filename || t('media.savedPhoto'), loading: 'lazy' });
       wrap.appendChild(img);
       db.getMedia(a.mediaKey).then((rec) => {
         if (rec && rec.blob) {
@@ -83,17 +88,17 @@ function mediaBlock(m) {
           img.tabIndex = 0;
           img.addEventListener('click', () => openLightbox(u));
           img.addEventListener('keydown', (e) => (e.key === 'Enter' || e.key === ' ') && openLightbox(u));
-        } else img.replaceWith(el('span', { class: 'muted small', text: '🖼️ photo (not in this browser — it was not saved, or not included in a restored backup)' }));
+        } else img.replaceWith(el('span', { class: 'muted small', text: t('media.notSaved') }));
       });
     } else if (isImage && safeImgSrc(a.previewUrl)) {
       // pictures load only from Facebook's servers (a planted address could reveal you to another site)
       const src = safeImgSrc(a.previewUrl);
-      const img = el('img', { alt: a.title || 'photo', loading: 'lazy', referrerpolicy: 'no-referrer', src });
-      img.addEventListener('error', () => img.replaceWith(el('span', { class: 'muted small', text: '🖼️ photo (link expired, not downloaded)' })));
+      const img = el('img', { alt: attTitle(a.title) || t('media.photo'), loading: 'lazy', referrerpolicy: 'no-referrer', src });
+      img.addEventListener('error', () => img.replaceWith(el('span', { class: 'muted small', text: t('media.expired') })));
       img.addEventListener('click', () => openLightbox(src));
       wrap.appendChild(img);
     } else {
-      const label = a.title || a.filename || (a.type === 4 ? 'video' : a.type === 5 ? 'voice message' : a.type === 6 ? 'file' : 'attachment');
+      const label = attTitle(a.title) || a.filename || t(a.type === 4 ? 'att.video' : a.type === 5 ? 'att.voice' : a.type === 6 ? 'att.file' : 'att.attachment');
       // links open only for https addresses (never javascript:, data: or file:)
       const href = safeLinkHref(a.actionUrl) || safeLinkHref(a.playableUrl) || safeLinkHref(a.previewUrl);
       wrap.appendChild(href ? el('a', { class: 'att', href, target: '_blank', rel: 'noopener noreferrer', text: '📎 ' + label }) : el('span', { class: 'att', text: '📎 ' + label }));
@@ -104,29 +109,29 @@ function mediaBlock(m) {
 
 function statusBadges(m) {
   const out = [];
-  if (m.unsent) out.push(el('span', { class: 'badge unsent', text: 'Unsent' + (m.unsentAt ? ' ' + fmtAgo(m.unsentAt) : '') }));
-  if (m.deleted) out.push(el('span', { class: 'badge unsent', text: 'Deleted' }));
-  if (m.edited) out.push(el('span', { class: 'badge edited', text: 'Edited' }));
-  if (m.e2ee) out.push(el('span', { class: 'badge', text: '🔒 encrypted chat' }));
+  if (m.unsent) out.push(el('span', { class: 'badge unsent', text: t('badge.unsent') + (m.unsentAt ? ' ' + fmtAgo(m.unsentAt) : '') }));
+  if (m.deleted) out.push(el('span', { class: 'badge unsent', text: t('badge.deleted') }));
+  if (m.edited) out.push(el('span', { class: 'badge edited', text: t('badge.edited') }));
+  if (m.e2ee) out.push(el('span', { class: 'badge', text: t('badge.e2ee') }));
   return out;
 }
 
 function historyBlock(m) {
   const hist = (m.history || []).filter((h) => h.text && h.text.trim() && h.text !== m.text);
   if (!hist.length) return null;
-  return el('div', { class: 'history' }, el('div', { class: 'muted small', text: 'Earlier versions:' }), ...hist.map((h) => el('div', { text: h.text })));
+  return el('div', { class: 'history' }, el('div', { class: 'muted small', text: t('history.earlier') }), ...hist.map((h) => el('div', { text: h.text })));
 }
 
 function copyButton(text) {
   return el('button', {
     class: 'btn small',
-    text: 'Copy text',
+    text: t('copy.btn'),
     onclick: async () => {
       try {
         await navigator.clipboard.writeText(text);
-        toast('Copied');
+        toast(t('copy.ok'));
       } catch (e) {
-        toast('Could not copy');
+        toast(t('copy.fail'));
       }
     },
   });
@@ -144,12 +149,12 @@ function messageCard(m) {
       'div',
       { class: 'meta' },
       el('span', { class: 'who', text: who }),
-      el('button', { class: 'chat linklike', type: 'button', text: who !== tName ? 'in ' + tName : 'open chat', title: 'Open this chat', onclick: () => openThread(m.threadKey, m.key) }),
-      el('span', { text: (m.approxTime ? 'saved ' : 'sent ') + fmtTime(m.ts) }),
+      el('button', { class: 'chat linklike', type: 'button', text: who !== tName ? t('card.in', { chat: tName }) : t('card.openChat'), title: t('card.openChatTitle'), onclick: () => openThread(m.threadKey, m.key) }),
+      el('span', { text: t(m.approxTime ? 'card.saved' : 'card.sent', { time: fmtTime(m.ts) }) }),
       ...statusBadges(m)
     ),
     m.replyText ? el('div', { class: 'reply', text: '↪ ' + m.replyText }) : null,
-    el('div', { class: 'text' + (text ? '' : ' empty'), text: text || (m.attachments && m.attachments.length ? '' : m.notCaptured ? 'This message was unsent before the extension could save it.' : '(no text)') }),
+    el('div', { class: 'text' + (text ? '' : ' empty'), text: text || (m.attachments && m.attachments.length ? '' : m.notCaptured ? t('card.notCaptured') : t('card.noText')) }),
     mediaBlock(m),
     historyBlock(m),
     text ? el('div', { class: 'actions' }, copyButton(text)) : null
@@ -170,7 +175,7 @@ async function renderUnsent() {
   if (state.unsentFilter === 'recovered') items = items.filter(hasContent);
   list.textContent = '';
   if (!items.length) {
-    list.appendChild(emptyState('No unsent messages yet. When someone unsends a message that reached this browser, it will show up here.'));
+    list.appendChild(emptyState(t('empty.unsent')));
     return;
   }
   for (const m of items.slice(0, 500)) list.appendChild(messageCard(m));
@@ -181,7 +186,7 @@ async function renderEdited() {
   const list = $('#edited-list');
   const items = await db.messagesByStatus('edited', 1000);
   list.textContent = '';
-  if (!items.length) return list.appendChild(emptyState('No edited messages saved yet.'));
+  if (!items.length) return list.appendChild(emptyState(t('empty.edited')));
   for (const m of items) list.appendChild(messageCard(m));
 }
 
@@ -189,10 +194,10 @@ async function renderNotifications() {
   const list = $('#notification-list');
   const items = (await db.getAll('notifications')).sort((a, b) => b.ts - a.ts).slice(0, 1000);
   list.textContent = '';
-  if (!items.length) return list.appendChild(emptyState('No Messenger notifications captured yet.'));
+  if (!items.length) return list.appendChild(emptyState(t('empty.notifications')));
   for (const n of items) {
     list.appendChild(
-      el('article', { class: 'card' }, el('div', { class: 'meta' }, el('span', { class: 'who', text: n.title || 'Notification' }), el('span', { text: fmtTime(n.ts) })), el('div', { class: 'text', text: n.body || '' }))
+      el('article', { class: 'card' }, el('div', { class: 'meta' }, el('span', { class: 'who', text: n.title || t('notif.fallback') }), el('span', { text: fmtTime(n.ts) })), el('div', { class: 'text', text: n.body || '' }))
     );
   }
 }
@@ -202,14 +207,14 @@ function renderThreadList() {
   const q = $('#thread-filter').value.trim().toLowerCase();
   ul.textContent = '';
   const threads = (state.summary && state.summary.threads) || [];
-  const shown = threads.filter((t) => !q || nameOfThread(t.threadKey).toLowerCase().includes(q));
+  const shown = threads.filter((th) => !q || nameOfThread(th.threadKey).toLowerCase().includes(q));
   if (!shown.length) {
-    ul.appendChild(el('li', { class: 'muted', text: threads.length ? 'No chat matches.' : 'No chats saved yet.' }));
+    ul.appendChild(el('li', { class: 'muted', text: threads.length ? t('empty.noChatMatch') : t('empty.noChats') }));
     return;
   }
-  for (const t of shown) {
-    const name = nameOfThread(t.threadKey);
-    const info = threadInfo(t.threadKey);
+  for (const th of shown) {
+    const name = nameOfThread(th.threadKey);
+    const info = threadInfo(th.threadKey);
     const avatar = el('span', { class: 'avatar' });
     if (safeImgSrc(info.pic)) {
       const img = el('img', { src: safeImgSrc(info.pic), alt: '', referrerpolicy: 'no-referrer' });
@@ -219,27 +224,27 @@ function renderThreadList() {
       });
       avatar.appendChild(img);
     } else avatar.textContent = (name[0] || '?').toUpperCase();
-    const sub = [`${t.total} saved`];
-    if (t.unsent) sub.push(`${t.unsent} unsent`);
-    if (t.edited) sub.push(`${t.edited} edited`);
+    const sub = [t('thread.saved', { n: th.total })];
+    if (th.unsent) sub.push(t('thread.unsent', { n: th.unsent }));
+    if (th.edited) sub.push(t('thread.edited', { n: th.edited }));
     const li = el(
       'li',
       {
-        class: state.currentThread === t.threadKey ? 'on' : '',
-        dataset: { key: t.threadKey },
+        class: state.currentThread === th.threadKey ? 'on' : '',
+        dataset: { key: th.threadKey },
         tabindex: '0',
         role: 'button',
-        'aria-current': state.currentThread === t.threadKey ? 'true' : null,
-        onclick: () => openThread(t.threadKey),
+        'aria-current': state.currentThread === th.threadKey ? 'true' : null,
+        onclick: () => openThread(th.threadKey),
         onkeydown: (e) => {
           if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
-            openThread(t.threadKey);
+            openThread(th.threadKey);
           }
         },
       },
       avatar,
-      el('div', { class: 'tinfo' }, el('div', { class: 'tname', text: name + (t.e2ee || info.e2ee ? ' 🔒' : '') }), el('div', { class: 'tsub', text: sub.join(' · ') + ' · ' + fmtAgo(t.lastTs) }))
+      el('div', { class: 'tinfo' }, el('div', { class: 'tname', text: name + (th.e2ee || info.e2ee ? ' 🔒' : '') }), el('div', { class: 'tsub', text: sub.join(' · ') + ' · ' + fmtAgo(th.lastTs) }))
     );
     ul.appendChild(li);
   }
@@ -250,8 +255,8 @@ async function renderThread(focusKey) {
   const box = $('#thread-messages');
   box.textContent = '';
   if (!state.currentThread) {
-    $('#thread-title').textContent = 'Pick a chat';
-    box.appendChild(emptyState('Choose a chat on the left.'));
+    $('#thread-title').textContent = t('chats.pick');
+    box.appendChild(emptyState(t('empty.pickChat')));
     return;
   }
   $('#thread-title').textContent = nameOfThread(state.currentThread);
@@ -260,23 +265,24 @@ async function renderThread(focusKey) {
   if (f === 'unsent') msgs = msgs.filter((m) => m.unsent || m.deleted);
   else if (f === 'edited') msgs = msgs.filter((m) => m.edited);
   else if (f === 'media') msgs = msgs.filter((m) => m.attachments && m.attachments.length);
-  if (!msgs.length) return box.appendChild(emptyState('Nothing to show with this filter.'));
+  if (!msgs.length) return box.appendChild(emptyState(t('empty.filter')));
   const tName = nameOfThread(state.currentThread);
+  const loc = globalThis.MMS_I18N.locale(lang());
   let lastDay = '';
   for (const m of msgs.slice(-3000)) {
     const day = new Date(m.ts).toDateString();
     if (day !== lastDay) {
       lastDay = day;
-      box.appendChild(el('div', { class: 'day-sep', text: new Date(m.ts).toLocaleDateString(undefined, { dateStyle: 'full' }) }));
+      box.appendChild(el('div', { class: 'day-sep', text: new Date(m.ts).toLocaleDateString(loc, { dateStyle: 'full' }) }));
     }
     const cls = ['bubble', m.isMine ? 'mine' : '', m.unsent ? 'unsent' : '', m.deleted ? 'deleted' : '', m.edited ? 'edited' : ''].filter(Boolean).join(' ');
     const text = (m.text || '').trim();
     const bubble = el(
       'div',
       { class: cls, dataset: { key: m.key } },
-      el('div', { class: 'bmeta' }, el('b', { text: senderOf(m, state.contacts, tName) }), el('span', { text: new Date(m.ts).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }) + (m.approxTime ? ' (saved)' : '') }), ...statusBadges(m)),
+      el('div', { class: 'bmeta' }, el('b', { text: senderOf(m, state.contacts, tName) }), el('span', { text: new Date(m.ts).toLocaleTimeString(loc, { hour: 'numeric', minute: '2-digit' }) + (m.approxTime ? t('bubble.approx') : '') }), ...statusBadges(m)),
       m.replyText ? el('div', { class: 'reply muted small', text: '↪ ' + m.replyText }) : null,
-      text ? el('div', { class: 'text', text }) : !hasContent(m) ? el('div', { class: 'text muted', text: m.unsent ? 'Unsent before it could be saved.' : '(no text)' }) : null,
+      text ? el('div', { class: 'text', text }) : !hasContent(m) ? el('div', { class: 'text muted', text: m.unsent ? t('bubble.unsentEmpty') : t('card.noText') }) : null,
       mediaBlock(m),
       historyBlock(m)
     );
@@ -303,11 +309,11 @@ async function openThread(threadKey, focusKey) {
 
 async function renderSearch(q) {
   revokeUrls();
-  $('#search-title').textContent = `Results for “${q}”`;
+  $('#search-title').textContent = t('search.results', { q });
   const list = $('#search-list');
   list.textContent = '';
   const items = await db.searchMessages(q, { limit: 300 });
-  if (!items.length) return list.appendChild(emptyState('No saved message contains that.'));
+  if (!items.length) return list.appendChild(emptyState(t('empty.search')));
   for (const m of items) list.appendChild(messageCard(m));
 }
 
@@ -337,12 +343,26 @@ async function bindSettings() {
         input.type === 'checkbox' ? input.checked : input.tagName === 'SELECT' ? input.value : Math.max(Number(input.min || 0), Math.min(Number(input.max || 1e9), Number(input.value) || 0));
       if (input.type !== 'checkbox' && input.tagName !== 'SELECT') input.value = value;
       await setSettings({ [key]: value });
-      toast('Saved');
+      toast(t('saved'));
     });
   }
   // changes made in the popup or with Alt+Shift+U show up here at once
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes.settings) getSettings().then(applySettings);
+    if (area !== 'local' || !changes.settings) return;
+    getSettings().then(async (s) => {
+      applySettings(s);
+      // a new interface language: translate the page and redraw what is on screen
+      if (I18N.resolve(s.uiLanguage) !== lang()) {
+        setUiLanguage(s.uiLanguage);
+        applyI18n(document);
+        for (const b of document.querySelectorAll('[data-lang]')) b.classList.toggle('on', b.dataset.lang === lang());
+        if (!state.ready) return;
+        await refreshAll();
+        const q = $('#search').value.trim();
+        if (!$('#view-search').hidden && q.length >= 2) await renderSearch(q);
+        if (!$('#view-settings').hidden) await renderDiagnostics();
+      }
+    });
   });
 }
 
@@ -352,7 +372,7 @@ async function renderDiagnostics() {
   const { stats = {} } = await chrome.storage.local.get('stats');
   const rows = Object.entries(all).filter(([k]) => k.startsWith('diag:'));
   const table = el('table');
-  table.appendChild(el('tr', {}, el('th', { text: 'Tab' }), el('th', { text: 'Gateway sockets' }), el('th', { text: 'Network messages' }), el('th', { text: 'On-screen' }), el('th', { text: 'Seen / typing blocked' }), el('th', { text: 'Problems' })));
+  table.appendChild(el('tr', {}, el('th', { text: t('diag.tab') }), el('th', { text: t('diag.sockets') }), el('th', { text: t('diag.network') }), el('th', { text: t('diag.screen') }), el('th', { text: t('diag.blocked') }), el('th', { text: t('diag.problems') })));
   for (const [, d] of rows) {
     const sockets = d.sockets || {};
     table.appendChild(
@@ -360,18 +380,18 @@ async function renderDiagnostics() {
         'tr',
         {},
         el('td', { text: (d.url || '').replace(/^https:\/\//, '').slice(0, 60) + ' · ' + fmtAgo(d.at) }),
-        el('td', { text: `${sockets.dgw || 0} gateway, ${sockets.mqtt || 0} legacy, ${sockets.e2ee || 0} encrypted` }),
-        el('td', { text: `${d.messages || 0} msgs, ${d.unsent || 0} unsends, ${d.edits || 0} edits` }),
-        el('td', { text: d.dom ? `${d.dom.logs} chat(s) open, ${d.dom.saved} saved, ${d.dom.recovered} shown` : '-' }),
-        el('td', { text: `${d.seenBlocked || 0} / ${d.typingBlocked || 0}` + (d.seenUnknown ? ` (${d.seenUnknown} not held back: reload this tab)` : '') + (d.lateInjected ? ' · started late: reload this tab' : '') + (d.strongMode ? ' · Strong mode on here' : '') }),
-        el('td', { text: d.errors ? `${d.errors}: ${d.lastError}` : 'none' })
+        el('td', { text: t('diag.socketsRow', { dgw: sockets.dgw || 0, mqtt: sockets.mqtt || 0, e2ee: sockets.e2ee || 0 }) }),
+        el('td', { text: t('diag.networkRow', { messages: d.messages || 0, unsent: d.unsent || 0, edits: d.edits || 0 }) }),
+        el('td', { text: d.dom ? t('diag.screenRow', { logs: d.dom.logs || 0, saved: d.dom.saved || 0, recovered: d.dom.recovered || 0 }) : '-' }),
+        el('td', { text: `${num(d.seenBlocked || 0)} / ${num(d.typingBlocked || 0)}` + (d.seenUnknown ? t('diag.notHeld', { n: d.seenUnknown }) : '') + (d.lateInjected ? t('diag.late') : '') + (d.strongMode ? t('diag.strong') : '') }),
+        el('td', { text: d.errors ? `${num(d.errors)}: ${d.lastError}` : t('diag.none') })
       )
     );
   }
   box.textContent = '';
-  if (!rows.length) box.appendChild(el('p', { class: 'muted', text: 'No Facebook or Messenger tab has reported yet. Open (or reload) one.' }));
+  if (!rows.length) box.appendChild(el('p', { class: 'muted', text: t('diag.noTabs') }));
   else box.appendChild(el('div', { class: 'table-scroll' }, table));
-  box.appendChild(el('p', { class: 'muted small', text: `Since install: ${stats.seenBlocked || 0} “Seen” and ${stats.typingBlocked || 0} “typing” signals blocked in normal chats.` }));
+  box.appendChild(el('p', { class: 'muted small', text: t('diag.sinceInstall', { seen: stats.seenBlocked || 0, typing: stats.typingBlocked || 0 }) }));
 }
 
 function download(name, blob) {
@@ -389,12 +409,12 @@ function stamp() {
 
 async function exportJson(includeMedia) {
   try {
-    toast('Preparing backup…');
+    toast(t('backup.preparing'));
     const { blob, photos } = await db.exportBlob({ includeMedia });
     download(`messenger-saved-${stamp()}.json`, blob);
-    toast(includeMedia ? `Backup ready (${photos} photos)` : 'Backup ready');
+    toast(includeMedia ? t('backup.readyPhotos', { n: photos }) : t('backup.ready'));
   } catch (e) {
-    toast('Backup failed: ' + e.message);
+    toast(t('backup.failed', { error: e.message }));
   }
 }
 
@@ -450,7 +470,8 @@ function esc(s) {
 }
 
 async function exportHtml() {
-  toast('Preparing page…');
+  toast(t('export.preparing'));
+  const loc = I18N.locale(lang());
   const msgs = (await db.getAll('messages')).sort((a, b) => a.ts - b.ts);
   const byThread = new Map();
   for (const m of msgs) {
@@ -466,8 +487,8 @@ async function exportHtml() {
     parts.push(`<h2>${esc(tName)}</h2>`);
     for (const m of list) {
       const cls = m.unsent || m.deleted ? 'u' : m.edited ? 'e' : '';
-      const tags = [m.unsent ? 'UNSENT' : '', m.deleted ? 'DELETED' : '', m.edited ? 'EDITED' : ''].filter(Boolean).join(' ');
-      const hist = (m.history || []).map((h) => `<div class="h">before: ${esc(h.text)}</div>`).join('');
+      const tags = [m.unsent ? t('export.unsent') : '', m.deleted ? t('export.deleted') : '', m.edited ? t('export.edited') : ''].filter(Boolean).join(' ');
+      const hist = (m.history || []).map((h) => `<div class="h">${esc(t('export.before', { text: h.text }))}</div>`).join('');
       const atts = [];
       for (const a of m.attachments || []) {
         const media = a.mediaKey && (m.unsent || m.deleted) ? await db.getMedia(a.mediaKey) : null;
@@ -475,30 +496,32 @@ async function exportHtml() {
           photoBudget -= media.blob.size;
           // the photo's type is forced to a plain image type: a crafted type could otherwise end the attribute
           atts.push(`<img class="p" alt="" src="${esc(await blobToDataUrl(retypeImageBlob(media.blob)))}">`);
-        } else atts.push(`<div class="a">📎 ${esc(a.title || a.filename || (a.mediaKey ? 'photo (in the JSON backup)' : 'attachment'))}</div>`);
+        } else atts.push(`<div class="a">📎 ${esc(attTitle(a.title) || a.filename || t(a.mediaKey ? 'export.photoInBackup' : 'att.attachment'))}</div>`);
       }
-      const body = m.text ? esc(m.text) : m.unsent && !hasContent(m) ? '<i>Unsent before it could be saved.</i>' : '';
-      parts.push(`<div class="m ${cls}"><div class="t">${esc(senderOf(m, state.contacts, tName))} · ${esc(new Date(m.ts).toLocaleString())} ${tags ? `<b>${tags}</b>` : ''}</div><div>${body}</div>${hist}${atts.join('')}</div>`);
+      const body = m.text ? esc(m.text) : m.unsent && !hasContent(m) ? `<i>${esc(t('export.unsentEmpty'))}</i>` : '';
+      parts.push(`<div class="m ${cls}"><div class="t">${esc(senderOf(m, state.contacts, tName))} · ${esc(new Date(m.ts).toLocaleString(loc))} ${tags ? `<b>${esc(tags)}</b>` : ''}</div><div>${body}</div>${hist}${atts.join('')}</div>`);
     }
   }
   // the page may contain anything people wrote: it can show text and the embedded photos, never run code
   const csp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'";
-  const html = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Saved Messenger messages</title><style>body{font:14px system-ui,sans-serif;max-width:860px;margin:20px auto;padding:0 12px}h2{border-bottom:1px solid #ccc;padding-bottom:4px;margin-top:28px}.m{padding:6px 10px;margin:4px 0;border-radius:8px;background:#f3f4f6;white-space:pre-wrap;overflow-wrap:anywhere}.m.u{background:#fde8ee;border-left:4px solid #e0245e}.m.e{border-left:4px solid #0a7cff}.t{font-size:12px;color:#555}.h{font-size:12px;color:#0a7cff}.a{font-size:12px;color:#555}.p{display:block;max-width:100%;max-height:360px;margin-top:6px;border-radius:6px}</style><h1>Saved Messenger messages</h1><p>Exported ${esc(new Date().toLocaleString())} by Messenger Message Saver.</p>${parts.join('\n')}`;
+  const title = esc(t('export.title'));
+  const html = `<!doctype html><html lang="${lang()}"><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>body{font:14px system-ui,sans-serif;max-width:860px;margin:20px auto;padding:0 12px}h2{border-bottom:1px solid #ccc;padding-bottom:4px;margin-top:28px}.m{padding:6px 10px;margin:4px 0;border-radius:8px;background:#f3f4f6;white-space:pre-wrap;overflow-wrap:anywhere}.m.u{background:#fde8ee;border-left:4px solid #e0245e}.m.e{border-left:4px solid #0a7cff}.t{font-size:12px;color:#555}.h{font-size:12px;color:#0a7cff}.a{font-size:12px;color:#555}.p{display:block;max-width:100%;max-height:360px;margin-top:6px;border-radius:6px}</style><h1>${title}</h1><p>${esc(t('export.by', { time: new Date().toLocaleString(loc) }))}</p>${parts.join('\n')}`;
   download(`messenger-saved-${stamp()}.html`, new Blob([html], { type: 'text/html' }));
 }
 
 async function importJson(file) {
   try {
-    toast('Restoring…');
-    const counts = await db.importFile(file, (c) => toast(`Restoring… ${c.media} photos so far`));
-    toast(`Restored ${counts.messages} messages, ${counts.media} photos`);
+    toast(t('restore.running'));
+    const counts = await db.importFile(file, (c) => toast(t('restore.progress', { n: c.media })));
+    toast(t('restore.done', { messages: counts.messages, media: counts.media }));
     await refreshAll();
   } catch (e) {
-    toast('Restore failed: ' + e.message);
+    const why = e && e.code === 'not-backup' ? t('restore.notBackup') : e && e.code === 'bad-layout' ? t('restore.badLayout') : (e && e.message) || String(e);
+    toast(t('restore.failed', { error: why }));
   }
 }
 
-function confirmDialog(text, okLabel = 'Delete') {
+function confirmDialog(text, okLabel = t('dlg.delete')) {
   const dlg = $('#confirm-dialog');
   $('#confirm-text').textContent = text;
   $('#confirm-ok').textContent = okLabel;
@@ -580,6 +603,7 @@ function route() {
 
 async function init() {
   await loadBasics();
+  state.ready = true;
   await bindSettings();
   for (const b of document.querySelectorAll('.tabs button')) b.addEventListener('click', () => showView(b.dataset.view));
   for (const c of document.querySelectorAll('#msg-filter .chip'))
@@ -610,20 +634,32 @@ async function init() {
     $('#welcome').hidden = true;
     history.replaceState(null, '', '#unsent');
   });
-  $('#export-json').addEventListener('click', () => exportJson(true));
-  $('#export-json-light').addEventListener('click', () => exportJson(false));
-  const guarded = (fn) => () => fn().catch((e) => toast('Export failed: ' + e.message));
+  // long jobs keep an unlocked page from locking itself in the middle of them
+  const busy = (fn) => async (...args) => {
+    state.busy++;
+    try {
+      return await fn(...args);
+    } finally {
+      state.busy--;
+    }
+  };
+  $('#export-json').addEventListener('click', busy(() => exportJson(true)));
+  $('#export-json-light').addEventListener('click', busy(() => exportJson(false)));
+  const guarded = (fn) => busy(() => fn().catch((e) => toast(t('export.failed', { error: e.message }))));
   $('#export-html').addEventListener('click', guarded(exportHtml));
   $('#export-csv').addEventListener('click', guarded(() => exportCsv(null)));
   $('#export-thread').addEventListener('click', guarded(() => (state.currentThread ? exportCsv(state.currentThread) : Promise.resolve())));
-  $('#import-json').addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    e.target.value = ''; // so choosing the same file again works
-    if (file) await importJson(file);
-  });
+  $('#import-json').addEventListener(
+    'change',
+    busy(async (e) => {
+      const file = e.target.files[0];
+      e.target.value = ''; // so choosing the same file again works
+      if (file) await importJson(file);
+    })
+  );
   $('#delete-thread').addEventListener('click', async () => {
     if (!state.currentThread) return;
-    if (!(await confirmDialog(`Delete everything saved from “${nameOfThread(state.currentThread)}”: messages, photos, unsend and edit history, and Messenger notification copies from this chat? This cannot be undone.`))) return;
+    if (!(await confirmDialog(t('confirm.deleteChat', { chat: nameOfThread(state.currentThread) })))) return;
     const name = nameOfThread(state.currentThread);
     const keys = await db.threadKeysFor(state.currentThread);
     for (const k of keys) await db.deleteThread(k, { name });
@@ -631,17 +667,16 @@ async function init() {
     state.currentThread = null;
     history.replaceState(null, '', '#chats');
     await renderThread(); // the deleted conversation must not stay on screen
-    toast('Chat data deleted');
+    toast(t('deleted.chat'));
     await refreshAll();
   });
   $('#delete-all').addEventListener('click', async () => {
-    if (!(await confirmDialog('Delete ALL saved messages, photos and history? This cannot be undone. (Tip: download a backup first.)', 'Delete everything'))) return;
-    await db.clearAll();
-    await chrome.storage.local.set({ stats: {} });
-    dataChannel.postMessage({ deleted: 'all' });
+    if (!(await confirmDialog(t('confirm.deleteAll'), t('confirm.deleteAllOk')))) return;
+    await wipeAll();
     await forgetOnScreen('all');
-    toast('Everything deleted');
+    toast(t('deleted.all'));
   });
+  bindPrivacy();
   // deletions made in another Saved Messages tab, or old messages removed by the retention setting
   dataChannel.onmessage = (e) => {
     const d = e.data || {};
@@ -669,7 +704,187 @@ async function init() {
   }, 10000);
 }
 
-init().catch((e) => {
+/* ---------------- everything saved, deleted ---------------- */
+
+async function wipeAll() {
+  await db.clearAll();
+  await chrome.storage.local.set({ stats: {} });
+  dataChannel.postMessage({ deleted: 'all' });
+  chrome.runtime.sendMessage({ type: 'badge-seen' }).catch(() => {});
+}
+
+/* ---------------- language ---------------- */
+
+function bindLanguageChoice() {
+  for (const b of document.querySelectorAll('[data-lang]')) {
+    b.classList.toggle('on', b.dataset.lang === lang());
+    b.addEventListener('click', () => setSettings({ uiLanguage: b.dataset.lang }));
+  }
+}
+
+/* ---------------- PIN lock ---------------- */
+
+// several things can ask for a fresh start at once (Lock now, the idle check, another tab)
+let reloading = false;
+function reloadOnce() {
+  if (reloading) return;
+  reloading = true;
+  location.reload();
+}
+
+async function applyLockUI() {
+  const on = await lock.isLockOn();
+  $('#lock-now').hidden = !on;
+  $('#pin-off').hidden = on;
+  $('#pin-on').hidden = !on;
+}
+
+function bindPrivacy() {
+  applyLockUI();
+  $('#pin-set').addEventListener('click', async () => {
+    const pin = $('#pin-new').value;
+    if (!lock.validPin(pin)) return toast(t('privacy.invalid'));
+    if (lock.normalizePin(pin) !== lock.normalizePin($('#pin-repeat').value)) return toast(t('privacy.mismatch'));
+    $('#pin-set').disabled = true;
+    try {
+      await lock.setPin(pin);
+      $('#pin-new').value = '';
+      $('#pin-repeat').value = '';
+      toast(t('privacy.setDone'));
+    } finally {
+      $('#pin-set').disabled = false;
+      await applyLockUI();
+    }
+  });
+  $('#pin-remove').addEventListener('click', async () => {
+    $('#pin-remove').disabled = true;
+    try {
+      const r = await lock.removeLock($('#pin-current').value);
+      $('#pin-current').value = '';
+      if (r.ok) toast(t('privacy.removed'));
+      else if (r.waitMs) toast(t('lock.wait', { s: Math.ceil(r.waitMs / 1000) }));
+      else toast(t('privacy.removeWrong'));
+    } finally {
+      $('#pin-remove').disabled = false;
+      await applyLockUI();
+    }
+  });
+  $('#lock-now').addEventListener('click', async () => {
+    await lock.lockNow();
+    reloadOnce();
+  });
+}
+
+/** Shows only the PIN screen; resolves once the right PIN was entered. Reads no saved data. */
+function showLockScreen() {
+  document.body.classList.add('locked');
+  const screen = $('#lock-screen');
+  const input = $('#lock-pin');
+  const submit = $('#lock-submit');
+  const error = $('#lock-error');
+  screen.hidden = false;
+  input.focus();
+  let countdown = 0;
+  const showWait = (ms) => {
+    clearInterval(countdown);
+    const end = Date.now() + ms;
+    const tick = () => {
+      const left = Math.ceil((end - Date.now()) / 1000);
+      if (left <= 0) {
+        clearInterval(countdown);
+        error.hidden = true;
+        input.disabled = submit.disabled = false;
+        input.focus();
+        return;
+      }
+      error.textContent = t('lock.wait', { s: left });
+      error.hidden = false;
+      input.disabled = submit.disabled = true;
+    };
+    tick();
+    countdown = setInterval(tick, 500);
+  };
+  // unlocked in another tab, or the lock was removed: start over
+  const onStorage = (changes, area) => {
+    if ((area === 'local' && changes.lock && !changes.lock.newValue) || (area === 'session' && changes.unlockedUntil && changes.unlockedUntil.newValue > Date.now())) reloadOnce();
+  };
+  chrome.storage.onChanged.addListener(onStorage);
+  return new Promise((resolve) => {
+    $('#lock-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (submit.disabled) return;
+      submit.disabled = true;
+      submit.textContent = t('lock.checking');
+      let r;
+      try {
+        r = await lock.verifyPin(input.value);
+      } finally {
+        submit.textContent = t('lock.submit');
+        submit.disabled = false;
+      }
+      input.value = '';
+      if (r.ok) {
+        chrome.storage.onChanged.removeListener(onStorage);
+        clearInterval(countdown);
+        screen.hidden = true;
+        error.hidden = true;
+        document.body.classList.remove('locked');
+        resolve();
+      } else if (r.waitMs > 0) showWait(r.waitMs);
+      else {
+        error.textContent = t('lock.wrong');
+        error.hidden = false;
+        input.focus();
+      }
+    });
+    $('#lock-forgot').addEventListener('click', async () => {
+      if (!(await confirmDialog(t('lock.forgotConfirm'), t('lock.forgotOk')))) return;
+      await wipeAll();
+      await lock.forgetLock();
+      reloadOnce();
+    });
+  });
+}
+
+/** An unlocked page locks itself again after 15 minutes without use (or "Lock now" elsewhere). */
+function watchIdle() {
+  let lastTouch = 0;
+  const activity = () => {
+    if (Date.now() - lastTouch < 30000) return;
+    lastTouch = Date.now();
+    lock.isLockOn().then((on) => on && lock.touch()).catch(() => {});
+  };
+  for (const ev of ['pointerdown', 'keydown', 'wheel', 'touchstart']) document.addEventListener(ev, activity, { passive: true, capture: true });
+  const check = async () => {
+    if (!(await lock.isLockOn())) return;
+    if (state.busy > 0) return lock.touch(); // never in the middle of a backup or restore
+    if (!(await lock.isUnlocked())) {
+      document.body.classList.add('locked'); // hide the messages at once, then start over
+      reloadOnce();
+    }
+  };
+  setInterval(() => check().catch(() => {}), 15000);
+  document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && check().catch(() => {}));
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if ((area === 'session' && changes.unlockedUntil) || (area === 'local' && changes.lock)) {
+      check().catch(() => {});
+      applyLockUI().catch(() => {});
+    }
+  });
+}
+
+async function boot() {
+  const s = await getSettings();
+  setUiLanguage(s.uiLanguage);
+  applyI18n(document);
+  bindLanguageChoice();
+  // with the PIN lock on, nothing saved is read before the right PIN
+  if ((await lock.isLockOn()) && !(await lock.isUnlocked())) await showLockScreen();
+  await init();
+  watchIdle();
+}
+
+boot().catch((e) => {
   console.error(e);
-  toast('Error: ' + e.message);
+  toast(t('error', { error: e.message }));
 });

@@ -40,7 +40,7 @@ test('open Messenger tab survives an extension update and a disable', { timeout:
     channel: 'chromium',
     headless: true,
     viewport: { width: 1280, height: 860 },
-    args: [`--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`],
+    args: ['--lang=en-US', `--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`],
   });
   t.after(async () => {
     await ctx.close();

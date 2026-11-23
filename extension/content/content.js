@@ -60,9 +60,21 @@
     downloadButtons: true,
     downloadQuality: 'hd',
     downloadAsk: false,
+    uiLanguage: 'auto',
   };
 
   let settings = { ...DEFAULT_SETTINGS };
+
+  // interface language of the boxes and buttons this script adds to Facebook (lib/i18n.js runs first)
+  const I18N = globalThis.MMS_I18N || null;
+  let uiLang = 'en';
+  function updateLang() {
+    uiLang = I18N ? I18N.resolve(settings.uiLanguage) : 'en';
+  }
+  function tr(key, vars) {
+    return I18N ? I18N.translate(uiLang, key, vars) : key;
+  }
+  updateLang();
   let extensionAlive = true;
   const domStats = { logs: 0, rows: 0, saved: 0, placeholders: 0, recovered: 0 };
   const cleanups = []; // observers and timers to stop if this copy is retired
@@ -149,6 +161,7 @@
 
   chrome.storage.local.get('settings').then(({ settings: stored }) => {
     settings = { ...DEFAULT_SETTINGS, ...(stored || {}) };
+    updateLang();
     pushSettingsToPage();
     startDom();
   });
@@ -156,6 +169,14 @@
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local' || !changes.settings) return;
     settings = { ...DEFAULT_SETTINGS, ...(changes.settings.newValue || {}) };
+    const langBefore = uiLang;
+    updateLang();
+    if (uiLang !== langBefore) {
+      // redraw the boxes and the download button in the new language
+      removeInline('.mms-recovered');
+      removeInline('.mms-edit-history');
+      hideDownloadButton(true, true);
+    }
     pushSettingsToPage();
     if (!settings.enabled || !settings.showRecoveredInline) removeInline('.mms-recovered');
     if (!settings.enabled || !settings.showEditHistoryInline) removeInline('.mms-edit-history');
@@ -975,7 +996,7 @@
   function fmtTime(ts) {
     if (!ts) return '';
     try {
-      return new Date(ts).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+      return new Date(ts).toLocaleString(I18N ? I18N.locale(uiLang) : undefined, { dateStyle: 'medium', timeStyle: 'short' });
     } catch (e) {
       return '';
     }
@@ -1015,7 +1036,7 @@
     box.setAttribute('data-mms-state', 'found');
     const head = document.createElement('div');
     head.className = 'mms-head';
-    head.textContent = '🛡️ Saved copy of the unsent message' + (hit.confidence === 'medium' ? ' (best match)' : '');
+    head.textContent = tr('box.saved') + (hit.confidence === 'medium' ? tr('box.bestMatch') : '');
     box.appendChild(head);
     if (hit.text) {
       const body = document.createElement('div');
@@ -1027,7 +1048,7 @@
       if (m.dataUrl || m.url) {
         const img = document.createElement('img');
         img.className = 'mms-img';
-        img.alt = m.title || 'saved photo';
+        img.alt = m.title || tr('media.savedPhoto');
         img.referrerPolicy = 'no-referrer';
         img.src = m.dataUrl || m.url;
         img.addEventListener('error', () => img.remove());
@@ -1035,16 +1056,16 @@
       } else if (m.title) {
         const t = document.createElement('div');
         t.className = 'mms-meta';
-        t.textContent = '📎 ' + m.title;
+        t.textContent = '📎 ' + (m.title === 'Voice message' ? tr('att.voiceTitle') : m.title === 'Video' ? tr('att.videoTitle') : m.title);
         box.appendChild(t);
       }
     }
     const meta = document.createElement('div');
     meta.className = 'mms-meta';
     const when = fmtTime(hit.ts);
-    meta.textContent = (when ? (hit.approxTime ? 'saved ' : 'sent ') + when : '') + (hit.unsentAt ? ' · unsent ' + fmtTime(hit.unsentAt) : '');
+    meta.textContent = (when ? tr(hit.approxTime ? 'box.savedAt' : 'box.sentAt', { time: when }) : '') + (hit.unsentAt ? tr('box.unsentAt', { time: fmtTime(hit.unsentAt) }) : '');
     if (meta.textContent) box.appendChild(meta);
-    box.title = 'Shown by Messenger Message Saver - only you can see this.';
+    box.title = tr('box.title');
     insertBox(row, box);
   }
 
@@ -1060,7 +1081,7 @@
     box.setAttribute('data-mms-state', 'missing');
     box.setAttribute('data-mms-tries', '1');
     box.setAttribute('data-mms-checked', String(Date.now()));
-    box.textContent = '🛡️ No saved copy: this message was unsent before Messenger Message Saver could see it.';
+    box.textContent = tr('box.missing');
     insertBox(row, box);
   }
 
@@ -1069,7 +1090,7 @@
     const box = makeBox('mms-edit-history');
     const head = document.createElement('div');
     head.className = 'mms-head';
-    head.textContent = '✏️ Before editing:';
+    head.textContent = tr('box.edited');
     box.appendChild(head);
     for (const h of history.slice(-5)) {
       const line = document.createElement('div');
@@ -1301,7 +1322,7 @@
     const root = host.attachShadow({ mode: 'open' });
     const style = document.createElement('style');
     style.textContent = `
-      .btn, .toast { position: fixed; z-index: 2147483647; box-sizing: border-box; font: 600 13px/1.2 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
+      .btn, .toast { position: fixed; z-index: 2147483647; box-sizing: border-box; font: 600 13px/1.2 system-ui, -apple-system, 'Segoe UI', 'Nirmala UI', Roboto, 'Noto Sans Bengali', sans-serif; }
       .btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 12px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
              background: rgba(24,25,26,.82); color: #fff; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.35); }
       .btn:hover { background: rgba(0,0,0,.92); }
@@ -1338,9 +1359,9 @@
   }
 
   function labelFor(target) {
-    if (target.kind === 'image') return { text: '⬇ Photo', title: 'Download this photo (largest size available)' };
+    if (target.kind === 'image') return { text: tr('dl.photo'), title: tr('dl.photoTitle') };
     const reel = /\/reels?\//.test(location.pathname) || (target.thumb && target.id);
-    return { text: reel ? '⬇ Reel' : '⬇ Video', title: settings.downloadQuality === 'sd' ? 'Download this video (smaller file)' : 'Download this video (best quality)' };
+    return { text: tr(reel ? 'dl.reel' : 'dl.video'), title: tr(settings.downloadQuality === 'sd' ? 'dl.videoTitleSd' : 'dl.videoTitleHd') };
   }
 
   function placeButton() {
@@ -1504,8 +1525,8 @@
   /** Hands a Facebook file address to the background worker, which saves it to Downloads/Facebook. */
   async function saveUrl(url, filename) {
     const res = await send({ type: 'download', url, filename });
-    if (!res) throw new Error('The extension did not answer. Reload this tab and try again.');
-    if (!res.ok) throw new Error(res.error || 'The download did not start.');
+    if (!res) throw new Error(tr('dl.noAnswerExt'));
+    if (!res.ok) throw new Error(res.error || tr('dl.noStart'));
     return res;
   }
 
@@ -1535,15 +1556,15 @@
     const shown = mediaUrlOf(target.el);
     const base = `${siteWord()}-photo-`;
     if (/^(blob|data):/i.test(shown)) {
-      if (await saveBlobUrl(shown, base + stamp(), 'jpg')) return 'Photo saved to your Downloads folder.';
-      throw new Error('This photo could not be read. Open it (click it) and try again.');
+      if (await saveBlobUrl(shown, base + stamp(), 'jpg')) return tr('dl.photoSavedRoot');
+      throw new Error(tr('dl.photoUnreadable'));
     }
     const res = await askPage('image', target.el);
     const url = (res && res.url) || shown;
-    if (!/^https:\/\//i.test(url)) throw new Error('This picture cannot be saved.');
+    if (!/^https:\/\//i.test(url)) throw new Error(tr('dl.cannotSave'));
     const key = (/\/([^/?#]+?)\.(?:jpe?g|png|webp|gif)(?:[?#]|$)/i.exec(url) || [])[1];
     await saveUrl(url, `${base}${key || stamp()}.${extOf(url, 'jpg')}`);
-    return 'Photo saved to Downloads › Facebook.';
+    return tr('dl.photoSaved');
   }
 
   async function downloadVideo(target) {
@@ -1554,12 +1575,12 @@
     // chat videos are often plain files already
     if (/^https:\/\//i.test(direct) && !/[?&]byte(?:start|end)=/i.test(direct)) {
       await saveUrl(direct, `${site}-${what}-${stamp()}.${extOf(direct, 'mp4')}`);
-      return 'Video saved to Downloads › Facebook.';
+      return tr('dl.videoSaved');
     }
-    if (/^blob:/i.test(direct) && (await saveBlobUrl(direct, `${site}-${what}-${stamp()}`, 'mp4'))) return 'Video saved to your Downloads folder.';
+    if (/^blob:/i.test(direct) && (await saveBlobUrl(direct, `${site}-${what}-${stamp()}`, 'mp4'))) return tr('dl.videoSavedRoot');
 
     const res = await askPage('video', video && video.isConnected ? video : target.el && target.el.isConnected ? target.el : null, { id: target.id || '' });
-    if (!res) throw new Error('No answer from the page. Reload this tab and try again.');
+    if (!res) throw new Error(tr('dl.noAnswerPage'));
     const id = res.id || target.id || '';
     const name = `${site}-${what}-${id || stamp()}`;
     const wantSd = settings.downloadQuality === 'sd';
@@ -1567,21 +1588,21 @@
     if (url) {
       const quality = url === res.hd ? 'hd' : 'sd';
       await saveUrl(url, `${name}-${quality}.mp4`);
-      return `${what === 'reel' ? 'Reel' : 'Video'} (${quality.toUpperCase()}) saved to Downloads › Facebook.`;
+      return tr(what === 'reel' ? 'dl.reelSavedQ' : 'dl.videoSavedQ', { q: quality.toUpperCase() });
     }
     if (res.dashVideo) {
       await saveUrl(res.dashVideo, `${name}-picture-only.mp4`);
       if (res.dashAudio) await saveUrl(res.dashAudio, `${name}-sound-only.m4a`);
-      return 'Facebook only offers this video as separate picture and sound files. Both were saved to Downloads › Facebook.';
+      return tr('dl.dashBoth');
     }
-    throw new Error('Facebook did not give a file for this video. Open the video on its own page (click its date or time) and try again.');
+    throw new Error(tr('dl.noFile'));
   }
 
   async function startDownload(target, near) {
     if (!downloadsOn() || dlBusy) return;
     dlBusy = true;
     if (dl) dl.btn.setAttribute('aria-busy', 'true');
-    showToast(target.kind === 'image' ? 'Saving the photo…' : 'Finding the video file…', false, near);
+    showToast(tr(target.kind === 'image' ? 'dl.savingPhoto' : 'dl.finding'), false, near);
     try {
       const done = target.kind === 'image' ? await downloadImage(target) : await downloadVideo(target);
       showToast('✓ ' + done, false, near);
@@ -1604,13 +1625,13 @@
     if (!target && linkId) target = { el: null, kind: 'video', id: linkId, thumb: /\/reels?\//.test(msg.linkUrl || '') };
     if (!target && /^https:\/\//i.test(msg.srcUrl || '') && msg.mediaType === 'image') {
       saveUrl(msg.srcUrl, `${siteWord()}-photo-${stamp()}.${extOf(msg.srcUrl, 'jpg')}`).then(
-        () => showToast('✓ Photo saved to Downloads › Facebook.', false, near),
+        () => showToast('✓ ' + tr('dl.photoSaved'), false, near),
         (e) => showToast(String((e && e.message) || e), true, near)
       );
       return;
     }
     if (!target) {
-      showToast('No photo or video was found where you right-clicked.', true, near);
+      showToast(tr('dl.nothingHere'), true, near);
       return;
     }
     startDownload(target, near);

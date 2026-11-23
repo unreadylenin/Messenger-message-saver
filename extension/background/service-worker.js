@@ -7,8 +7,11 @@ import { DEFAULT_SETTINGS, getSettings } from '../lib/settings.js';
 import * as db from '../lib/db.js';
 import { downloadFileName, isDownloadableUrl } from '../lib/downloads.js';
 import { LIMITS, clip, httpsUrl, isFbUrl, safeImageMime, retypeImageBlob, cleanDiag } from '../lib/sanitize.js';
+import { isLockOn } from '../lib/lock.js';
+import '../lib/i18n.js'; // defines globalThis.MMS_I18N
 
 const { normalizeText, finalizeMessage, reqP } = db;
+const I18N = globalThis.MMS_I18N;
 
 /* ---------------- settings cache ---------------- */
 
@@ -19,6 +22,12 @@ async function settings() {
   return settingsCache;
 }
 
+/** Interface text in the language chosen in Settings. */
+async function L(key, vars) {
+  const s = await settings();
+  return I18N.translate(I18N.resolve(s.uiLanguage), key, vars);
+}
+
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.settings) {
     const before = { ...DEFAULT_SETTINGS, ...(changes.settings.oldValue || {}) };
@@ -26,7 +35,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     updateBadge();
     // a new "delete older than N days" applies now, not at the next 6-hourly run
     if (settingsCache.retentionDays > 0 && settingsCache.retentionDays !== before.retentionDays) pruneNow(settingsCache.retentionDays);
-    if (settingsCache.enabled !== before.enabled || settingsCache.downloadButtons !== before.downloadButtons) updateMenus();
+    if (settingsCache.enabled !== before.enabled || settingsCache.downloadButtons !== before.downloadButtons || settingsCache.uiLanguage !== before.uiLanguage) updateMenus();
   }
 });
 
@@ -60,20 +69,26 @@ chrome.runtime.onStartup.addListener(() => {
 // page can never use this to download anything else.
 
 const MENU_ID = 'mms-download';
-async function updateMenus() {
-  try {
-    await chrome.contextMenus.removeAll();
-    const s = await settings();
-    if (!s.enabled || !s.downloadButtons) return;
-    chrome.contextMenus.create({
-      id: MENU_ID,
-      title: 'Download this photo or video',
-      contexts: ['image', 'video', 'link', 'page'],
-      documentUrlPatterns: PAGE_MATCHES,
-    });
-  } catch (e) {
-    console.debug('[MMS] menu not updated', e && e.message);
-  }
+let menuChain = Promise.resolve();
+
+/** (Re)creates the right-click entry; calls run one after another so removeAll/create never interleave. */
+function updateMenus() {
+  menuChain = menuChain.then(async () => {
+    try {
+      await chrome.contextMenus.removeAll();
+      const s = await settings();
+      if (!s.enabled || !s.downloadButtons) return;
+      await chrome.contextMenus.create({
+        id: MENU_ID,
+        title: await L('menu.download'),
+        contexts: ['image', 'video', 'link', 'page'],
+        documentUrlPatterns: PAGE_MATCHES,
+      });
+    } catch (e) {
+      console.debug('[MMS] menu not updated', e && e.message);
+    }
+  });
+  return menuChain;
 }
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
@@ -84,14 +99,14 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 
 async function startDownload(msg) {
   const url = String((msg && msg.url) || '');
-  if (!isDownloadableUrl(url)) return { ok: false, error: 'Only photos and videos stored by Facebook can be downloaded.' };
+  if (!isDownloadableUrl(url)) return { ok: false, error: await L('dl.onlyFb') };
   const s = await settings();
-  if (!s.enabled || !s.downloadButtons) return { ok: false, error: 'Downloads are turned off in Messenger Message Saver’s settings.' };
+  if (!s.enabled || !s.downloadButtons) return { ok: false, error: await L('dl.off') };
   try {
     const id = await chrome.downloads.download({ url, filename: downloadFileName(msg.filename, url), conflictAction: 'uniquify', saveAs: !!s.downloadAsk });
     return { ok: true, id };
   } catch (e) {
-    return { ok: false, error: 'Chrome could not start the download: ' + String((e && e.message) || e) };
+    return { ok: false, error: await L('dl.chromeFailed', { error: String((e && e.message) || e) }) };
   }
 }
 
@@ -128,7 +143,8 @@ async function injectIntoOpenTabs() {
       // the page hook does nothing if a copy is already running in that tab
       await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content/main-world.js'], world: 'MAIN' });
       await chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: ['content/content.css'] });
-      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content/content.js'] });
+      // the interface text first, in the same (isolated) world as the content script
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['lib/i18n.js', 'content/content.js'] });
     } catch (e) {
       console.debug('[MMS] could not refresh tab', tab.id, e && e.message);
     }
@@ -1085,10 +1101,14 @@ async function notify(n) {
   if (rec.isMine) return;
   if (n.kind === 'unsent' && !s.notifyOnUnsend) return;
   if (n.kind === 'edited' && !s.notifyOnEdit) return;
-  const who = rec.senderName || (await contactName(rec.senderId)) || (await threadName(rec.threadKey)) || 'Someone';
-  const what = normalizeText(rec.text) || (rec.attachments && rec.attachments.length ? '[photo / attachment]' : '');
-  const title = n.kind === 'unsent' ? `${who} unsent a message` : `${who} edited a message`;
-  const message = n.kind === 'unsent' ? `"${what.slice(0, 220)}"` : `Before: "${normalizeText((rec.history || []).slice(-1)[0]?.text).slice(0, 100)}"\nNow: "${what.slice(0, 100)}"`;
+  const who = rec.senderName || (await contactName(rec.senderId)) || (await threadName(rec.threadKey)) || (await L('notify.someone'));
+  const what = normalizeText(rec.text) || (rec.attachments && rec.attachments.length ? await L('att.photoOrAttachment') : '');
+  const title = await L(n.kind === 'unsent' ? 'notify.unsent' : 'notify.edited', { who });
+  let message;
+  // with the PIN lock on, the alert names the person but never shows the text
+  if (await isLockOn()) message = await L('notify.lockedBody');
+  else if (n.kind === 'unsent') message = `"${what.slice(0, 220)}"`;
+  else message = await L('notify.editBody', { before: normalizeText((rec.history || []).slice(-1)[0]?.text).slice(0, 100), now: what.slice(0, 100) });
   try {
     await chrome.notifications.create('mms|' + encodeURIComponent(rec.threadKey) + '|' + Date.now(), {
       type: 'basic',
@@ -1155,8 +1175,8 @@ chrome.commands.onCommand.addListener(async (command) => {
     await chrome.notifications.create('mms-unseen|' + Date.now(), {
       type: 'basic',
       iconUrl: chrome.runtime.getURL('icons/icon128.png'),
-      title: (!s.enabled ? 'Messenger Message Saver is back on. ' : '') + (next.blockSeen ? 'Unseen mode is ON' : 'Unseen mode is OFF'),
-      message: next.blockSeen ? 'People will not see "Seen" when you read.' : 'Messenger will show "Seen" again when you read.',
+      title: (!s.enabled ? await L('unseen.backOn') : '') + (await L(next.blockSeen ? 'unseen.on' : 'unseen.off')),
+      message: await L(next.blockSeen ? 'unseen.onBody' : 'unseen.offBody'),
       priority: 0,
     });
   } catch (e) {

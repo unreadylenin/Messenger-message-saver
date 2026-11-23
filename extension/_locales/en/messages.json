@@ -1,0 +1,18 @@
+{
+  "appName": {
+    "message": "Messenger Message Saver",
+    "description": "Extension name (the Web Store package uses its own name)."
+  },
+  "appDesc": {
+    "message": "Keeps a private copy of your Messenger chats so unsent messages stay readable. Unseen mode, photo/video downloads, Bangla.",
+    "description": "Max 132 characters (Web Store summary)."
+  },
+  "actionTitle": {
+    "message": "Messenger Message Saver",
+    "description": "Toolbar button tooltip."
+  },
+  "cmdToggleUnseen": {
+    "message": "Turn Unseen mode on or off",
+    "description": "Keyboard shortcut description."
+  }
+}

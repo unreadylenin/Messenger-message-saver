@@ -47,7 +47,7 @@ test('Messenger Message Saver end to end', { timeout: 420000 }, async (t) => {
     channel: 'chromium',
     headless: true,
     viewport: { width: 1280, height: 860 },
-    args: [`--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`],
+    args: ['--lang=en-US', `--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`],
   });
   const errors = [];
   t.after(async () => {

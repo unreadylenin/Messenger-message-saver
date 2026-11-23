@@ -3,12 +3,26 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Saved Messages</title>
+    <title data-i18n="page.title">Saved Messages</title>
     <link rel="icon" href="../icons/icon32.png" />
     <link rel="stylesheet" href="../lib/ui.css" />
     <link rel="stylesheet" href="dashboard.css" />
   </head>
   <body>
+    <!-- shown instead of everything else while the PIN lock is on and the page is locked -->
+    <div id="lock-screen" class="lock-screen" hidden>
+      <form id="lock-form" class="lock-card" autocomplete="off">
+        <img src="../icons/icon48.png" alt="" width="40" height="40" />
+        <h1 data-i18n="lock.title">Saved messages are locked</h1>
+        <label for="lock-pin" data-i18n="lock.label">Enter your PIN</label>
+        <input id="lock-pin" type="password" inputmode="numeric" maxlength="12" autocomplete="off" />
+        <button id="lock-submit" class="btn primary" type="submit" data-i18n="lock.submit">Unlock</button>
+        <p id="lock-error" class="lock-error" role="alert" hidden></p>
+        <button id="lock-forgot" class="linklike" type="button" data-i18n="lock.forgot">Forgot PIN?</button>
+        <p class="muted small" data-i18n="lock.honest">The PIN keeps other people who use this computer out of Saved Messages. It does not encrypt the files on the disk.</p>
+      </form>
+    </div>
+
     <header class="bar">
       <div class="brand">
         <img src="../icons/icon48.png" alt="" width="30" height="30" />
@@ -17,40 +31,48 @@
           <span class="muted small" id="totals-line"></span>
         </div>
       </div>
-      <input id="search" type="search" placeholder="Search all saved messages…" autocomplete="off" aria-label="Search all saved messages" />
+      <input id="search" type="search" placeholder="Search all saved messages…" data-i18n-placeholder="search.ph" autocomplete="off" aria-label="Search all saved messages" data-i18n-aria-label="search.ph" />
       <nav class="tabs" role="tablist">
-        <button role="tab" data-view="unsent" aria-selected="true">Unsent &amp; deleted <span class="count" id="c-unsent"></span></button>
-        <button role="tab" data-view="chats">Chats</button>
-        <button role="tab" data-view="edited">Edited <span class="count" id="c-edited"></span></button>
-        <button role="tab" data-view="notifications">Notifications</button>
-        <button role="tab" data-view="settings">Settings</button>
-        <button role="tab" data-view="help">Help</button>
+        <button role="tab" data-view="unsent" aria-selected="true"><span data-i18n="tab.unsent">Unsent &amp; deleted</span> <span class="count" id="c-unsent"></span></button>
+        <button role="tab" data-view="chats"><span data-i18n="tab.chats">Chats</span></button>
+        <button role="tab" data-view="edited"><span data-i18n="tab.edited">Edited</span> <span class="count" id="c-edited"></span></button>
+        <button role="tab" data-view="notifications"><span data-i18n="tab.notifications">Notifications</span></button>
+        <button role="tab" data-view="settings"><span data-i18n="tab.settings">Settings</span></button>
+        <button role="tab" data-view="help"><span data-i18n="tab.help">Help</span></button>
       </nav>
+      <button class="btn small" id="lock-now" type="button" hidden data-i18n="lock.now">🔒 Lock now</button>
     </header>
 
     <div id="paused-banner" class="paused-banner" hidden>
-      ⏸️ Messenger Message Saver is paused: nothing is saved, and others can see “Seen” and “typing…”.
-      <label class="switch" title="Turn everything back on"><input type="checkbox" data-setting="enabled" aria-label="Turn Messenger Message Saver on" /><span></span></label>
+      <span data-i18n="paused.banner">⏸️ Messenger Message Saver is paused: nothing is saved, and others can see “Seen” and “typing…”.</span>
+      <label class="switch" title="Turn everything back on" data-i18n-title="paused.switchTitle"><input type="checkbox" data-setting="enabled" aria-label="Turn Messenger Message Saver on" data-i18n-aria-label="paused.switchAria" /><span></span></label>
     </div>
 
     <div id="welcome" class="welcome" hidden>
-      <h1>You're set up 🎉</h1>
+      <h1 data-i18n="welcome.title">You're set up 🎉</h1>
+      <div class="lang-choice">
+        <span data-i18n="welcome.lang">Language:</span>
+        <button class="chip" type="button" data-lang="en">English</button>
+        <button class="chip" type="button" data-lang="bn">বাংলা</button>
+      </div>
       <ol>
-        <li><b>Reload</b> any Facebook or Messenger tab that was already open.</li>
-        <li>Chat as usual. Messages are saved on this computer as they arrive or appear on screen.</li>
-        <li>When someone unsends, the original appears right under <i>“unsent a message”</i>, and here.</li>
-        <li><b>Unseen mode</b> is on: people won't see “Seen” when you read. Turn it off any time from the toolbar icon.</li>
+        <li data-i18n-rich="welcome.1"><b>Reload</b> any Facebook or Messenger tab that was already open.</li>
+        <li data-i18n-rich="welcome.2">Chat as usual. Messages are saved on this computer as they arrive or appear on screen.</li>
+        <li data-i18n-rich="welcome.3">When someone unsends, the original appears right under <i>“unsent a message”</i>, and here.</li>
+        <li data-i18n-rich="welcome.4"><b>Unseen mode</b> is on: people won't see “Seen” when you read. Turn it off any time from the toolbar icon.</li>
       </ol>
-      <button class="btn primary" id="welcome-close">Got it</button>
+      <h2 class="welcome-h2" data-i18n="welcome.storesTitle">What this stores, and where</h2>
+      <p class="small" data-i18n-rich="welcome.stores"></p>
+      <button class="btn primary" id="welcome-close" data-i18n="welcome.ok">Got it</button>
     </div>
 
     <main>
       <section id="view-unsent" class="view" data-view="unsent">
         <div class="view-head">
-          <h2>Unsent &amp; deleted messages</h2>
+          <h2 data-i18n="unsent.title">Unsent &amp; deleted messages</h2>
           <div class="chips" id="unsent-filter">
-            <button class="chip on" data-f="recovered">Recovered</button>
-            <button class="chip" data-f="all">All (incl. not captured)</button>
+            <button class="chip on" data-f="recovered" data-i18n="unsent.recovered">Recovered</button>
+            <button class="chip" data-f="all" data-i18n="unsent.all">All (incl. not captured)</button>
           </div>
         </div>
         <div id="unsent-list" class="cards"></div>
@@ -58,21 +80,21 @@
 
       <section id="view-chats" class="view" data-view="chats" hidden>
         <aside class="threads">
-          <input id="thread-filter" type="search" placeholder="Find a chat…" aria-label="Find a chat" />
+          <input id="thread-filter" type="search" placeholder="Find a chat…" data-i18n-placeholder="chats.find" aria-label="Find a chat" data-i18n-aria-label="chats.find" />
           <ul id="thread-list"></ul>
         </aside>
         <div class="thread-pane">
           <div class="view-head">
-            <h2 id="thread-title">Pick a chat</h2>
+            <h2 id="thread-title" data-i18n="chats.pick">Pick a chat</h2>
             <div class="chips" id="msg-filter">
-              <button class="chip on" data-f="all">All</button>
-              <button class="chip" data-f="unsent">Unsent</button>
-              <button class="chip" data-f="edited">Edited</button>
-              <button class="chip" data-f="media">Photos</button>
+              <button class="chip on" data-f="all" data-i18n="filter.all">All</button>
+              <button class="chip" data-f="unsent" data-i18n="filter.unsent">Unsent</button>
+              <button class="chip" data-f="edited" data-i18n="filter.edited">Edited</button>
+              <button class="chip" data-f="media" data-i18n="filter.media">Photos</button>
             </div>
             <div class="thread-actions">
-              <button class="btn small" id="export-thread">Export chat</button>
-              <button class="btn small" id="delete-thread">Delete chat data</button>
+              <button class="btn small" id="export-thread" data-i18n="chats.export">Export chat</button>
+              <button class="btn small" id="delete-thread" data-i18n="chats.delete">Delete chat data</button>
             </div>
           </div>
           <div id="thread-messages" class="timeline"></div>
@@ -80,19 +102,19 @@
       </section>
 
       <section id="view-edited" class="view" data-view="edited" hidden>
-        <div class="view-head"><h2>Edited messages</h2></div>
+        <div class="view-head"><h2 data-i18n="edited.title">Edited messages</h2></div>
         <div id="edited-list" class="cards"></div>
       </section>
 
       <section id="view-search" class="view" data-view="search" hidden>
-        <div class="view-head"><h2 id="search-title">Search</h2></div>
+        <div class="view-head"><h2 id="search-title" data-i18n="search.title">Search</h2></div>
         <div id="search-list" class="cards"></div>
       </section>
 
       <section id="view-notifications" class="view" data-view="notifications" hidden>
         <div class="view-head">
-          <h2>Messenger notifications</h2>
-          <p class="muted small">A backup copy of Messenger's own desktop notifications (sender and text). Useful when a message was unsent before you opened the chat.</p>
+          <h2 data-i18n="notif.title">Messenger notifications</h2>
+          <p class="muted small" data-i18n="notif.intro">A backup copy of Messenger's own desktop notifications (sender and text). Useful when a message was unsent before you opened the chat.</p>
         </div>
         <div id="notification-list" class="cards"></div>
       </section>
@@ -100,54 +122,73 @@
       <section id="view-settings" class="view" data-view="settings" hidden>
         <div class="settings-grid">
           <div class="panel">
-            <h3>Saving</h3>
-            <label class="srow"><span>Messenger Message Saver is on<small>Turn off to pause everything (saving and Unseen)</small></span><span class="switch"><input type="checkbox" data-setting="enabled" /><span></span></span></label>
-            <label class="srow"><span>Save messages</span><span class="switch"><input type="checkbox" data-setting="saveMessages" /><span></span></span></label>
-            <label class="srow"><span>Read Messenger's own data (normal chats)<small>Catches messages even before you open the chat</small></span><span class="switch"><input type="checkbox" data-setting="captureNetwork" /><span></span></span></label>
-            <label class="srow"><span>Read messages shown on screen<small>Needed for end-to-end encrypted chats</small></span><span class="switch"><input type="checkbox" data-setting="captureDom" /><span></span></span></label>
-            <label class="srow"><span>Keep copies of Messenger notifications</span><span class="switch"><input type="checkbox" data-setting="captureNotifications" /><span></span></span></label>
-            <label class="srow"><span>Save photos and stickers</span><span class="switch"><input type="checkbox" data-setting="saveMedia" /><span></span></span></label>
-            <label class="srow"><span>Largest photo to keep (MB)<small>Up to 40 MB</small></span><input type="number" min="1" max="40" step="1" data-setting="maxMediaMB" class="num" /></label>
-            <label class="srow"><span>Delete saved messages older than (days)<small>0 = keep forever</small></span><input type="number" min="0" max="3650" step="1" data-setting="retentionDays" class="num" /></label>
+            <h3 data-i18n="set.saving">Saving</h3>
+            <label class="srow"><span><span data-i18n="set.enabled">Messenger Message Saver is on</span><small data-i18n="set.enabled.hint">Turn off to pause everything (saving and Unseen)</small></span><span class="switch"><input type="checkbox" data-setting="enabled" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.saveMessages">Save messages</span></span><span class="switch"><input type="checkbox" data-setting="saveMessages" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.captureNetwork">Read Messenger's own data (normal chats)</span><small data-i18n="set.captureNetwork.hint">Catches messages even before you open the chat</small></span><span class="switch"><input type="checkbox" data-setting="captureNetwork" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.captureDom">Read messages shown on screen</span><small data-i18n="set.captureDom.hint">Needed for end-to-end encrypted chats</small></span><span class="switch"><input type="checkbox" data-setting="captureDom" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.captureNotifications">Keep copies of Messenger notifications</span></span><span class="switch"><input type="checkbox" data-setting="captureNotifications" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.saveMedia">Save photos and stickers</span></span><span class="switch"><input type="checkbox" data-setting="saveMedia" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.maxMediaMB">Largest photo to keep (MB)</span><small data-i18n="set.maxMediaMB.hint">Up to 40 MB</small></span><input type="number" min="1" max="40" step="1" data-setting="maxMediaMB" class="num" /></label>
+            <label class="srow"><span><span data-i18n="set.retentionDays">Delete saved messages older than (days)</span><small data-i18n="set.retentionDays.hint">0 = keep forever</small></span><input type="number" min="0" max="3650" step="1" data-setting="retentionDays" class="num" /></label>
           </div>
           <div class="panel">
-            <h3>Showing</h3>
-            <label class="srow"><span>Show unsent messages inside the chat</span><span class="switch"><input type="checkbox" data-setting="showRecoveredInline" /><span></span></span></label>
-            <label class="srow"><span>Show earlier text of edited messages</span><span class="switch"><input type="checkbox" data-setting="showEditHistoryInline" /><span></span></span></label>
-            <label class="srow"><span>Desktop alert when someone unsends</span><span class="switch"><input type="checkbox" data-setting="notifyOnUnsend" /><span></span></span></label>
-            <label class="srow"><span>Desktop alert when someone edits</span><span class="switch"><input type="checkbox" data-setting="notifyOnEdit" /><span></span></span></label>
-            <label class="srow"><span>Count new unsent messages on the toolbar icon</span><span class="switch"><input type="checkbox" data-setting="badge" /><span></span></span></label>
+            <h3 data-i18n="set.showing">Showing</h3>
+            <label class="srow"><span><span data-i18n="set.showRecoveredInline">Show unsent messages inside the chat</span></span><span class="switch"><input type="checkbox" data-setting="showRecoveredInline" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.showEditHistoryInline">Show earlier text of edited messages</span></span><span class="switch"><input type="checkbox" data-setting="showEditHistoryInline" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.notifyOnUnsend">Desktop alert when someone unsends</span></span><span class="switch"><input type="checkbox" data-setting="notifyOnUnsend" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.notifyOnEdit">Desktop alert when someone edits</span></span><span class="switch"><input type="checkbox" data-setting="notifyOnEdit" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.badge">Count new unsent messages on the toolbar icon</span></span><span class="switch"><input type="checkbox" data-setting="badge" /><span></span></span></label>
           </div>
           <div class="panel">
-            <h3>Unseen</h3>
-            <label class="srow"><span>Don't send “Seen”</span><span class="switch"><input type="checkbox" data-setting="blockSeen" /><span></span></span></label>
-            <label class="srow"><span>Strong mode for encrypted chats<small>On facebook.com/messages and messenger.com only, Messenger is told the window is not focused, so it does not report “Seen”. Read encrypted chats there, not in chat pop-ups. Side effect: Messenger may play its message sound or show a notification while you are reading.</small></span><span class="switch"><input type="checkbox" data-setting="stealthFocus" /><span></span></span></label>
-            <label class="srow"><span>Extra: also report the tab as hidden<small>Only if Strong mode alone is not enough (Messenger pages only). With several Facebook tabs open, encrypted chats can stop loading until you reload the tab.</small></span><span class="switch"><input type="checkbox" data-setting="stealthVisibility" /><span></span></span></label>
-            <label class="srow"><span>Don't show “typing…”<small>Works in normal (not end-to-end encrypted) chats</small></span><span class="switch"><input type="checkbox" data-setting="blockTyping" /><span></span></span></label>
-            <p class="muted small">Replying to a chat always shows “Seen” - that is how Messenger works. Right after installing or updating, reload open Facebook tabs so every chat is covered.</p>
+            <h3 data-i18n="set.unseen">Unseen</h3>
+            <label class="srow"><span><span data-i18n="set.blockSeen">Don’t send “Seen”</span></span><span class="switch"><input type="checkbox" data-setting="blockSeen" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.stealthFocus">Strong mode for encrypted chats</span><small data-i18n="set.stealthFocus.hint">On facebook.com/messages and messenger.com only, Messenger is told the window is not focused, so it does not report “Seen”. Read encrypted chats there, not in chat pop-ups. Side effect: Messenger may play its message sound or show a notification while you are reading.</small></span><span class="switch"><input type="checkbox" data-setting="stealthFocus" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.stealthVisibility">Extra: also report the tab as hidden</span><small data-i18n="set.stealthVisibility.hint">Only if Strong mode alone is not enough (Messenger pages only). With several Facebook tabs open, encrypted chats can stop loading until you reload the tab.</small></span><span class="switch"><input type="checkbox" data-setting="stealthVisibility" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.blockTyping">Don’t show “typing…”</span><small data-i18n="set.blockTyping.hint">Works in normal (not end-to-end encrypted) chats</small></span><span class="switch"><input type="checkbox" data-setting="blockTyping" /><span></span></span></label>
+            <p class="muted small" data-i18n="set.unseen.note">Replying to a chat always shows “Seen” - that is how Messenger works. Right after installing or updating, reload open Facebook tabs so every chat is covered.</p>
           </div>
           <div class="panel">
-            <h3>Downloads</h3>
-            <label class="srow"><span>Download buttons on photos, videos and reels<small>Point at a photo, video or reel on Facebook or Messenger and press “⬇”. Right-click → “Download this photo or video” works too.</small></span><span class="switch"><input type="checkbox" data-setting="downloadButtons" /><span></span></span></label>
-            <label class="srow"><span>Video quality<small>HD when Facebook offers it; SD makes smaller files</small></span><select data-setting="downloadQuality" class="num sel"><option value="hd">Best (HD)</option><option value="sd">Smaller (SD)</option></select></label>
-            <label class="srow"><span>Ask where to save each file<small>Off: files go to Downloads › Facebook</small></span><span class="switch"><input type="checkbox" data-setting="downloadAsk" /><span></span></span></label>
-            <p class="muted small">Download only what you have the right to keep, such as your own posts or photos friends sent you.</p>
+            <h3 data-i18n="set.downloads">Downloads</h3>
+            <label class="srow"><span><span data-i18n="set.downloadButtons">Download buttons on photos, videos and reels</span><small data-i18n="set.downloadButtons.hint">Point at a photo, video or reel on Facebook or Messenger and press “⬇”. Right-click → “Download this photo or video” works too.</small></span><span class="switch"><input type="checkbox" data-setting="downloadButtons" /><span></span></span></label>
+            <label class="srow"><span><span data-i18n="set.downloadQuality">Video quality</span><small data-i18n="set.downloadQuality.hint">HD when Facebook offers it; SD makes smaller files</small></span><select data-setting="downloadQuality" class="num sel"><option value="hd" data-i18n="set.q.hd">Best (HD)</option><option value="sd" data-i18n="set.q.sd">Smaller (SD)</option></select></label>
+            <label class="srow"><span><span data-i18n="set.downloadAsk">Ask where to save each file</span><small data-i18n="set.downloadAsk.hint">Off: files go to Downloads › Facebook</small></span><span class="switch"><input type="checkbox" data-setting="downloadAsk" /><span></span></span></label>
+            <p class="muted small" data-i18n="set.downloads.note">Download only what you have the right to keep, such as your own posts or photos friends sent you.</p>
           </div>
           <div class="panel">
-            <h3>Backup</h3>
-            <div class="btn-col">
-              <button class="btn" id="export-json">Download backup (with photos)</button>
-              <button class="btn" id="export-json-light">Download backup (text only)</button>
-              <button class="btn" id="export-html">Download as readable web page</button>
-              <button class="btn" id="export-csv">Download as spreadsheet (CSV)</button>
-              <label class="btn file-btn">Restore a backup…<input type="file" id="import-json" accept="application/json,.json" /></label>
+            <h3 data-i18n="set.language">Language / ভাষা</h3>
+            <label class="srow"><span><span data-i18n="set.language.label">Show this extension in</span><small data-i18n="set.language.hint">Automatic follows the browser’s language</small></span><select data-setting="uiLanguage" class="num sel"><option value="auto" data-i18n="set.lang.auto">Automatic</option><option value="en">English</option><option value="bn">বাংলা</option></select></label>
+          </div>
+          <div class="panel" id="privacy-panel">
+            <h3 data-i18n="privacy.title">Privacy</h3>
+            <p class="muted small" data-i18n="privacy.intro">Lock Saved Messages with a PIN. People who use this computer then cannot open your saved messages, backups or settings without it.</p>
+            <div id="pin-off">
+              <label class="srow"><span><span data-i18n="privacy.newPin">New PIN (4–12 digits)</span></span><input type="password" id="pin-new" inputmode="numeric" autocomplete="new-password" maxlength="12" class="num pin" /></label>
+              <label class="srow"><span><span data-i18n="privacy.repeat">Type it again</span></span><input type="password" id="pin-repeat" inputmode="numeric" autocomplete="new-password" maxlength="12" class="num pin" /></label>
+              <button class="btn" id="pin-set" type="button" data-i18n="privacy.set">Turn on the PIN lock</button>
             </div>
-            <h3 class="danger-h">Danger zone</h3>
-            <button class="btn danger" id="delete-all">Delete everything saved</button>
+            <div id="pin-on" hidden>
+              <p class="small" data-i18n="privacy.on">🔒 The PIN lock is on.</p>
+              <label class="srow"><span><span data-i18n="privacy.current">Current PIN</span></span><input type="password" id="pin-current" inputmode="numeric" autocomplete="current-password" maxlength="12" class="num pin" /></label>
+              <button class="btn" id="pin-remove" type="button" data-i18n="privacy.remove">Turn off the PIN lock</button>
+            </div>
+            <p class="muted small" data-i18n="privacy.honest">Honest note: the PIN stops people who use this computer from opening Saved Messages. It does not encrypt the files on the disk.</p>
+          </div>
+          <div class="panel">
+            <h3 data-i18n="set.backup">Backup</h3>
+            <div class="btn-col">
+              <button class="btn" id="export-json" data-i18n="backup.full">Download backup (with photos)</button>
+              <button class="btn" id="export-json-light" data-i18n="backup.light">Download backup (text only)</button>
+              <button class="btn" id="export-html" data-i18n="backup.html">Download as readable web page</button>
+              <button class="btn" id="export-csv" data-i18n="backup.csv">Download as spreadsheet (CSV)</button>
+              <label class="btn file-btn"><span data-i18n="backup.restore">Restore a backup…</span><input type="file" id="import-json" accept="application/json,.json" /></label>
+            </div>
+            <h3 class="danger-h" data-i18n="set.danger">Danger zone</h3>
+            <button class="btn danger" id="delete-all" data-i18n="set.deleteAll">Delete everything saved</button>
           </div>
           <div class="panel wide">
-            <h3>Diagnostics</h3>
-            <p class="muted small">What the extension sees in your open Facebook / Messenger tabs. If “gateway sockets” stays 0, Messenger may have changed how it connects; messages are then saved from the screen only.</p>
+            <h3 data-i18n="set.diag">Diagnostics</h3>
+            <p class="muted small" data-i18n="set.diag.intro">What the extension sees in your open Facebook / Messenger tabs. If “gateway sockets” stays 0, Messenger may have changed how it connects; messages are then saved from the screen only.</p>
             <div id="diag"></div>
           </div>
         </div>
@@ -155,25 +196,27 @@
 
       <section id="view-help" class="view" data-view="help" hidden>
         <div class="help">
-          <h2>How it works</h2>
+          <h2 data-i18n="help.how">How it works</h2>
           <ul>
-            <li><b>Saving.</b> While a Facebook or Messenger tab is open, the extension keeps a private copy of messages: from Messenger's own data for normal chats, and from what is shown on screen for every chat (including end-to-end encrypted ones). Everything stays on this computer.</li>
-            <li><b>Unsent messages.</b> When someone unsends, Messenger shows “… unsent a message”. The saved original appears right under it, in the <i>Unsent &amp; deleted</i> tab, and as a desktop alert.</li>
-            <li><b>Edited messages.</b> Earlier versions are kept and shown under the edited message.</li>
-            <li><b>Unseen.</b> “Seen” is not sent when you read. In normal chats the read marker is held back everywhere. In encrypted chats this works through <i>Strong mode</i>, which tells Messenger the window is not focused; it runs only on facebook.com/messages and messenger.com, so read encrypted chats there rather than in the small chat pop-ups. Check it once with a friend.</li>
-            <li><b>Downloads.</b> Point at a photo, video or reel and press the “⬇” button that appears on it (or right-click → “Download this photo or video”). Videos are saved in HD with sound when Facebook offers it; photos at the largest size the page has. Files go to Downloads › Facebook.</li>
+            <li data-i18n-rich="help.saving"></li>
+            <li data-i18n-rich="help.unsent"></li>
+            <li data-i18n-rich="help.edited"></li>
+            <li data-i18n-rich="help.unseen"></li>
+            <li data-i18n-rich="help.downloads"></li>
+            <li data-i18n-rich="help.language"></li>
+            <li data-i18n-rich="help.lock"></li>
           </ul>
-          <h2>Limits</h2>
+          <h2 data-i18n="help.limits">Limits</h2>
           <ul>
-            <li>A message can only be recovered if it reached this browser before it was unsent: Messenger must have been open in a tab (a chat pop-up or the Messages page). Messages unsent while Facebook was closed cannot be recovered.</li>
-            <li>In end-to-end encrypted chats the message must have been <b>shown on screen</b> at least once (the chat pop-up or chat page was open), or have arrived as a Messenger notification.</li>
-            <li>“Typing…” can only be hidden in normal chats.</li>
-            <li>In chat pop-ups on the news feed, encrypted chats can still send “Seen” (Strong mode is kept off there so Facebook’s feed, Watch and Reels keep loading).</li>
-            <li>If Facebook only offers a video as separate picture and sound files, both files are saved; a video player such as VLC can play them, or they can be joined with a video editor.</li>
-            <li>Facebook changes its website often. If something stops working, check <i>Settings → Diagnostics</i>.</li>
+            <li data-i18n-rich="help.lim1"></li>
+            <li data-i18n-rich="help.lim2"></li>
+            <li data-i18n-rich="help.lim3"></li>
+            <li data-i18n-rich="help.lim4"></li>
+            <li data-i18n-rich="help.lim5"></li>
+            <li data-i18n-rich="help.lim6"></li>
           </ul>
-          <h2>Privacy</h2>
-          <p>No data leaves your computer. The extension has no servers and sends nothing anywhere. Uninstalling it deletes everything it saved.</p>
+          <h2 data-i18n="help.privacy">Privacy</h2>
+          <p data-i18n="help.privacyText">No data leaves your computer.</p>
         </div>
       </section>
     </main>
@@ -182,7 +225,7 @@
       <form method="dialog">
         <p id="confirm-text"></p>
         <div class="dlg-actions">
-          <button value="cancel" class="btn">Cancel</button>
+          <button value="cancel" class="btn" data-i18n="dlg.cancel">Cancel</button>
           <button value="ok" class="btn danger" id="confirm-ok">Delete</button>
         </div>
       </form>

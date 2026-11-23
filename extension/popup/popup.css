@@ -193,3 +193,32 @@ body {
 .bottom .primary {
   flex: 1;
 }
+
+/* EN | বাং language switch */
+.lang-switch {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.lang-switch button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: 600 11px/1 inherit;
+  padding: 6px 7px;
+  cursor: pointer;
+}
+
+.lang-switch button.on {
+  background: var(--brand);
+  color: #fff;
+}
+
+.lang-switch button:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: -2px;
+}

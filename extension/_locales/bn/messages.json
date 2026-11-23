@@ -1,0 +1,14 @@
+{
+  "appName": {
+    "message": "Messenger Message Saver"
+  },
+  "appDesc": {
+    "message": "আপনার Messenger চ্যাটের ব্যক্তিগত কপি রাখে, তাই আনসেন্ড করা মেসেজও পড়া যায়। Unseen মোড, ছবি/ভিডিও ডাউনলোড, বাংলা।"
+  },
+  "actionTitle": {
+    "message": "Messenger Message Saver"
+  },
+  "cmdToggleUnseen": {
+    "message": "Unseen মোড চালু বা বন্ধ করুন"
+  }
+}

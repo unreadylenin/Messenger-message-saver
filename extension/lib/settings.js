@@ -26,6 +26,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
   downloadButtons: true, // a Download button on photos, videos and reels, plus a right-click menu item
   downloadQuality: 'hd', // 'hd' = best quality, 'sd' = smaller file
   downloadAsk: false, // ask where to save each file (otherwise Downloads/Facebook)
+  // --- interface ---
+  uiLanguage: 'auto', // 'auto' (browser language), 'en' or 'bn' (বাংলা)
 });
 
 export async function getSettings() {

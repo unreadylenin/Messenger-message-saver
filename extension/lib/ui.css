@@ -49,7 +49,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.4 system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans Bengali', sans-serif;
+  font: 14px/1.4 system-ui, -apple-system, 'Segoe UI', 'Nirmala UI', Roboto, 'Noto Sans Bengali', sans-serif;
 }
 
 .muted {
