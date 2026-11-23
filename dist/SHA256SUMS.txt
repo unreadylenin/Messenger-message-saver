@@ -1,0 +1,2 @@
+b2e5e2280a05729bf8fe034d94570584106d34ae5b897ce4bb304fb7cca1c1de  MessengerMessageSaver-v1.2.0-share.zip
+5c390d761b900e1233f5cd24a36929b767875d86f81ea95697b8278029e70f56  MessageSaverForMessenger-v1.2.0-webstore.zip
