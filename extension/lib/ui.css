@@ -1,0 +1,182 @@
+/* Shared look for the popup and the dashboard. */
+:root {
+  --bg: #ffffff;
+  --bg-soft: #f0f2f5;
+  --bg-card: #ffffff;
+  --text: #1c1e21;
+  --muted: #65676b;
+  --line: #dadde1;
+  --brand: #0866ff;
+  --brand-text: #0866ff;
+  --brand-2: #a033ff;
+  --danger: #e0245e;
+  --danger-soft: rgba(224, 36, 94, 0.1);
+  --edit: #0a7cff;
+  --edit-soft: rgba(10, 124, 255, 0.08);
+  --ok: #1b8a3a;
+  --radius: 12px;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.08), 0 4px 16px rgba(0, 0, 0, 0.06);
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #18191a;
+    --bg-soft: #242526;
+    --bg-card: #242526;
+    --text: #e4e6eb;
+    --muted: #b0b3b8;
+    --line: #3a3b3c;
+    --brand-text: #6aa7ff;
+    --danger: #ff7a9c;
+    --danger-soft: rgba(255, 122, 156, 0.16);
+    --edit: #7cb8ff;
+    --edit-soft: rgba(124, 184, 255, 0.14);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.4 system-ui, -apple-system, 'Segoe UI', 'Nirmala UI', Roboto, 'Noto Sans Bengali', sans-serif;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.small {
+  font-size: 12px;
+}
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--bg-soft);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn:hover {
+  filter: brightness(0.97);
+}
+
+.btn:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.btn.primary {
+  background: linear-gradient(135deg, var(--brand), var(--brand-2));
+  border-color: transparent;
+  color: #fff;
+}
+
+.btn.danger {
+  color: #fff;
+  background: var(--danger);
+  border-color: transparent;
+}
+
+.btn.small {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+/* toggle switch */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 40px;
+  height: 22px;
+  flex: none;
+}
+
+.switch input {
+  position: absolute;
+  opacity: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  cursor: pointer;
+  z-index: 1;
+}
+
+.switch span {
+  position: absolute;
+  inset: 0;
+  border-radius: 22px;
+  background: var(--line);
+  transition: background 0.15s;
+}
+
+.switch span::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  transition: transform 0.15s;
+}
+
+.switch input:checked + span {
+  background: var(--brand);
+}
+
+.switch input:checked + span::after {
+  transform: translateX(18px);
+}
+
+.switch input:disabled + span {
+  opacity: 0.5;
+}
+
+.switch input:focus-visible + span {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.paused .needs-on {
+  opacity: 0.45;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: var(--bg-soft);
+  color: var(--muted);
+}
+
+.badge.unsent {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.badge.edited {
+  background: var(--edit-soft);
+  color: var(--edit);
+}

@@ -1,0 +1,1658 @@
+/*
+ * Messenger Message Saver - content script (extension's private "isolated world").
+ *
+ * 1. Passes settings to the page hook (main-world.js) and forwards what it captures
+ *    to the background worker.
+ * 2. Reads the messages shown on screen (chat pop-ups on facebook.com, the full
+ *    facebook.com/messages page and messenger.com). This also works for end-to-end
+ *    encrypted chats, whose network traffic cannot be read.
+ * 3. Under every "X unsent a message" it shows the saved original, and under edited
+ *    messages it shows the earlier text.
+ *
+ * Page structure used (checked against live captures, Oct-Nov 2026):
+ *   message list  : [role="log"]
+ *   message row   : [data-scope="messages_table"] with aria-roledescription="message",
+ *                   data-message-id="<sender id>@msgr.<id>", aria-label="At <time>, <Sender>: <text>"
+ *   date separator: [data-scope="date_break"]
+ *   text          : span[dir="auto"] > div[dir="auto"] (emoji are <img alt="😀">)
+ *   chat window   : [data-mw-file-dropzone] with the chat name in the heading above the log
+ * Facebook's CSS class names are never used: they change every few weeks.
+ */
+(() => {
+  'use strict';
+
+  // One live copy per tab. After the extension is updated, reloaded or re-enabled, the
+  // background worker injects a fresh copy; an old copy whose extension context is gone
+  // steps aside (and stops itself, see invalidated()).
+  const runtimeRef = chrome.runtime;
+  const instance = { id: Math.random().toString(36).slice(2), t: Date.now() };
+  const prev = window.__mmsContent;
+  if (prev && typeof prev.alive === 'function' && prev.alive()) return;
+  if (prev && typeof prev.stop === 'function') {
+    try {
+      prev.stop();
+    } catch (e) {
+      /* already gone */
+    }
+  }
+
+  const CHANNEL_OUT = '__mms_page_to_ext__'; // page hook -> here
+  const CHANNEL_IN = '__mms_ext_to_page__'; // here -> page hook
+
+  const DEFAULT_SETTINGS = {
+    enabled: true,
+    saveMessages: true,
+    captureNetwork: true,
+    captureDom: true,
+    captureNotifications: true,
+    saveMedia: true,
+    maxMediaMB: 15,
+    retentionDays: 0,
+    showRecoveredInline: true,
+    showEditHistoryInline: true,
+    notifyOnUnsend: true,
+    notifyOnEdit: false,
+    badge: true,
+    blockSeen: true,
+    stealthFocus: true,
+    stealthVisibility: false,
+    blockTyping: true,
+    downloadButtons: true,
+    downloadQuality: 'hd',
+    downloadAsk: false,
+    uiLanguage: 'auto',
+  };
+
+  let settings = { ...DEFAULT_SETTINGS };
+
+  // interface language of the boxes and buttons this script adds to Facebook (lib/i18n.js runs first)
+  const I18N = globalThis.MMS_I18N || null;
+  let uiLang = 'en';
+  function updateLang() {
+    uiLang = I18N ? I18N.resolve(settings.uiLanguage) : 'en';
+  }
+  function tr(key, vars) {
+    return I18N ? I18N.translate(uiLang, key, vars) : key;
+  }
+  updateLang();
+  let extensionAlive = true;
+  const domStats = { logs: 0, rows: 0, saved: 0, placeholders: 0, recovered: 0 };
+  const cleanups = []; // observers and timers to stop if this copy is retired
+
+  function runtimeAlive() {
+    try {
+      return !!(runtimeRef && runtimeRef.id);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  window.__mmsContent = {
+    alive: () => extensionAlive && runtimeAlive(),
+    stop: () => invalidated(true),
+  };
+
+  /* ---------------- talking to the background worker ---------------- */
+
+  function isInvalidation(e) {
+    return /context invalidated/i.test(String((e && e.message) || e)) || !runtimeAlive();
+  }
+
+  function send(msg) {
+    if (!extensionAlive) return Promise.resolve(null);
+    try {
+      return runtimeRef.sendMessage(msg).catch((e) => {
+        if (isInvalidation(e)) invalidated(false);
+        return null;
+      });
+    } catch (e) {
+      // e.g. "Message exceeded maximum allowed size": drop this message, keep working
+      if (isInvalidation(e)) invalidated(false);
+      else console.debug('[MMS] message not sent', e && e.message);
+      return Promise.resolve(null);
+    }
+  }
+
+  /**
+   * The extension was updated, reloaded, disabled or removed: stop this copy and give the
+   * page back to Facebook's normal behaviour (a newer copy, if any, takes over the page hook).
+   */
+  function invalidated(replaced) {
+    if (!extensionAlive) return;
+    extensionAlive = false;
+    for (const fn of cleanups.splice(0)) {
+      try {
+        fn();
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    if (!replaced) {
+      document.querySelectorAll('.mms-recovered, .mms-edit-history').forEach((el) => el.remove());
+      document.dispatchEvent(new CustomEvent(CHANNEL_IN, { detail: JSON.stringify({ type: 'settings', inst: instance, data: { enabled: false } }) }));
+    }
+  }
+
+  const aliveTimer = setInterval(() => {
+    if (!runtimeAlive()) invalidated(false);
+  }, 5000);
+  cleanups.push(() => clearInterval(aliveTimer));
+
+  function selfId() {
+    const m = /(?:^|;\s*)c_user=(\d+)/.exec(document.cookie || '');
+    return m ? m[1] : '';
+  }
+
+  /* ---------------- settings -> page hook ---------------- */
+
+  function pushSettingsToPage() {
+    const forPage = {
+      enabled: settings.enabled,
+      captureNetwork: settings.enabled && settings.saveMessages && settings.captureNetwork,
+      captureNotifications: settings.enabled && settings.saveMessages && settings.captureNotifications,
+      blockSeen: settings.enabled && settings.blockSeen,
+      blockTyping: settings.enabled && settings.blockTyping,
+      stealthFocus: settings.enabled && settings.blockSeen && settings.stealthFocus,
+      stealthVisibility: settings.enabled && settings.blockSeen && settings.stealthFocus && settings.stealthVisibility,
+    };
+    if (!extensionAlive) return;
+    document.dispatchEvent(new CustomEvent(CHANNEL_IN, { detail: JSON.stringify({ type: 'settings', inst: instance, data: forPage }) }));
+  }
+
+  chrome.storage.local.get('settings').then(({ settings: stored }) => {
+    settings = { ...DEFAULT_SETTINGS, ...(stored || {}) };
+    updateLang();
+    pushSettingsToPage();
+    startDom();
+  });
+
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !changes.settings) return;
+    settings = { ...DEFAULT_SETTINGS, ...(changes.settings.newValue || {}) };
+    const langBefore = uiLang;
+    updateLang();
+    if (uiLang !== langBefore) {
+      // redraw the boxes and the download button in the new language
+      removeInline('.mms-recovered');
+      removeInline('.mms-edit-history');
+      hideDownloadButton(true, true);
+    }
+    pushSettingsToPage();
+    if (!settings.enabled || !settings.showRecoveredInline) removeInline('.mms-recovered');
+    if (!settings.enabled || !settings.showEditHistoryInline) removeInline('.mms-edit-history');
+    if (!downloadsOn()) hideDownloadButton(true, true);
+    scheduleFullScan();
+  });
+
+  /* ---------------- page hook -> background ---------------- */
+
+  let lsBuffer = null;
+  let lsTimer = 0;
+
+  function mergeEvents(into, ev) {
+    for (const k of Object.keys(ev)) {
+      if (Array.isArray(ev[k])) {
+        if (!into[k]) into[k] = [];
+        into[k].push(...ev[k]);
+      }
+    }
+  }
+
+  function flushLs() {
+    lsTimer = 0;
+    if (!lsBuffer) return;
+    const events = lsBuffer;
+    lsBuffer = null;
+    send({ type: 'ingest-ls', events, ctx: { selfId: selfId(), url: location.href } });
+  }
+
+  const onPageMessage = (e) => {
+    let m;
+    try {
+      m = JSON.parse(String(e.detail));
+    } catch (err) {
+      return;
+    }
+    if (!m || typeof m !== 'object') return;
+    switch (m.type) {
+      case 'ls-events':
+        if (!settings.enabled || !settings.saveMessages) return;
+        lsBuffer = lsBuffer || {};
+        mergeEvents(lsBuffer, m.data || {});
+        if (!lsTimer) lsTimer = setTimeout(flushLs, 250);
+        break;
+      case 'notification':
+        if (settings.enabled && settings.saveMessages && settings.captureNotifications) send({ type: 'ingest-notification', notification: m.data });
+        break;
+      case 'unseen-actions':
+        send({ type: 'unseen-actions', actions: m.data });
+        break;
+      case 'diag':
+        send({ type: 'diag', diag: { ...(m.data || {}), dom: domStats } });
+        break;
+      case 'media-result':
+        onMediaResult(m.data);
+        break;
+      default:
+        break;
+    }
+  };
+  document.addEventListener(CHANNEL_OUT, onPageMessage);
+  cleanups.push(() => document.removeEventListener(CHANNEL_OUT, onPageMessage));
+
+  // The page hook buffers until it gets settings; send defaults right away so nothing
+  // waits on storage (real settings follow a few milliseconds later).
+  pushSettingsToPage();
+
+  /* ================================================================== */
+  /* On-screen capture                                                  */
+  /* ================================================================== */
+
+  // Placeholder text Messenger shows instead of an unsent / removed message.
+  // Seen live in 2026: "Alpha deleted a message", "You deleted a message"; Meta's own strings:
+  // "You unsent a message", "<first name> unsent a message", "A poll has been unsent."
+  const PLACEHOLDER_PATTERNS = [
+    /^(?:you|.{1,80}?) (?:unsent|deleted|removed) (?:a|an|this) (?:message|attachment|photo|video|voice message|poll)\.?$/i,
+    /^this message (?:was|has been) (?:unsent|deleted|removed)\.?$/i,
+    /^message (?:unsent|deleted|removed)\.?$/i,
+    /^a poll has been unsent\.?$/i,
+    /^(?:bạn|.{1,80}?) đã (?:thu hồi|xóa|xoá) (?:một )?tin nhắn\.?$/i, // Vietnamese
+    /^.{1,80}? (?:cofnął|cofnęła|cofnęłaś|cofnąłeś) wysłanie wiadomości\.?$/i, // Polish
+    /একটি (?:বার্তা|মেসেজ) (?:মুছে ফেলেছেন|আনসেন্ড করেছেন|সরিয়ে দিয়েছেন|সরিয়েছেন)/, // Bangla
+    /^এই (?:বার্তাটি|মেসেজটি) (?:মুছে ফেলা হয়েছে|সরানো হয়েছে|আনসেন্ড করা হয়েছে)/,
+    /(?:a annulé l’envoi d’un message|hat eine Nachricht zurückgerufen|anuló el envío de un mensaje|retirou o envio de uma mensagem|ha annullato l'invio di un messaggio|membatalkan pengiriman pesan)/i,
+  ];
+  let learnedPlaceholders = []; // RegExps learned on this computer for other UI languages
+
+  const EDITED_LABELS = new Set(['edited', 'hide edits', 'edytowano', 'সম্পাদিত', 'modifié', 'bearbeitet', 'editado', 'modificato', 'diedit', 'đã chỉnh sửa']);
+  // Messenger's word for "you" in its labels, per UI language (the page's <html lang>). Only the
+  // page's own language counts, so a friend actually named "Tu" or "Du" is not saved as "You".
+  const YOU_BY_LANG = {
+    en: ['you'],
+    pl: ['ty'],
+    bn: ['আপনি'],
+    fr: ['vous', 'tu'],
+    de: ['du'],
+    es: ['tú', 'tu'],
+    pt: ['você'],
+    it: ['tu'],
+    id: ['anda'],
+    vi: ['bạn'],
+  };
+  const YOU_ALL = new Set(Object.values(YOU_BY_LANG).flat());
+  function youLabels() {
+    const lang = String(document.documentElement.getAttribute('lang') || '')
+      .toLowerCase()
+      .split(/[-_]/)[0];
+    const own = YOU_BY_LANG[lang];
+    // unknown page language: every form, as before
+    return own ? new Set(['you', ...own]) : YOU_ALL;
+  }
+  // a Unicode-aware end of word: \b does not work after Bangla letters
+  const YOU_HEADINGS = /^(?:you sent|you replied to|wysłano|bạn đã gửi|আপনি পাঠিয়েছেন)(?![\p{L}\p{M}\p{N}])/iu;
+
+  function isPlaceholderText(text) {
+    const t = String(text || '').trim();
+    if (!t || t.length > 140) return false;
+    return PLACEHOLDER_PATTERNS.some((re) => re.test(t)) || learnedPlaceholders.some((re) => re.test(t));
+  }
+
+  function escapeRe(x) {
+    return x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  /** Remembers this UI language's "X unsent a message" wording (sender name masked). */
+  function learnPlaceholder(text, senderName, previousText) {
+    const t = norm(text);
+    if (!t || t.length > 120 || isPlaceholderText(t)) return;
+    // Messenger's wording names the sender ("Alpha unsent…", "You unsent…"); anything else is not learned
+    const name = norm(senderName);
+    const tokens = [name, name.split(' ')[0], ...youLabels()].filter((x) => x && x.length >= 2);
+    const lower = t.toLowerCase();
+    const hit = tokens.find((x) => lower.includes(x.toLowerCase()));
+    if (!hit) return;
+    const at = lower.indexOf(hit.toLowerCase());
+    const src = '^' + escapeRe(t.slice(0, at)) + '.{1,80}?' + escapeRe(t.slice(at + hit.length)) + '$';
+    if (!safeLearned(src, previousText)) return;
+    chrome.storage.local.get('learnedPlaceholders').then(({ learnedPlaceholders: list = [] }) => {
+      if (list.includes(src)) return;
+      chrome.storage.local.set({ learnedPlaceholders: [...list, src].slice(-20) });
+    });
+  }
+
+  // A learned wording must name the action in words: a row whose text was just the sender's name
+  // (or a page script faking one) would otherwise teach "^.{1,80}?$" and every short message
+  // would look like "unsent" and stop being saved.
+  const ORDINARY_TEXTS = ['ok', 'okay', 'hi', 'hello', 'hey', 'yes', 'no', 'thanks', 'thank you', 'haha', 'lol', 'good morning', 'good night', 'ঠিক আছে', 'হ্যাঁ', 'না', 'ধন্যবাদ', 'আচ্ছা', 'kemon acho', 'acha'];
+  function safeLearned(src, previousText) {
+    if (typeof src !== 'string' || src.length > 400) return false;
+    const literal = src.replace(/\.\{1,80\}\?/g, '').replace(/\\(.)/g, '$1');
+    if ((literal.match(/[\p{L}\p{N}]/gu) || []).length < 6) return false;
+    let re;
+    try {
+      re = new RegExp(src, 'i');
+    } catch (e) {
+      return false;
+    }
+    if (ORDINARY_TEXTS.some((x) => re.test(x))) return false;
+    if (previousText && re.test(norm(previousText))) return false;
+    return true;
+  }
+
+  function loadLearned(list) {
+    learnedPlaceholders = (list || [])
+      .filter((src) => safeLearned(src))
+      .map((src) => {
+        try {
+          return new RegExp(src, 'i');
+        } catch (e) {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  }
+  chrome.storage.local.get('learnedPlaceholders').then(({ learnedPlaceholders: list }) => loadLearned(list));
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.learnedPlaceholders) loadLearned(changes.learnedPlaceholders.newValue);
+  });
+
+  /** Messenger shows one message under several ids over time ("123", "456@msgr.123"): use the stable part. */
+  function canonId(raw) {
+    const id = String(raw || '').trim();
+    const m = /^(?:\d+@msgr\.)?(\d{16,})$/.exec(id);
+    return m ? 'msgr.' + m[1] : id;
+  }
+
+  function norm(t) {
+    return String(t || '')
+      .normalize('NFC')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /** Text of an element, with emoji images turned back into their characters. */
+  function textOf(root) {
+    let out = '';
+    const walk = (node) => {
+      if (node.nodeType === 3) {
+        out += node.nodeValue;
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      const el = node;
+      if (el.classList && (el.classList.contains('mms-recovered') || el.classList.contains('mms-edit-history'))) return;
+      const tag = el.tagName;
+      if (tag === 'IMG') {
+        const alt = el.getAttribute('alt') || '';
+        if (alt && /^[\p{Extended_Pictographic}\p{Emoji_Component}\u200d\ufe0f\s]+$/u.test(alt)) out += alt;
+        return;
+      }
+      if (tag === 'BR') {
+        out += '\n';
+        return;
+      }
+      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'SVG') return;
+      for (const c of el.childNodes) walk(c);
+    };
+    walk(root);
+    return out.replace(/[\u00a0\u202f]/g, ' ').trim();
+  }
+
+  const SKIP_INSIDE = 'h1,h2,h3,h4,h5,h6,[role="toolbar"],[aria-hidden="true"],[role="button"],a[aria-label],[role="link"][aria-label],.mms-recovered,.mms-edit-history';
+  const CALL_BUTTONS = '[role="button"][aria-label="Call again"],[role="button"][aria-label="Call back"],[role="button"][aria-label="Join call"],[role="button"][aria-label="Join"]';
+
+  // Delivery status under your own messages ("Sent", "Delivered", "Seen", "Sent 5h ago")
+  const STATUS_TEXT = /^(?:sent|delivered|seen|sending\.*|not delivered|failed to send)(?:\s+\d+\s*[smhdw]\w*\s+ago)?$|^seen by\b/i;
+
+  /** The message's own text pieces (not the reply quote, header, toolbar or a11y button). */
+  function messageTextNodes(row) {
+    const nodes = [];
+    for (const el of row.querySelectorAll('div[dir="auto"], span[dir="auto"]')) {
+      if (el.querySelector('div[dir="auto"], span[dir="auto"]')) continue; // use the innermost only
+      const skip = el.closest(SKIP_INSIDE);
+      if (skip && row.contains(skip)) continue;
+      // status line: <span role="presentation"><span dir="auto">Sent</span></span>
+      if (el.parentElement && el.parentElement.matches('span[role="presentation"]')) continue;
+      if (STATUS_TEXT.test(norm(el.textContent))) continue;
+      nodes.push(el);
+    }
+    return nodes;
+  }
+
+  function messageText(row) {
+    const parts = [];
+    for (const el of messageTextNodes(row)) {
+      const t = textOf(el);
+      if (t && !parts.includes(t)) parts.push(t);
+    }
+    // call notices ("Audio call", "Missed video call", "18 mins")
+    if (row.querySelector(CALL_BUTTONS)) {
+      const bits = [];
+      for (const el of row.querySelectorAll('span[dir="auto"], div[dir="auto"]')) {
+        if (el.querySelector('[dir="auto"]') || el.closest('[role="toolbar"]') || el.closest('[role="button"][aria-label^="Enter,"]')) continue;
+        const t = textOf(el);
+        if (t && !bits.includes(t)) bits.push(t);
+      }
+      return bits.length ? '📞 ' + bits.join(' · ') : '📞 Call';
+    }
+    return parts.join('\n').trim();
+  }
+
+  /** Link previews, voice messages and files shown in a row (not photos). */
+  function messageExtras(row) {
+    const out = [];
+    for (const a of row.querySelectorAll('a[aria-label], [role="link"][aria-label]')) {
+      const label = norm(a.getAttribute('aria-label'));
+      const m = /^open attachment, (.+)$/i.exec(label);
+      if (!m) continue;
+      const href = a.getAttribute('href') || '';
+      out.push({ kind: 'link', title: m[1].slice(0, 300), url: /^https?:/.test(href) ? href : '' });
+    }
+    if (row.querySelector('[role="slider"][aria-label="Audio scrubber"], audio')) out.push({ kind: 'voice', title: 'Voice message' });
+    if (row.querySelector('video')) out.push({ kind: 'video', title: 'Video' });
+    return out;
+  }
+
+  /** Photos / stickers / GIFs in a row (not avatars, not emoji). */
+  function messageImages(row) {
+    const out = [];
+    for (const img of row.querySelectorAll('img')) {
+      const src = img.currentSrc || img.getAttribute('src') || '';
+      if (!src) continue;
+      if (/\/images\/emoji\.php\//.test(src) || /static\.xx\.fbcdn\.net\/images\/emoji/.test(src)) continue;
+      const hidden = img.closest('[aria-hidden="true"]');
+      if (hidden && row.contains(hidden) && img.closest('[role="button"]')) continue; // avatar
+      // the quote of a reply ("Go to replied message") shows the other message's photo
+      const labelled = img.closest('[role="button"][aria-label]');
+      if (labelled && row.contains(labelled) && !/^open\b/i.test(labelled.getAttribute('aria-label') || '')) continue;
+      if (/^original image$/i.test(img.getAttribute('alt') || '')) continue;
+      if (/[?&]stp=[^&]*_s(?:\d{1,2}|1[0-4]\d)x/.test(src)) continue; // tiny avatar thumbnails
+      const w = Number(img.getAttribute('width')) || img.naturalWidth || 0;
+      const h = Number(img.getAttribute('height')) || img.naturalHeight || 0;
+      if (w && h && w <= 40 && h <= 40) continue;
+      out.push({ src, alt: img.getAttribute('alt') || '', w, h, key: imageKey(src) });
+    }
+    // stickers are often <div role="img" aria-label="… sticker" style="background-image:url(…)">
+    for (const el of row.querySelectorAll('[role="img"][aria-label]')) {
+      const m = /url\(["']?([^"')]+)["']?\)/.exec(el.style.backgroundImage || '');
+      if (!m) continue;
+      out.push({ src: m[1], alt: el.getAttribute('aria-label') || 'sticker', w: el.offsetWidth || 96, h: el.offsetHeight || 96, key: imageKey(m[1]) });
+    }
+    return out;
+  }
+
+  function imageKey(src) {
+    if (src.startsWith('blob:') || src.startsWith('data:')) return '';
+    try {
+      const u = new URL(src);
+      return u.pathname.split('/').pop() || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function hasEditedMarker(row) {
+    for (const b of row.querySelectorAll('[role="button"][aria-label]')) {
+      if (EDITED_LABELS.has(norm(b.getAttribute('aria-label')).toLowerCase())) return true;
+    }
+    for (const el of row.querySelectorAll('span, div')) {
+      if (el.children.length) continue;
+      const t = norm(el.textContent).toLowerCase();
+      if (t && t.length < 25 && EDITED_LABELS.has(t)) {
+        if (el.closest('[role="button"][aria-label^="Enter"]')) continue;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /* ---------------- sender, time, direction ---------------- */
+
+  const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+  const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+
+  /** Parses English Messenger time labels ("3:11 PM", "Tuesday 10:25pm", "April 16, 2026, 10:55 AM"). */
+  function parseTimeLabel(label, now = new Date()) {
+    const s = String(label || '').trim().toLowerCase();
+    const tm = /(\d{1,2}):(\d{2})\s*(am|pm)?/.exec(s);
+    if (!tm) return 0;
+    let hh = Number(tm[1]);
+    const mm = Number(tm[2]);
+    if (tm[3] === 'pm' && hh < 12) hh += 12;
+    if (tm[3] === 'am' && hh === 12) hh = 0;
+    const d = new Date(now.getTime());
+    d.setSeconds(0, 0);
+    const md = /(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.? (\d{1,2})(?:, (\d{4}))?/.exec(s);
+    if (md) {
+      const mi = MONTHS.findIndex((m) => m.startsWith(md[1].slice(0, 3)));
+      d.setFullYear(md[3] ? Number(md[3]) : now.getFullYear(), mi, Number(md[2]));
+    }
+    let weekday = false;
+    if (!md) {
+      const wd = WEEKDAYS.findIndex((w) => s.includes(w) || new RegExp('\\b' + w.slice(0, 3) + '\\b').test(s));
+      if (wd >= 0) {
+        weekday = true;
+        const diff = (now.getDay() - wd + 7) % 7 || 7;
+        d.setDate(d.getDate() - diff);
+      } else if (s.includes('yesterday')) d.setDate(d.getDate() - 1);
+    }
+    d.setHours(hh, mm, 0, 0);
+    const t = d.getTime();
+    if (t <= now.getTime() + 60000) return t;
+    // a time later than now: a weekday means last week; a bare time means yesterday at most
+    return weekday ? t - 7 * 86400000 : t - 86400000;
+  }
+
+  /**
+   * Reads sender and time from the row's aria-label (English):
+   *   "At <time>, <Sender>"  |  "At <time>, <Sender>: <text>"  |  "At <time>, <Sender> <text>"
+   */
+  const TIME_TOKEN = /\d{1,2}[:.]\d{2}(?:\s?[ap]\.?m\.?)?/i;
+
+  function splitSender(rest, text, avatarName) {
+    rest = norm(rest);
+    const t = norm(text);
+    if (t && rest.endsWith(t) && rest.length > t.length) return rest.slice(0, rest.length - t.length).trim().replace(/:$/, '').trim();
+    const colon = rest.indexOf(': ');
+    if (colon > 0 && colon < 80) return rest.slice(0, colon).trim();
+    if (avatarName && rest.toLowerCase().startsWith(avatarName.toLowerCase())) return avatarName;
+    for (const you of youLabels()) if (rest.toLowerCase() === you || rest.toLowerCase().startsWith(you + ' ')) return rest.slice(0, you.length);
+    return rest.length <= 60 ? rest : '';
+  }
+
+  function parseRowLabel(row, text) {
+    const avatar = row.querySelector('[aria-hidden="true"] [role="button"] img[alt]');
+    const avatarName = avatar ? norm(avatar.getAttribute('alt')) : '';
+    let sender = '';
+    let timeLabel = '';
+    const label = norm(row.getAttribute('aria-label'));
+    let m = /^at (.*?\d{1,2}[:.]\d{2}(?:\s?[ap]\.?m\.?)?), (.*)$/i.exec(label);
+    if (m) {
+      timeLabel = m[1];
+      sender = splitSender(m[2], text, avatarName);
+    }
+    if (!sender) {
+      // accessibility button next to the message: "Enter, Message sent 12:26 AM by Alpha: text"
+      const art = row.closest('[role="article"]');
+      const scope = (art && art.parentElement) || row.parentElement;
+      const a11y = scope ? scope.querySelector('[role="button"][aria-label^="Enter, Message sent"]') : null;
+      const al = a11y ? norm(a11y.getAttribute('aria-label')) : '';
+      m = /^enter, message sent (.*?\d{1,2}[:.]\d{2}(?:\s?[ap]\.?m\.?)?) by (.*)$/i.exec(al);
+      if (m) {
+        timeLabel = timeLabel || m[1];
+        sender = splitSender(m[2], text, avatarName);
+      }
+    }
+    if (!sender) sender = avatarName;
+    void TIME_TOKEN;
+    return { sender, timeLabel };
+  }
+
+  function rowDirection(row, log, sender) {
+    const lower = norm(sender).toLowerCase();
+    if (youLabels().has(lower)) return true;
+    // (the number before "@msgr" in data-message-id is NOT the sender, so it is not used here)
+    if (lower && /^at /i.test(row.getAttribute('aria-label') || '')) return false;
+    for (const h of row.querySelectorAll('h1,h2,h4,h5,h6,[role="heading"]')) {
+      if (YOU_HEADINGS.test(norm(h.textContent))) return true;
+    }
+    if (row.querySelector('[aria-hidden="true"] [role="button"][aria-haspopup="dialog"] img, [aria-hidden="true"] [role="button"] img[alt]')) return false; // avatar = someone else
+    const lane = row.querySelector(':scope > [role="presentation"]');
+    if (lane) {
+      const fd = getComputedStyle(lane).flexDirection;
+      if (fd === 'row-reverse') return true;
+    }
+    // Fall back to layout: your own bubbles sit on the right.
+    const textEl = messageTextNodes(row)[0] || row.querySelector('img[alt]') || row;
+    const r = textEl.getBoundingClientRect();
+    const L = log.getBoundingClientRect();
+    if (!r.width || !L.width) return null;
+    const leftGap = r.left - L.left;
+    const rightGap = L.right - r.right;
+    if (Math.abs(leftGap - rightGap) < 24) return null;
+    return leftGap > rightGap;
+  }
+
+  /* ---------------- which chat is this list in? ---------------- */
+
+  function threadFromUrl() {
+    const m = /\/(?:messages\/)?(e2ee\/)?t\/([^/?#]+)/.exec(location.pathname);
+    if (!m || m[2] === 'new') return null;
+    return { id: decodeURIComponent(m[2]), e2ee: !!m[1] };
+  }
+
+  function chatWindowOf(log) {
+    const zone = log.closest('[data-mw-file-dropzone]');
+    return zone ? zone.parentElement || zone : log.parentElement;
+  }
+
+  function headingName(el) {
+    if (!el) return '';
+    const t = norm(textOf(el));
+    return t.replace(/^(?:messages in )?conversation (?:with|titled) /i, '').slice(0, 120);
+  }
+
+  /** First heading in `scope` that is not inside the message area (that one is a generic "Messages"). */
+  function titleOutside(scope, log) {
+    if (!scope) return '';
+    const zone = log.closest('[data-mw-file-dropzone]');
+    for (const h of scope.querySelectorAll('h1, h2, h3, h4, [role="heading"]')) {
+      if (log.contains(h) || (zone && zone.contains(h))) continue;
+      const name = headingName(h);
+      if (name) return name;
+    }
+    return '';
+  }
+
+  function profileIdsIn(scope, log) {
+    const ids = [];
+    if (!scope) return ids;
+    for (const a of scope.querySelectorAll('a[href]')) {
+      if (log.contains(a)) continue;
+      const href = a.getAttribute('href') || '';
+      const pm = /^(?:https:\/\/(?:www|web)\.facebook\.com)?\/(?:profile\.php\?id=)?(\d{5,})\/?(?:[?#].*)?$/.exec(href);
+      if (pm) ids.push(pm[1]);
+    }
+    return [...new Set(ids)];
+  }
+
+  function identifyThread(log) {
+    const win = chatWindowOf(log);
+    let name = '';
+    const lm = /^messages in conversation (?:with|titled) (.+)$/i.exec(norm(log.getAttribute('aria-label')));
+    if (lm) name = lm[1].slice(0, 120);
+    const main = log.closest('[role="main"]');
+    const fromUrl = threadFromUrl();
+    const isMessagesPage = /^\/(?:messages\/)?(?:e2ee\/)?t\//.test(location.pathname) || location.hostname.endsWith('messenger.com');
+    if (main && fromUrl && isMessagesPage) {
+      if (!name) {
+        const header = main.querySelector('[data-pagelet="MWInboxDetail_MessageList_Header"]');
+        name = titleOutside(header, log) || titleOutside(main, log);
+      }
+      return { id: fromUrl.id, e2ee: fromUrl.e2ee, name, surface: 'page', url: location.href };
+    }
+    // Chat pop-up: title in its header (outside the message area) and the profile link there.
+    if (!name) name = titleOutside(win, log);
+    return { id: '', name, altIds: profileIdsIn(win, log), surface: 'popup', url: location.href };
+  }
+
+  /* ---------------- reading one message list ---------------- */
+
+  const MSG_SELECTOR = '[data-scope="messages_table"][data-message-id], [data-scope="messages_table"][aria-roledescription="message"]';
+
+  function messageRows(log) {
+    const rows = [];
+    for (const el of log.querySelectorAll(MSG_SELECTOR)) {
+      if (/@msgrCUTOVER/i.test(el.getAttribute('data-message-id') || '')) continue; // "messages are end-to-end encrypted" notice
+      if (el.querySelector('[data-scope="date_break"]')) continue;
+      const outer = el.parentElement && el.parentElement.closest(MSG_SELECTOR);
+      if (outer && log.contains(outer)) continue; // keep the outermost message element
+      rows.push(el);
+    }
+    return rows;
+  }
+
+  /** The element that stays in the same place for one message, even if Messenger swaps its id. */
+  function rowAnchor(row) {
+    return row.closest('[data-pagelet="MWMessageRow"], [role="article"], [role="row"]') || row;
+  }
+
+  /** "At 3:11 PM, Alpha" - the part of the label that does not change when a message is unsent. */
+  function identityStamp(row, text) {
+    let label = norm(row.getAttribute('aria-label'));
+    const t = norm(text);
+    if (!label) return '';
+    if (t && label.endsWith(t)) label = label.slice(0, label.length - t.length).trim().replace(/:$/, '').trim();
+    else {
+      const colon = label.indexOf(': ');
+      if (colon > 0 && /\d[:.]\d{2}/.test(label.slice(0, colon))) {
+        const afterTime = label.search(/\d{1,2}[:.]\d{2}(?:\s?[ap]\.?m\.?)?, /i);
+        if (afterTime >= 0 && colon > afterTime) label = label.slice(0, colon);
+      }
+    }
+    return label.slice(0, 160);
+  }
+
+  function dateBreakBefore(row, log) {
+    // nearest date separator above the row, for the message time
+    const all = log.querySelectorAll('[data-scope="date_break"]');
+    let best = '';
+    for (const d of all) {
+      if (d.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING) best = norm(d.textContent);
+      else break;
+    }
+    return best;
+  }
+
+  const rowCache = new WeakMap(); // row element -> { fp, data }
+
+  /** readRow, but rows whose label, id and content size did not change are not read again. */
+  function readRowCached(row, log) {
+    const fp = (row.getAttribute('aria-label') || '') + '|' + (row.getAttribute('data-message-id') || '') + '|' + row.textContent.length + '|' + row.getElementsByTagName('img').length + '|' + row.querySelectorAll('[role="img"]').length;
+    const hit = rowCache.get(row);
+    if (hit && hit.fp === fp) return { ...hit.data };
+    const data = readRow(row, log);
+    rowCache.set(row, { fp, data: { ...data } });
+    return data;
+  }
+
+  function readRow(row, log) {
+    const domId = canonId(row.getAttribute('data-message-id'));
+    let text = messageText(row);
+    const label = norm(row.getAttribute('aria-label'));
+    // A real "X unsent a message" row has no text in its label ("At 7:54pm, Alpha");
+    // a message someone typed with those words does ("At 7:54pm, Bob: Alice deleted a message").
+    const placeholder = isPlaceholderText(text) && !(label && label.toLowerCase().includes(norm(text).toLowerCase()));
+    const { sender, timeLabel } = parseRowLabel(row, placeholder ? '' : text);
+    const isMine = rowDirection(row, log, sender);
+    const images = placeholder ? [] : messageImages(row);
+    const extras = placeholder ? [] : messageExtras(row);
+    if (!placeholder && !text && !images.length && !extras.length) {
+      // e.g. the big like: <div role="img" aria-label="Like, thumbs up"><svg/></div>
+      const like = row.querySelector('[role="img"][aria-label]');
+      if (like && !/url\(/.test(like.style.backgroundImage || '')) text = /thumbs up/i.test(like.getAttribute('aria-label')) ? '👍' : '[' + norm(like.getAttribute('aria-label')).slice(0, 60) + ']';
+    }
+    const when = timeLabel || dateBreakBefore(row, log);
+    return {
+      row,
+      anchor: rowAnchor(row),
+      domId,
+      stamp: identityStamp(row, placeholder ? '' : text),
+      labelHasBody: !!(text && label && label.includes(norm(text).slice(0, 40))),
+      labelLen: label.length,
+      text: placeholder ? '' : text,
+      placeholderText: placeholder ? text : '',
+      placeholder,
+      senderName: youLabels().has(norm(sender).toLowerCase()) ? '' : sender,
+      isMine,
+      timeLabel: when,
+      ts: parseTimeLabel(when),
+      ownTs: timeLabel ? parseTimeLabel(timeLabel) : 0, // from this row's own label, not a date separator
+      images,
+      extras,
+      edited: !placeholder && hasEditedMarker(row),
+    };
+  }
+
+  /* ---------------- per-list state ---------------- */
+
+  const logs = new Map(); // log element -> state
+  const rowMemory = new Map(); // message id -> what the row showed this session (live unsend detection)
+  const anchorMemory = new WeakMap(); // row element -> the same, survives Messenger changing the id
+  const sentSignatures = new Set(); // what was already sent to the background
+  /** Copies a decrypted (blob:) photo out of the page. Nothing is cached: the copy goes straight to storage. */
+  function blobToDataUrl(src, maxBytes) {
+    return fetch(src)
+      .then((r) => r.blob())
+      .then(
+        (b) =>
+          new Promise((resolve) => {
+            if (!b || b.size > maxBytes || !/^image\//.test(b.type)) return resolve('');
+            const fr = new FileReader();
+            fr.onload = () => resolve(String(fr.result || ''));
+            fr.onerror = () => resolve('');
+            fr.readAsDataURL(b);
+          })
+      )
+      .catch(() => '');
+  }
+
+  function memoryFor(r) {
+    return (r.domId && rowMemory.get(r.domId)) || anchorMemory.get(r.anchor) || null;
+  }
+
+  async function processLog(log, state) {
+    state.timer = 0;
+    if (!extensionAlive) return;
+    if (!document.contains(log)) {
+      state.observer.disconnect();
+      logs.delete(log);
+      return;
+    }
+    if (!settings.enabled) return;
+    const thread = identifyThread(log);
+    state.thread = thread;
+    const rows = messageRows(log).map((r) => readRowCached(r, log));
+    domStats.rows = Math.max(domStats.rows, rows.length);
+
+    // A row that showed a saved message and now shows one short line, with the label's text
+    // part gone, has been unsent - this catches Messenger's wording in any language.
+    for (const r of rows) {
+      if (r.placeholder) continue;
+      const before = memoryFor(r);
+      if (!before || !before.text || before.unsent || !before.labelHasBody) continue;
+      const leaves = messageTextNodes(r.row);
+      if (r.text && r.text !== before.text && !r.labelHasBody && r.labelLen && leaves.length === 1 && r.text.length <= 120 && !r.images.length && !r.extras.length) {
+        learnPlaceholder(r.text, before.senderName || r.senderName, before.text);
+        r.placeholderText = r.text;
+        r.text = '';
+        r.placeholder = true;
+      }
+    }
+
+    // context: neighbouring texts help find the original of a placeholder later
+    const texts = rows.map((r) => r.text);
+    const items = [];
+    const unsentNow = [];
+    const placeholders = [];
+    const edited = [];
+    const visibleTexts = [];
+    const visibleDomIds = [];
+    rows.forEach((r, i) => {
+      let p = i - 1;
+      while (p >= 0 && !texts[p]) p--;
+      let n = i + 1;
+      while (n < rows.length && !texts[n]) n++;
+      r.prev = p >= 0 ? texts[p] : '';
+      r.next = n < rows.length ? texts[n] : '';
+      if (r.placeholder) {
+        domStats.placeholders++;
+        const before = memoryFor(r);
+        if (before && before.text && !before.unsent) {
+          unsentNow.push({ domId: before.domId || r.domId, newDomId: before.domId && before.domId !== r.domId ? r.domId : '', text: before.text, senderName: before.senderName, isMine: before.isMine, prev: r.prev, next: r.next, ts: before.ts, stamp: before.stamp });
+          const mark = { ...before, unsent: true };
+          if (r.domId) rowMemory.set(r.domId, mark);
+          if (before.domId) rowMemory.set(before.domId, mark);
+          anchorMemory.set(r.anchor, mark);
+        }
+        const box = r.row.querySelector('.mms-recovered');
+        const tries = box ? Number(box.getAttribute('data-mms-tries') || 0) : 0;
+        const checkedAt = box ? Number(box.getAttribute('data-mms-checked') || 0) : 0;
+        const retry = box && box.getAttribute('data-mms-state') === 'missing' && tries < 4 && Date.now() - checkedAt > 4000;
+        if (!box || retry) {
+          placeholders.push({ pid: placeholders.length, domId: r.domId, senderName: r.senderName, isMine: r.isMine, prev: r.prev, next: r.next, stamp: r.stamp, ts: r.ownTs, row: r.row, local: before && before.text ? before : null });
+        } else if (box && box.getAttribute('data-mms-state') === 'missing' && tries < 4) state.retryNeeded = true;
+        return;
+      }
+      if (r.text) visibleTexts.push(r.text);
+      if (r.domId) visibleDomIds.push(r.domId);
+      if (!r.text && !r.images.length && !r.extras.length) return;
+      const mem = { domId: r.domId, text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ts, media: r.images.length + r.extras.length > 0, stamp: r.stamp, labelHasBody: r.labelHasBody };
+      if (r.domId) rowMemory.set(r.domId, mem);
+      anchorMemory.set(r.anchor, mem);
+      if (r.edited) edited.push(r);
+      const sig = [r.domId, r.text, r.images.map((x) => x.key || x.src.slice(0, 80)).join(','), r.extras.map((x) => x.kind + x.title).join(',')].join('|');
+      if (!sentSignatures.has(sig)) {
+        sentSignatures.add(sig);
+        r.sig = sig;
+        items.push(r);
+      }
+    });
+    if (sentSignatures.size > 20000) sentSignatures.clear();
+    if (rowMemory.size > 20000) rowMemory.clear();
+
+    if (settings.saveMessages && settings.captureDom && (items.length || unsentNow.length)) {
+      const maxBytes = Math.min(settings.maxMediaMB || 15, 40) * 1024 * 1024;
+      const outItems = [];
+      for (const r of items) {
+        const images = [];
+        for (const im of r.images) {
+          if (settings.saveMedia && im.src.startsWith('blob:')) {
+            const dataUrl = await blobToDataUrl(im.src, maxBytes);
+            if (dataUrl) images.push({ dataUrl, w: im.w, h: im.h, alt: im.alt, key: '' });
+          } else if (im.src.startsWith('data:')) {
+            if (settings.saveMedia && im.src.length < maxBytes * 1.4) images.push({ dataUrl: im.src, w: im.w, h: im.h, alt: im.alt, key: '' });
+          } else images.push({ src: im.src, w: im.w, h: im.h, alt: im.alt, key: im.key });
+        }
+        outItems.push({ domId: r.domId, text: r.text, senderName: r.senderName, isMine: r.isMine, ts: r.ownTs || r.ts, exactTime: !!r.ownTs, prev: r.prev, next: r.next, stamp: r.stamp, images, extras: r.extras, edited: r.edited });
+      }
+      domStats.saved += outItems.length;
+      // Chrome limits one message to 64 MB: send photos in chunks of about 16 MB.
+      const threadInfo = { id: thread.id, name: thread.name, e2ee: !!thread.e2ee, url: thread.url, altIds: thread.altIds || [] };
+      const LIMIT = 16 * 1024 * 1024;
+      const sizeOf = (it) => (it.text || '').length + it.images.reduce((n, im) => n + (im.dataUrl ? im.dataUrl.length : 300), 0) + 1000;
+      // a row with many photos becomes its text first, then one part per photo (same message id)
+      const pieces = [];
+      outItems.forEach((it, idx) => {
+        if (sizeOf(it) <= LIMIT || !it.images.length) return pieces.push({ it, sig: items[idx].sig });
+        pieces.push({ it: { ...it, images: [] }, sig: items[idx].sig });
+        for (const im of it.images) pieces.push({ it: { ...it, text: '', extras: [], images: [im] }, sig: items[idx].sig });
+      });
+      const chunks = [];
+      let cur = { items: [], sigs: [], size: 0 };
+      for (const { it, sig } of pieces) {
+        const size = sizeOf(it);
+        if (cur.items.length && cur.size + size > LIMIT) {
+          chunks.push(cur);
+          cur = { items: [], sigs: [], size: 0 };
+        }
+        cur.items.push(it);
+        if (!cur.sigs.includes(sig)) cur.sigs.push(sig);
+        cur.size += size;
+      }
+      if (cur.items.length || unsentNow.length) chunks.push(cur);
+      chunks.forEach((chunk, i) => {
+        send({
+          type: 'ingest-dom',
+          batch: { thread: threadInfo, items: chunk.items, unsentNow: i === 0 ? unsentNow : [] },
+          ctx: { selfId: selfId() },
+        }).then((res) => {
+          // not stored (e.g. the background worker was restarting): try again on the next pass
+          if (!res || res.error) for (const sig of chunk.sigs) sentSignatures.delete(sig);
+        });
+      });
+    }
+
+    if (settings.showRecoveredInline && placeholders.length) {
+      const localOnly = (ph) => ph.local && ph.local.text && !ph.local.media;
+      for (const ph of placeholders) {
+        if (localOnly(ph)) renderRecovered(ph.row, { text: ph.local.text, media: [], senderName: ph.local.senderName, ts: ph.local.ts, confidence: 'high', live: true });
+      }
+      const ask = placeholders.filter((ph) => !localOnly(ph));
+      if (ask.length) {
+        const res = await send({
+          type: 'lookup-placeholders',
+          thread: { id: thread.id, name: thread.name, altIds: thread.altIds || [] },
+          placeholders: ask.map(({ pid, domId, senderName, isMine, prev, next, stamp, ts }) => ({ pid, domId, senderName, isMine, prev, next, stamp, ts })),
+          visibleTexts,
+          visibleDomIds,
+        });
+        if (!extensionAlive) return; // retired while waiting
+        // no answer (e.g. the background worker was restarting): try again, show nothing yet
+        const answered = !!(res && Array.isArray(res.results));
+        const found = new Map((answered ? res.results : []).map((x) => [x.pid, x]));
+        for (const ph of ask) {
+          const hit = found.get(ph.pid);
+          if (hit) {
+            domStats.recovered++;
+            renderRecovered(ph.row, hit);
+          } else if (ph.local && ph.local.text) {
+            renderRecovered(ph.row, { text: ph.local.text, media: [], senderName: ph.local.senderName, ts: ph.local.ts, confidence: 'high', live: true });
+          } else if (answered) {
+            renderNotCaptured(ph.row);
+            state.retryNeeded = true;
+          } else state.retryNeeded = true;
+        }
+      }
+    }
+    if (state.retryNeeded && !state.timer) {
+      state.retryNeeded = false;
+      state.timer = setTimeout(() => processLog(log, state).catch(() => {}), 4500);
+    }
+
+    if (settings.showEditHistoryInline && edited.length) {
+      const need = edited.filter((r) => !r.row.querySelector('.mms-edit-history'));
+      if (need.length) {
+        const res = await send({ type: 'lookup-edited', thread: { id: thread.id, name: thread.name }, items: need.map((r) => ({ text: r.text, domId: r.domId })) });
+        if (!extensionAlive) return;
+        const byKey = new Map(((res && res.results) || []).map((x) => [x.domId || norm(x.text), x.history]));
+        for (const r of need) {
+          const hist = byKey.get(r.domId) || byKey.get(norm(r.text));
+          if (hist && hist.length) renderEditHistory(r.row, hist);
+        }
+      }
+    }
+  }
+
+  /* ---------------- inline display ---------------- */
+
+  function placeholderAnchor(row) {
+    for (const el of messageTextNodes(row)) {
+      if (isPlaceholderText(textOf(el))) return el.closest('span[dir="auto"]') || el;
+    }
+    return null;
+  }
+
+  function fmtTime(ts) {
+    if (!ts) return '';
+    try {
+      return new Date(ts).toLocaleString(I18N ? I18N.locale(uiLang) : undefined, { dateStyle: 'medium', timeStyle: 'short' });
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function makeBox(cls) {
+    const box = document.createElement('div');
+    box.className = cls;
+    box.setAttribute('data-mms', '1');
+    return box;
+  }
+
+  /** Light text around the box means a dark (themed) chat background: use a dark box, else a light one. */
+  function setTone(box, ref) {
+    let dark = false;
+    try {
+      const m = /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(getComputedStyle(ref || document.body).color);
+      if (m) dark = (0.2126 * m[1] + 0.7152 * m[2] + 0.0722 * m[3]) / 255 > 0.55;
+    } catch (e) {
+      /* keep light */
+    }
+    box.setAttribute('data-tone', dark ? 'dark' : 'light');
+  }
+
+  function insertBox(row, box) {
+    const anchor = placeholderAnchor(row);
+    setTone(box, anchor || row);
+    if (anchor && anchor.parentElement) anchor.parentElement.insertBefore(box, anchor.nextSibling);
+    else row.appendChild(box);
+  }
+
+  function renderRecovered(row, hit) {
+    const old = row.querySelector('.mms-recovered');
+    if (old && old.getAttribute('data-mms-state') === 'found') return;
+    if (old) old.remove();
+    const box = makeBox('mms-recovered');
+    box.setAttribute('data-mms-state', 'found');
+    const head = document.createElement('div');
+    head.className = 'mms-head';
+    head.textContent = tr('box.saved') + (hit.confidence === 'medium' ? tr('box.bestMatch') : '');
+    box.appendChild(head);
+    if (hit.text) {
+      const body = document.createElement('div');
+      body.className = 'mms-text';
+      body.textContent = hit.text;
+      box.appendChild(body);
+    }
+    for (const m of hit.media || []) {
+      if (m.dataUrl || m.url) {
+        const img = document.createElement('img');
+        img.className = 'mms-img';
+        img.alt = m.title || tr('media.savedPhoto');
+        img.referrerPolicy = 'no-referrer';
+        img.src = m.dataUrl || m.url;
+        img.addEventListener('error', () => img.remove());
+        box.appendChild(img);
+      } else if (m.title) {
+        const t = document.createElement('div');
+        t.className = 'mms-meta';
+        t.textContent = '📎 ' + (m.title === 'Voice message' ? tr('att.voiceTitle') : m.title === 'Video' ? tr('att.videoTitle') : m.title);
+        box.appendChild(t);
+      }
+    }
+    const meta = document.createElement('div');
+    meta.className = 'mms-meta';
+    const when = fmtTime(hit.ts);
+    meta.textContent = (when ? tr(hit.approxTime ? 'box.savedAt' : 'box.sentAt', { time: when }) : '') + (hit.unsentAt ? tr('box.unsentAt', { time: fmtTime(hit.unsentAt) }) : '');
+    if (meta.textContent) box.appendChild(meta);
+    box.title = tr('box.title');
+    insertBox(row, box);
+  }
+
+  function renderNotCaptured(row) {
+    const old = row.querySelector('.mms-recovered');
+    if (old && old.getAttribute('data-mms-state') === 'missing') {
+      old.setAttribute('data-mms-tries', String(Number(old.getAttribute('data-mms-tries') || 0) + 1));
+      old.setAttribute('data-mms-checked', String(Date.now()));
+      return;
+    }
+    if (old) return;
+    const box = makeBox('mms-recovered mms-missing');
+    box.setAttribute('data-mms-state', 'missing');
+    box.setAttribute('data-mms-tries', '1');
+    box.setAttribute('data-mms-checked', String(Date.now()));
+    box.textContent = tr('box.missing');
+    insertBox(row, box);
+  }
+
+  function renderEditHistory(row, history) {
+    if (row.querySelector('.mms-edit-history')) return;
+    const box = makeBox('mms-edit-history');
+    const head = document.createElement('div');
+    head.className = 'mms-head';
+    head.textContent = tr('box.edited');
+    box.appendChild(head);
+    for (const h of history.slice(-5)) {
+      const line = document.createElement('div');
+      line.className = 'mms-text';
+      line.textContent = h;
+      box.appendChild(line);
+    }
+    const nodes = messageTextNodes(row);
+    const anchor = nodes.length ? nodes[nodes.length - 1].closest('span[dir="auto"]') || nodes[nodes.length - 1] : null;
+    setTone(box, nodes[nodes.length - 1] || row);
+    if (anchor && anchor.parentElement) anchor.parentElement.insertBefore(box, anchor.nextSibling);
+    else row.appendChild(box);
+  }
+
+  function removeInline(selector) {
+    document.querySelectorAll(selector).forEach((el) => el.remove());
+  }
+
+  /* ---------------- observers ---------------- */
+
+  const NOISE = '[data-mms], [role="toolbar"], [role="timer"], [role="slider"], [role="progressbar"]';
+
+  /** True when every change is ours or inside a playing timer, slider or hover toolbar. */
+  function isOwnMutation(records) {
+    return records.every((r) => {
+      const target = r.target && r.target.nodeType === 1 ? r.target : r.target && r.target.parentElement;
+      if (target && target.closest && target.closest(NOISE)) return true;
+      const nodes = [...r.addedNodes, ...r.removedNodes];
+      if (!nodes.length) return false;
+      return nodes.every((n) => n.nodeType === 1 && n.hasAttribute && n.hasAttribute('data-mms'));
+    });
+  }
+
+  function watchLog(log) {
+    if (logs.has(log)) return;
+    const state = { timer: 0, observer: null, thread: null };
+    state.observer = new MutationObserver((records) => {
+      if (isOwnMutation(records)) return;
+      if (!state.timer) state.timer = setTimeout(() => processLog(log, state).catch(() => {}), 350);
+    });
+    state.observer.observe(log, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['src', 'alt', 'aria-label', 'data-message-id'] });
+    cleanups.push(() => {
+      state.observer.disconnect();
+      clearTimeout(state.timer);
+    });
+    logs.set(log, state);
+    domStats.logs = logs.size;
+    state.timer = setTimeout(() => processLog(log, state).catch(() => {}), 200);
+  }
+
+  /** Message lists on the page: [role=log] first, then the fallbacks Messenger has used. */
+  function findLogs() {
+    const found = new Set();
+    for (const el of document.querySelectorAll('[role="log"], [data-pagelet="MWMessageList"], [role="grid"][aria-label^="Messages in conversation"]')) {
+      if (el.querySelector(MSG_SELECTOR)) found.add(el);
+    }
+    if (!found.size) {
+      // last resort: the lowest element holding all message rows of each chat window
+      for (const zone of document.querySelectorAll('[data-mw-file-dropzone]')) if (zone.querySelector(MSG_SELECTOR)) found.add(zone);
+    }
+    // keep the innermost list when one contains another
+    const list = [...found];
+    return list.filter((el) => !list.some((other) => other !== el && el.contains(other)));
+  }
+
+  let scanTimer = 0;
+  function scheduleFullScan() {
+    if (scanTimer) return;
+    scanTimer = setTimeout(() => {
+      scanTimer = 0;
+      if (!extensionAlive || !settings.enabled) return;
+      if (!settings.captureDom && !settings.showRecoveredInline && !settings.showEditHistoryInline) return;
+      findLogs().forEach(watchLog);
+      for (const [log, state] of logs) {
+        if (!document.contains(log)) {
+          state.observer.disconnect();
+          logs.delete(log);
+        } else if (!state.timer) state.timer = setTimeout(() => processLog(log, state).catch(() => {}), 50);
+      }
+      domStats.logs = logs.size;
+    }, 400);
+  }
+
+  let started = false;
+  function startDom() {
+    if (started) return;
+    started = true;
+    const begin = () => {
+      scheduleFullScan();
+      const rootObserver = new MutationObserver((records) => {
+        for (const r of records) {
+          for (const n of r.addedNodes) {
+            if (n.nodeType !== 1) continue;
+            if ((n.getAttribute && (n.getAttribute('role') === 'log' || n.getAttribute('data-scope') === 'messages_table')) || (n.querySelector && n.querySelector('[role="log"], [data-scope="messages_table"]'))) {
+              scheduleFullScan();
+              return;
+            }
+          }
+        }
+      });
+      rootObserver.observe(document.documentElement, { childList: true, subtree: true });
+      // Messenger is a single-page app: re-check when the address changes.
+      let lastUrl = location.href;
+      const urlTimer = setInterval(() => {
+        if (location.href !== lastUrl) {
+          lastUrl = location.href;
+          scheduleFullScan();
+        }
+      }, 1000);
+      cleanups.push(() => {
+        rootObserver.disconnect();
+        clearInterval(urlTimer);
+        clearTimeout(scanTimer);
+      });
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', begin, { once: true });
+    else begin();
+  }
+
+  /* ================================================================== */
+  /* Downloads: photos, videos and reels                                */
+  /* ================================================================== */
+  // Pointing at a photo, video or reel shows a small "Download" button on it; the right-
+  // click menu has the same action. The button is one element outside Facebook's own page
+  // tree (so Facebook never re-renders around it), and it is looked for only when the
+  // pointer moves onto something new.
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const MIN_MEDIA_PX = 120;
+  const pendingMedia = new Map(); // request id -> callback
+  let mediaSeq = 0;
+  let dl = null; // { host, btn, toast }
+  let dlTarget = null; // { el, kind: 'image'|'video', id? }
+  let dlHideTimer = 0;
+  let dlToastTimer = 0;
+  let dlBusy = false;
+  let pointerRaf = 0;
+  let lastPointer = { x: -1, y: -1 };
+  let lastContext = null; // where the right-click menu was opened
+
+  function downloadsOn() {
+    return extensionAlive && settings.enabled !== false && settings.downloadButtons !== false;
+  }
+
+  function onMediaResult(data) {
+    if (!data || typeof data !== 'object' || !data.reqId) return;
+    const done = pendingMedia.get(data.reqId);
+    if (!done) return;
+    pendingMedia.delete(data.reqId);
+    done(data);
+  }
+
+  /** Asks the page hook (which can read Facebook's own data) for the file behind an element. */
+  function askPage(kind, el, extra) {
+    const reqId = 'm' + Date.now().toString(36) + (mediaSeq++).toString(36);
+    if (el) el.setAttribute('data-mms-pick', reqId);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingMedia.delete(reqId);
+        resolve(null);
+      }, 30000);
+      pendingMedia.set(reqId, (data) => {
+        clearTimeout(timer);
+        resolve(data.result || null);
+      });
+      const msg = { type: 'media-resolve', inst: instance, data: { reqId, pick: el ? reqId : '', kind, ...(extra || {}) } };
+      document.dispatchEvent(new CustomEvent(CHANNEL_IN, { detail: JSON.stringify(msg) }));
+    }).finally(() => {
+      if (el) el.removeAttribute('data-mms-pick');
+    });
+  }
+
+  /** Same rules as the page hook: /reel/ID, /watch/?v=ID, /videos/ID, video.php?v=ID. */
+  function videoIdFromHref(href) {
+    const s = String(href || '');
+    if (!/facebook\.com|^\//i.test(s)) return '';
+    const m = /\/reels?\/(\d{5,25})/.exec(s) || /\/watch\/?(?:live\/?)?\?(?:[^#]*&)?v=(\d{5,25})/.exec(s) || /\/video\.php\?(?:[^#]*&)?v=(\d{5,25})/.exec(s) || /\/videos\/(?:[^/?#]+\/)*?(\d{5,25})(?:[/?#]|$)/.exec(s);
+    return m ? m[1] : '';
+  }
+
+  function mediaUrlOf(el) {
+    try {
+      if (el.tagName === 'IMG' || el.tagName === 'VIDEO') return el.currentSrc || el.src || '';
+      if (el.namespaceURI === SVG_NS) return (el.href && el.href.baseVal) || el.getAttribute('href') || el.getAttribute('xlink:href') || '';
+    } catch (e) {
+      /* ignore */
+    }
+    return '';
+  }
+
+  function bigEnough(el) {
+    const r = el.getBoundingClientRect();
+    return r.width >= MIN_MEDIA_PX && r.height >= MIN_MEDIA_PX;
+  }
+
+  /** The photo or video under a point of the window, if any ('overlay' = our own button). */
+  function mediaAt(x, y) {
+    let stack;
+    try {
+      stack = document.elementsFromPoint(x, y);
+    } catch (e) {
+      return null;
+    }
+    for (const el of stack) {
+      if (dl && el === dl.host) return 'overlay';
+      const tag = el.tagName;
+      if (tag === 'VIDEO') {
+        if (!bigEnough(el)) continue;
+        const link = el.closest && el.closest('a[href]');
+        return { el, kind: 'video', id: link ? videoIdFromHref(link.getAttribute('href')) : '' };
+      }
+      const isImg = tag === 'IMG' || (el.namespaceURI === SVG_NS && String(tag).toLowerCase() === 'image');
+      if (!isImg || !bigEnough(el)) continue;
+      const url = mediaUrlOf(el);
+      if (!url || /^data:image\/svg/i.test(url)) continue;
+      // a reel or video thumbnail: download the video it opens, not the picture
+      const link = el.closest && el.closest('a[href]');
+      const vid = link ? videoIdFromHref(link.getAttribute('href')) : '';
+      return vid ? { el, kind: 'video', id: vid, thumb: true } : { el, kind: 'image' };
+    }
+    return null;
+  }
+
+  function ensureOverlay() {
+    if (dl) return dl;
+    const host = document.createElement('div');
+    host.setAttribute('data-mms', 'download');
+    host.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;margin:0;padding:0;border:0;z-index:2147483647;';
+    const root = host.attachShadow({ mode: 'open' });
+    const style = document.createElement('style');
+    style.textContent = `
+      .btn, .toast { position: fixed; z-index: 2147483647; box-sizing: border-box; font: 600 13px/1.2 system-ui, -apple-system, 'Segoe UI', 'Nirmala UI', Roboto, 'Noto Sans Bengali', sans-serif; }
+      .btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 12px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+             background: rgba(24,25,26,.82); color: #fff; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.35); }
+      .btn:hover { background: rgba(0,0,0,.92); }
+      .btn:focus-visible { outline: 2px solid #4cc2ff; outline-offset: 2px; }
+      .btn[aria-busy="true"] { cursor: progress; opacity: .85; }
+      .toast { max-width: 300px; padding: 9px 12px; border-radius: 10px; background: #242526; color: #e4e6eb; font-weight: 500;
+               box-shadow: 0 4px 14px rgba(0,0,0,.4); pointer-events: none; }
+      .toast.bad { background: #5c1e24; color: #ffe3e6; }
+      [hidden] { display: none !important; }`;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn';
+    btn.hidden = true;
+    const toastBox = document.createElement('div');
+    toastBox.className = 'toast';
+    toastBox.setAttribute('role', 'status');
+    toastBox.setAttribute('aria-live', 'polite');
+    toastBox.hidden = true;
+    root.append(style, btn, toastBox);
+    // Facebook must not treat a press on the button as a press on the photo or video
+    for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'dblclick', 'contextmenu']) {
+      btn.addEventListener(type, (e) => e.stopPropagation());
+    }
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // only a real click or key press: a script on the page cannot start downloads by itself
+      if (!e.isTrusted) return;
+      if (dlTarget) startDownload(dlTarget);
+    });
+    (document.documentElement || document.body).appendChild(host);
+    dl = { host, btn, toast: toastBox };
+    return dl;
+  }
+
+  function labelFor(target) {
+    if (target.kind === 'image') return { text: tr('dl.photo'), title: tr('dl.photoTitle') };
+    const reel = /\/reels?\//.test(location.pathname) || (target.thumb && target.id);
+    return { text: tr(reel ? 'dl.reel' : 'dl.video'), title: tr(settings.downloadQuality === 'sd' ? 'dl.videoTitleSd' : 'dl.videoTitleHd') };
+  }
+
+  function placeButton() {
+    if (!dl || !dlTarget) return;
+    const r = dlTarget.el.getBoundingClientRect();
+    if (!dlTarget.el.isConnected || r.width < MIN_MEDIA_PX || r.height < MIN_MEDIA_PX) {
+      hideDownloadButton(false);
+      return;
+    }
+    const b = dl.btn;
+    b.hidden = false;
+    const bw = b.offsetWidth || 96;
+    const bh = b.offsetHeight || 32;
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    const vh = document.documentElement.clientHeight || window.innerHeight;
+    const left = Math.max(6, Math.min(Math.min(r.right, vw) - bw - 10, vw - bw - 6));
+    const top = Math.max(6, Math.min(Math.max(r.top, 0) + 10, vh - bh - 6));
+    b.style.left = left + 'px';
+    b.style.top = top + 'px';
+  }
+
+  function showButtonFor(hit) {
+    ensureOverlay();
+    clearTimeout(dlHideTimer);
+    if (!dlTarget || dlTarget.el !== hit.el || dlTarget.kind !== hit.kind) {
+      dlTarget = hit;
+      const label = labelFor(hit);
+      dl.btn.textContent = label.text;
+      dl.btn.title = label.title;
+      dl.btn.setAttribute('aria-label', label.title);
+    }
+    placeButton();
+  }
+
+  function hideDownloadButton(now, force) {
+    clearTimeout(dlHideTimer);
+    const hide = () => {
+      if (!force) {
+        // while a download is being prepared the button stays (it shows progress); look again after
+        if (dlBusy) {
+          dlHideTimer = setTimeout(hide, 300);
+          return;
+        }
+        if (dl && dl.btn.matches(':hover')) return; // the pointer is on it
+      }
+      if (dl) dl.btn.hidden = true;
+      dlTarget = null;
+    };
+    if (now) hide();
+    else dlHideTimer = setTimeout(hide, 300);
+  }
+
+  function onPointerOver(e) {
+    if (!downloadsOn()) return;
+    lastPointer = { x: e.clientX, y: e.clientY };
+    if (pointerRaf) return;
+    pointerRaf = requestAnimationFrame(() => {
+      pointerRaf = 0;
+      const hit = mediaAt(lastPointer.x, lastPointer.y);
+      if (hit === 'overlay') clearTimeout(dlHideTimer);
+      else if (hit) showButtonFor(hit);
+      else if (dlTarget) hideDownloadButton(false);
+    });
+  }
+
+  function onPointerOut(e) {
+    if (!e.relatedTarget && dlTarget) hideDownloadButton(false); // the pointer left the window
+  }
+
+  let scrollRaf = 0;
+  /** Scrolling moves the photo or video: the button follows it (other scrolling lists are ignored). */
+  function onScroll(e) {
+    if (!dlTarget || dlBusy) return;
+    const t = e.target;
+    const movesTarget = t === document || t === window || t === document.documentElement || t === document.body || (t && t.nodeType === 1 && t.contains(dlTarget.el));
+    if (!movesTarget || scrollRaf) return;
+    scrollRaf = requestAnimationFrame(() => {
+      scrollRaf = 0;
+      if (!dlTarget || dlBusy) return;
+      const hit = mediaAt(lastPointer.x, lastPointer.y);
+      if (hit === 'overlay' || (hit && hit.el === dlTarget.el)) placeButton();
+      else if (hit) showButtonFor(hit);
+      else hideDownloadButton(true);
+    });
+  }
+
+  function onContextMenu(e) {
+    lastContext = { x: e.clientX, y: e.clientY, t: Date.now() };
+  }
+
+  document.addEventListener('pointerover', onPointerOver, { capture: true, passive: true });
+  document.addEventListener('pointerout', onPointerOut, { capture: true, passive: true });
+  document.addEventListener('contextmenu', onContextMenu, { capture: true, passive: true });
+  window.addEventListener('scroll', onScroll, { capture: true, passive: true });
+  cleanups.push(() => {
+    document.removeEventListener('pointerover', onPointerOver, { capture: true });
+    document.removeEventListener('pointerout', onPointerOut, { capture: true });
+    document.removeEventListener('contextmenu', onContextMenu, { capture: true });
+    window.removeEventListener('scroll', onScroll, { capture: true });
+    clearTimeout(dlHideTimer);
+    clearTimeout(dlToastTimer);
+    if (pointerRaf) cancelAnimationFrame(pointerRaf);
+    if (scrollRaf) cancelAnimationFrame(scrollRaf);
+    if (dl) dl.host.remove();
+    dl = null;
+    dlTarget = null;
+  });
+
+  function showToast(text, bad, near) {
+    ensureOverlay();
+    const t = dl.toast;
+    t.textContent = text;
+    t.classList.toggle('bad', !!bad);
+    t.hidden = false;
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    const vh = document.documentElement.clientHeight || window.innerHeight;
+    let x = vw - 316;
+    let y = 16;
+    if (!dl.btn.hidden) {
+      const r = dl.btn.getBoundingClientRect();
+      x = r.right - 300;
+      y = r.bottom + 8;
+    } else if (near) {
+      x = near.x - 150;
+      y = near.y + 16;
+    }
+    t.style.left = Math.max(8, Math.min(x, vw - 308)) + 'px';
+    t.style.top = Math.max(8, Math.min(y, vh - 80)) + 'px';
+    clearTimeout(dlToastTimer);
+    dlToastTimer = setTimeout(() => {
+      if (dl) dl.toast.hidden = true;
+    }, bad ? 9000 : 5000);
+  }
+
+  function siteWord() {
+    return /(^|\.)messenger\.com$/i.test(location.hostname) || /^\/messages(\/|$)/.test(location.pathname) ? 'messenger' : 'facebook';
+  }
+
+  function stamp() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  }
+
+  function extOf(url, fallback) {
+    const m = /\.(mp4|m4a|jpe?g|png|webp|gif)(?:$)/i.exec(String(url || '').split(/[?#]/)[0]);
+    return m ? m[1].toLowerCase().replace('jpeg', 'jpg') : fallback;
+  }
+
+  function extOfType(type, fallback) {
+    const t = String(type || '').toLowerCase();
+    if (/jpe?g/.test(t)) return 'jpg';
+    if (/png/.test(t)) return 'png';
+    if (/webp/.test(t)) return 'webp';
+    if (/gif/.test(t)) return 'gif';
+    if (/mp4|quicktime|video/.test(t)) return 'mp4';
+    if (/audio/.test(t)) return 'm4a';
+    return fallback;
+  }
+
+  /** Hands a Facebook file address to the background worker, which saves it to Downloads/Facebook. */
+  async function saveUrl(url, filename) {
+    const res = await send({ type: 'download', url, filename });
+    if (!res) throw new Error(tr('dl.noAnswerExt'));
+    if (!res.ok) throw new Error(res.error || tr('dl.noStart'));
+    return res;
+  }
+
+  /**
+   * Saves a file that only exists inside this tab (photos and videos of encrypted chats).
+   * Facebook's own video player uses MediaSource addresses, which cannot be read: false then.
+   */
+  async function saveBlobUrl(blobUrl, nameNoExt, fallbackExt) {
+    let blob;
+    try {
+      const resp = await fetch(blobUrl);
+      blob = await resp.blob();
+    } catch (e) {
+      return false;
+    }
+    if (!blob || !blob.size) return false;
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objectUrl;
+    a.download = `${nameNoExt}.${extOfType(blob.type, fallbackExt)}`;
+    a.click(); // never added to the page, so Facebook's link handling never sees it
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 120000);
+    return true;
+  }
+
+  async function downloadImage(target) {
+    const shown = mediaUrlOf(target.el);
+    const base = `${siteWord()}-photo-`;
+    if (/^(blob|data):/i.test(shown)) {
+      if (await saveBlobUrl(shown, base + stamp(), 'jpg')) return tr('dl.photoSavedRoot');
+      throw new Error(tr('dl.photoUnreadable'));
+    }
+    const res = await askPage('image', target.el);
+    const url = (res && res.url) || shown;
+    if (!/^https:\/\//i.test(url)) throw new Error(tr('dl.cannotSave'));
+    const key = (/\/([^/?#]+?)\.(?:jpe?g|png|webp|gif)(?:[?#]|$)/i.exec(url) || [])[1];
+    await saveUrl(url, `${base}${key || stamp()}.${extOf(url, 'jpg')}`);
+    return tr('dl.photoSaved');
+  }
+
+  async function downloadVideo(target) {
+    const video = target.el && target.el.tagName === 'VIDEO' ? target.el : null;
+    const direct = video ? video.currentSrc || video.src || '' : '';
+    const what = /\/reels?\//.test(location.pathname) || (target.thumb && target.id) ? 'reel' : 'video';
+    const site = siteWord();
+    // chat videos are often plain files already
+    if (/^https:\/\//i.test(direct) && !/[?&]byte(?:start|end)=/i.test(direct)) {
+      await saveUrl(direct, `${site}-${what}-${stamp()}.${extOf(direct, 'mp4')}`);
+      return tr('dl.videoSaved');
+    }
+    if (/^blob:/i.test(direct) && (await saveBlobUrl(direct, `${site}-${what}-${stamp()}`, 'mp4'))) return tr('dl.videoSavedRoot');
+
+    const res = await askPage('video', video && video.isConnected ? video : target.el && target.el.isConnected ? target.el : null, { id: target.id || '' });
+    if (!res) throw new Error(tr('dl.noAnswerPage'));
+    const id = res.id || target.id || '';
+    const name = `${site}-${what}-${id || stamp()}`;
+    const wantSd = settings.downloadQuality === 'sd';
+    const url = wantSd ? res.sd || res.hd : res.hd || res.sd;
+    if (url) {
+      const quality = url === res.hd ? 'hd' : 'sd';
+      await saveUrl(url, `${name}-${quality}.mp4`);
+      return tr(what === 'reel' ? 'dl.reelSavedQ' : 'dl.videoSavedQ', { q: quality.toUpperCase() });
+    }
+    if (res.dashVideo) {
+      await saveUrl(res.dashVideo, `${name}-picture-only.mp4`);
+      if (res.dashAudio) await saveUrl(res.dashAudio, `${name}-sound-only.m4a`);
+      return tr('dl.dashBoth');
+    }
+    throw new Error(tr('dl.noFile'));
+  }
+
+  async function startDownload(target, near) {
+    if (!downloadsOn() || dlBusy) return;
+    dlBusy = true;
+    if (dl) dl.btn.setAttribute('aria-busy', 'true');
+    showToast(tr(target.kind === 'image' ? 'dl.savingPhoto' : 'dl.finding'), false, near);
+    try {
+      const done = target.kind === 'image' ? await downloadImage(target) : await downloadVideo(target);
+      showToast('✓ ' + done, false, near);
+    } catch (e) {
+      showToast(String((e && e.message) || e), true, near);
+    } finally {
+      dlBusy = false;
+      if (dl) dl.btn.removeAttribute('aria-busy');
+    }
+  }
+
+  /** The right-click menu item ("Download this photo or video"). */
+  function onContextDownload(msg) {
+    if (!downloadsOn()) return;
+    const near = lastContext && Date.now() - lastContext.t < 120000 ? lastContext : null;
+    const linkId = videoIdFromHref(msg.linkUrl);
+    let target = near ? mediaAt(near.x, near.y) : null;
+    if (target === 'overlay') target = dlTarget;
+    if (target && linkId && target.kind === 'image') target = { el: target.el, kind: 'video', id: linkId, thumb: true };
+    if (!target && linkId) target = { el: null, kind: 'video', id: linkId, thumb: /\/reels?\//.test(msg.linkUrl || '') };
+    if (!target && /^https:\/\//i.test(msg.srcUrl || '') && msg.mediaType === 'image') {
+      saveUrl(msg.srcUrl, `${siteWord()}-photo-${stamp()}.${extOf(msg.srcUrl, 'jpg')}`).then(
+        () => showToast('✓ ' + tr('dl.photoSaved'), false, near),
+        (e) => showToast(String((e && e.message) || e), true, near)
+      );
+      return;
+    }
+    if (!target) {
+      showToast(tr('dl.nothingHere'), true, near);
+      return;
+    }
+    startDownload(target, near);
+  }
+
+  const onRuntimeMessage = (msg, sender, sendResponse) => {
+    if (!msg || msg.type !== 'download-context') return false;
+    try {
+      onContextDownload(msg);
+    } catch (e) {
+      /* ignore */
+    }
+    sendResponse({ ok: true });
+    return false;
+  };
+  chrome.runtime.onMessage.addListener(onRuntimeMessage);
+  cleanups.push(() => {
+    try {
+      chrome.runtime.onMessage.removeListener(onRuntimeMessage);
+    } catch (e) {
+      /* context gone */
+    }
+  });
+})();

@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Facebook (test double)</title>
+    <style>
+      body { font: 14px system-ui, sans-serif; margin: 0; background: #fff; }
+      .popup { position: fixed; right: 20px; bottom: 0; width: 330px; height: 520px; border: 1px solid #ccc; display: flex; flex-direction: column; }
+      .popup-head { padding: 8px; border-bottom: 1px solid #ddd; }
+      [role="log"] { flex: 1; overflow: auto; padding: 8px; }
+      .row-out { display: flex; justify-content: flex-end; }
+      .row-in { display: flex; justify-content: flex-start; }
+      .bubble { max-width: 70%; padding: 6px 10px; border-radius: 16px; background: #eee; }
+      .row-out .bubble { background: #0866ff; color: #fff; }
+      main.page { margin-right: 380px; }
+    </style>
+  </head>
+  <body>
+    <!--
+      Test double of Messenger's 2026 page structure (role="log", data-scope="messages_table",
+      aria-roledescription="message", data-message-id, aria-label "At <time>, <Sender>: <text>").
+      Written for these tests; it contains no Facebook code.
+    -->
+    <main class="page" id="page-main"></main>
+
+    <!-- like the live pop-up: the chat title is in the header, the heading inside the
+         message area is a generic "Messages" -->
+    <div class="popup" id="popup">
+      <div class="popup-head">
+        <div role="button"><a href="/100012345678901/" role="link"><h2 dir="auto"><span>Alex Example</span></h2></a></div>
+        <span>Active 1h ago</span>
+      </div>
+      <div data-mw-file-dropzone="1" style="display: flex; flex-direction: column; flex: 1; min-height: 0">
+        <h2 dir="auto">Messages</h2>
+        <div role="status"></div>
+        <div role="log" id="log" aria-label="Messages in conversation with Alex Example"></div>
+      </div>
+      <div role="textbox" contenteditable="true" aria-label="Message">Aa</div>
+    </div>
+
+    <script>
+      (function () {
+        'use strict';
+        const mainLog = document.getElementById('log');
+        let log = mainLog;
+        const state = { ws: null, received: [], streamId: 1 };
+
+        function rowHtml(m) {
+          const lead = m.labelPrefix || 'At'; // other UI languages translate "At"
+          // the screen-reader button is translated too (Vietnamese form seen live: "Nhập, Tin nhắn do X gửi lúc 00:42: …")
+          const a11y = (m.labelPrefix
+            ? `Nhập, Tin nhắn do ${m.sender} gửi lúc ${m.time}`
+            : `Enter, Message sent ${m.time} by ${m.sender}`) + (m.text && !m.placeholder ? ': ' + m.text : '');
+          const label = m.placeholder
+            ? `${lead} ${m.time}, ${m.sender}`
+            : m.like
+            ? `${lead} ${m.time}, ${m.sender}: 👍`
+            : m.text
+            ? `${lead} ${m.time}, ${m.sender}: ${m.text}`
+            : `${lead} ${m.time}, ${m.sender}`;
+          const avatar = m.mine || m.noAvatar
+            ? ''
+            : `<div role="presentation"><div aria-hidden="true"><span><div aria-expanded="false" aria-haspopup="dialog" role="button" tabindex="-1"><img alt="${m.sender}" src="https://scontent.xx.fbcdn.net/v/t1.6435-1/avatar.jpg?stp=dst-jpg_s100x100_tt6" width="28" height="28"></div></span></div></div>`;
+          const htag = m.headingTag || 'h3';
+          const heading = m.heading ? `<div role="presentation"><div><div><span aria-hidden="true"><${htag} dir="auto">${m.heading}</${htag}></span></div></div></div>` : '';
+          const textPart = m.placeholder
+            ? `<span dir="auto"><div dir="auto">${m.placeholder}</div></span>`
+            : m.text
+            ? `<span dir="auto"><div dir="auto">${m.text}</div></span>`
+            : '';
+          const photo = m.photo ? `<div role="presentation"><div role="button" tabindex="-1"><img alt="Open photo" width="480" height="360" src="${m.photo}"></div></div>` : '';
+          const quote = m.quotePhoto ? `<div role="presentation"><div aria-label="Go to replied message" role="button" tabindex="-1"><div tabindex="-1">Original message:</div><img alt="Original image" width="720" height="469" src="${m.quotePhoto}"></div></div>` : '';
+          const like = m.like ? `<div role="presentation"><div aria-label="Like, thumbs up" role="img"><div><svg width="40" height="40"></svg></div></div></div>` : '';
+          const sticker = m.sticker ? `<div role="presentation"><div role="img" tabindex="-1" aria-label="Heart sticker" style="background-image: url(&quot;${m.sticker}&quot;); width: 96px; height: 96px"></div></div>` : '';
+          const edited = m.edited ? (m.editedButton ? '' : `<div role="presentation"><span>Edited</span></div>`) : '';
+          const editedHeading = m.edited && m.editedButton ? `<div role="presentation"><h4 dir="auto"><span>${m.sender}</span><div role="button" aria-label="Edited" tabindex="0"></div></h4></div>` : '';
+          return `<div data-virtualized="false"><div><div role="none"><div role="article"><div>
+              <div aria-label="${label.replace(/"/g, '&quot;')}" aria-roledescription="message" data-message-id="${m.domId}" data-scope="messages_table" tabindex="-1" class="${m.mine ? 'row-out' : 'row-in'}">
+                ${heading}${editedHeading}
+                ${avatar}
+                <div role="presentation" class="bubble">${quote}<div><span><div role="none"><div><div role="presentation">${textPart}</div></div></div></span></div>${photo}${sticker}${like}${edited}</div>
+                <div role="presentation"><div aria-hidden="true" aria-label="Message actions" role="toolbar"></div></div>
+              </div>
+            </div></div>
+            <div role="none"><div aria-label="${a11y}" role="button" tabindex="-1"><span dir="auto">${a11y}</span></div></div>
+          </div></div></div>`;
+        }
+
+        function dateBreak(text) {
+          return `<div data-virtualized="false"><div role="none"><div data-scope="messages_table"><div role="presentation"><div aria-hidden="true" data-scope="date_break"><span dir="auto"><span>${text}</span></span></div></div></div></div></div>`;
+        }
+
+        const rows = new Map();
+
+        function withLog(logId, fn) {
+          const prev = log;
+          log = logId ? document.getElementById(logId) : mainLog;
+          try {
+            return fn();
+          } finally {
+            log = prev;
+          }
+        }
+
+        window.fb = {
+          // another chat pop-up; `label` is the list's aria-label (other UI languages translate it)
+          openPopup({ logId, title, profileId, label, generic = 'Messages' }) {
+            const div = document.createElement('div');
+            div.className = 'popup';
+            div.style.right = 380 + document.querySelectorAll('.popup').length * 10 + 'px';
+            div.innerHTML = `<div class="popup-head"><div role="button">${profileId ? `<a href="/${profileId}/" role="link">` : ''}<h2 dir="auto"><span>${title}</span></h2>${profileId ? '</a>' : ''}</div></div>
+              <div data-mw-file-dropzone="1" style="display:flex;flex-direction:column;flex:1;min-height:0"><h2 dir="auto">${generic}</h2><div role="status"></div><div role="log" id="${logId}" aria-label="${label}"></div></div>`;
+            document.body.appendChild(div);
+          },
+          inLog(logId, fn) {
+            return withLog(logId, () => fn(window.fb));
+          },
+          dateBreak(text) {
+            log.insertAdjacentHTML('beforeend', dateBreak(text));
+          },
+          addMessage(m) {
+            const wrap = document.createElement('div');
+            wrap.innerHTML = rowHtml(m);
+            const node = wrap.firstElementChild;
+            rows.set(m.domId, { node, m });
+            log.appendChild(node);
+          },
+          // Messenger keeps the row (same data-message-id) and swaps its content
+          unsend(domId, placeholder) {
+            const r = rows.get(domId);
+            const m = { ...r.m, placeholder, text: '', photo: '' };
+            const wrap = document.createElement('div');
+            wrap.innerHTML = rowHtml(m);
+            const node = wrap.firstElementChild;
+            r.node.replaceWith(node);
+            rows.set(domId, { node, m });
+          },
+          // what end-to-end encrypted chats do: same row element, NEW data-message-id, label loses its text
+          unsendInPlace(domId, newDomId, placeholder) {
+            const r = rows.get(domId);
+            const msg = r.node.querySelector('[data-scope="messages_table"]');
+            msg.setAttribute('data-message-id', newDomId);
+            msg.setAttribute('aria-label', `${r.m.labelPrefix || 'At'} ${r.m.time}, ${r.m.sender}`);
+            const bubble = msg.querySelector('.bubble');
+            bubble.innerHTML = `<div><span><div role="none"><div><div role="presentation"><span dir="auto"><div dir="auto">${placeholder}</div></span></div></div></div></span></div>`;
+            rows.set(newDomId, { node: r.node, m: { ...r.m, domId: newDomId, placeholder, text: '' } });
+          },
+          blobPng(b64) {
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            return URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
+          },
+          edit(domId, text, editedButton) {
+            const r = rows.get(domId);
+            const m = { ...r.m, text, edited: true, editedButton: !!editedButton };
+            const wrap = document.createElement('div');
+            wrap.innerHTML = rowHtml(m);
+            const node = wrap.firstElementChild;
+            r.node.replaceWith(node);
+            rows.set(domId, { node, m });
+          },
+          clear() {
+            log.textContent = '';
+            rows.clear();
+          },
+          connect(url) {
+            return new Promise((resolve, reject) => {
+              const ws = new WebSocket(url || 'wss://gateway.facebook.com/ws/lightspeed?x-dgw-appid=2220391788200892&x-dgw-appversion=0&x-dgw-authtype=1%3A0&x-dgw-version=5');
+              ws.binaryType = 'arraybuffer';
+              ws.onopen = () => resolve(true);
+              ws.onerror = () => reject(new Error('ws error'));
+              ws.onmessage = (ev) => state.received.push(ev.data.byteLength || 0);
+              state.ws = ws;
+            });
+          },
+          // client -> server: EstablishStream + Data(JSON) in one WebSocket message, like Messenger
+          sendJson(json, requiresAck = true) {
+            const enc = new TextEncoder();
+            const id = ++state.streamId;
+            const params = enc.encode('{}');
+            const payload = enc.encode(json);
+            const est = new Uint8Array(6 + params.length);
+            est.set([15, id & 255, id >> 8, params.length & 255, (params.length >> 8) & 255, params.length >> 16]);
+            est.set(params, 6);
+            const len = 2 + payload.length;
+            const data = new Uint8Array(6 + len);
+            data.set([13, id & 255, id >> 8, len & 255, (len >> 8) & 255, len >> 16, 1, requiresAck ? 0x80 : 0]);
+            data.set(payload, 8);
+            const all = new Uint8Array(est.length + data.length);
+            all.set(est, 0);
+            all.set(data, est.length);
+            state.ws.send(all.buffer);
+            return id;
+          },
+          focusInfo() {
+            return { hasFocus: document.hasFocus(), visibilityState: document.visibilityState, hidden: document.hidden };
+          },
+          // A feed post with a video played through MediaSource (a blob: address that cannot be
+          // saved), as Facebook does. React's data on it is imitated with a __reactFiber$ property;
+          // `shape` picks which of Facebook's data layouts carries the files.
+          addFeedVideo({ id, hd, sd, dash, shape = 'player', link }) {
+            const art = document.createElement('div');
+            art.setAttribute('role', 'article');
+            art.innerHTML =
+              '<div style="position:relative;width:480px;height:270px;background:#000;margin:10px 0">' +
+              '<video muted playsinline style="width:480px;height:270px;display:block"></video>' +
+              '<div class="player-overlay" style="position:absolute;inset:0"></div></div>' +
+              (link ? `<a href="${link}">2 h</a>` : '');
+            document.getElementById('page-main').appendChild(art);
+            const video = art.querySelector('video');
+            video.src = URL.createObjectURL(new MediaSource());
+            let props;
+            if (shape === 'legacy') props = { video: { __typename: 'Video', id, videoDeliveryLegacyFields: { browser_native_hd_url: hd, browser_native_sd_url: sd } } };
+            else if (shape === 'progressive')
+              props = { video: { __typename: 'Video', id, videoDeliveryResponseFragment: { videoDeliveryResponseResult: { progressive_urls: [{ progressive_url: sd, metadata: { quality: 'SD' } }, { progressive_url: hd, metadata: { quality: 'HD' } }] } } } };
+            else if (shape === 'dash') props = { video: { __typename: 'Video', id, videoDeliveryResponseFragment: { videoDeliveryResponseResult: { dash_manifests: [{ manifest_xml: dash }] } } } };
+            else if (shape === 'none') props = { videoID: id };
+            else props = { videoID: id, implementations: [{ typename: 'VideoPlayerShakaImplementationData', data: {} }, { typename: 'VideoPlayerProgressiveImplementationData', data: { hdSrc: hd, sdSrc: sd } }] };
+            const root = { tag: 3, memoizedProps: null, memoizedState: null, return: null };
+            const player = { tag: 0, memoizedProps: props, memoizedState: null, return: root };
+            video['__reactFiber$mmstest'] = { tag: 5, memoizedProps: { src: video.src }, memoizedState: null, return: player };
+            return true;
+          },
+          // A feed photo: the page shows a smaller copy; React's data also lists a larger one
+          addPhoto({ src, big, link = '/photo/?fbid=1001', bigWidth = 2048, bigHeight = 1365 }) {
+            const art = document.createElement('div');
+            art.setAttribute('role', 'article');
+            art.innerHTML = `<a href="${link}"><img alt="" style="width:300px;height:200px;display:block;margin:10px 0" /></a>`;
+            document.getElementById('page-main').appendChild(art);
+            const img = art.querySelector('img');
+            img.src = src;
+            const post = { tag: 0, memoizedProps: { photo: { image: { uri: src, width: 300, height: 200 }, viewer_image: big ? { uri: big, width: bigWidth, height: bigHeight } : null } }, memoizedState: null, return: null };
+            img['__reactFiber$mmstest'] = { tag: 5, memoizedProps: { src }, memoizedState: null, return: post };
+            return true;
+          },
+          // A photo from an encrypted chat: only a blob: copy exists in the tab
+          addBlobPhoto(b64) {
+            const art = document.createElement('div');
+            art.innerHTML = '<img alt="" style="width:200px;height:150px;display:block;margin:10px 0" />';
+            document.getElementById('page-main').appendChild(art);
+            art.querySelector('img').src = window.fb.blobPng(b64);
+            return true;
+          },
+          clearMain() {
+            document.getElementById('page-main').textContent = '';
+          },
+          receivedCount() {
+            return state.received.length;
+          },
+        };
+      })();
+    </script>
+  </body>
+</html>

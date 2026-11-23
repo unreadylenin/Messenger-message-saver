@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Messenger Message Saver</title>
+    <link rel="stylesheet" href="../lib/ui.css" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="top">
+      <img src="../icons/icon48.png" alt="" width="28" height="28" />
+      <div class="title">
+        <strong>Messenger Message Saver</strong>
+        <span id="state-line" class="muted" data-i18n="popup.loading">Loading…</span>
+      </div>
+      <div class="lang-switch" role="group" aria-label="Language" data-i18n-aria-label="lang.switchTitle">
+        <button type="button" data-lang="en" title="English">EN</button>
+        <button type="button" data-lang="bn" title="বাংলা">বাং</button>
+      </div>
+      <label class="switch" title="Turn everything on or off" data-i18n-title="popup.masterTitle">
+        <input type="checkbox" data-setting="enabled" />
+        <span></span>
+      </label>
+    </header>
+
+    <div id="reload-hint" class="hint" hidden>
+      <span id="reload-text" data-i18n="hint.reload">Reload this Facebook tab once so the extension can start working here.</span>
+      <button id="reload-tab" class="btn small" data-i18n="popup.reloadTab">Reload tab</button>
+    </div>
+
+    <div id="paused-note" class="paused-note" hidden data-i18n="popup.paused">⏸️ Paused: nothing is saved, and others can see “Seen” and “typing…”.</div>
+
+    <section class="stats">
+      <div><b id="s-messages">0</b><span data-i18n="stats.saved">saved</span></div>
+      <div class="accent"><b id="s-unsent">0</b><span data-i18n="stats.unsent">unsent kept</span></div>
+      <div><b id="s-edited">0</b><span data-i18n="stats.edited">edited</span></div>
+      <div title="Counts normal chats only. In encrypted chats Strong mode stops “Seen” without counting it." data-i18n-title="stats.seenTitle"><b id="s-seen">0</b><span data-i18n="stats.seen">Seen held back*</span></div>
+    </section>
+
+    <section class="toggles needs-on">
+      <label class="row">
+        <span class="label"><span class="ico">💾</span><span data-i18n="pop.saveMessages">Save messages</span><small data-i18n="pop.saveMessages.hint">Private copy on this computer</small></span>
+        <span class="switch"><input type="checkbox" data-setting="saveMessages" /><span></span></span>
+      </label>
+      <label class="row">
+        <span class="label"><span class="ico">🗨️</span><span data-i18n="pop.showRecovered">Show unsent messages in chat</span><small data-i18n="pop.showRecovered.hint">Under “unsent a message”</small></span>
+        <span class="switch"><input type="checkbox" data-setting="showRecoveredInline" /><span></span></span>
+      </label>
+      <label class="row">
+        <span class="label"><span class="ico">👁️</span><span data-i18n="pop.unseen">Unseen mode</span><small data-i18n="pop.unseen.hint">Others don’t see “Seen” when you read · Alt+Shift+U</small></span>
+        <span class="switch"><input type="checkbox" data-setting="blockSeen" /><span></span></span>
+      </label>
+      <label class="row sub" id="row-stealth">
+        <span class="label"><span data-i18n="pop.strong">Strong mode (encrypted chats)</span><small data-i18n="pop.strong.hint">On facebook.com/messages and messenger.com</small></span>
+        <span class="switch"><input type="checkbox" data-setting="stealthFocus" /><span></span></span>
+      </label>
+      <label class="row">
+        <span class="label"><span class="ico">⌨️</span><span data-i18n="pop.typing">Hide “typing…”</span><small data-i18n="pop.typing.hint">Others don’t see you typing (normal chats)</small></span>
+        <span class="switch"><input type="checkbox" data-setting="blockTyping" /><span></span></span>
+      </label>
+      <label class="row">
+        <span class="label"><span class="ico">🔔</span><span data-i18n="pop.alert">Alert when someone unsends</span><small data-i18n="pop.alert.hint">Desktop notification</small></span>
+        <span class="switch"><input type="checkbox" data-setting="notifyOnUnsend" /><span></span></span>
+      </label>
+      <label class="row">
+        <span class="label"><span class="ico">🖼️</span><span data-i18n="pop.photos">Save photos too</span><small data-i18n="pop.photos.hint">Unsent photos stay visible</small></span>
+        <span class="switch"><input type="checkbox" data-setting="saveMedia" /><span></span></span>
+      </label>
+      <label class="row">
+        <span class="label"><span class="ico">⬇️</span><span data-i18n="pop.downloads">Download buttons</span><small data-i18n="pop.downloads.hint">On photos, videos and reels</small></span>
+        <span class="switch"><input type="checkbox" data-setting="downloadButtons" /><span></span></span>
+      </label>
+    </section>
+
+    <section class="recent">
+      <h2 data-i18n="popup.recent">Recently unsent</h2>
+      <ul id="recent-list" class="recent-list"></ul>
+      <p id="recent-empty" class="muted small" data-i18n="popup.recentEmpty">Nothing unsent yet. Keep Messenger open in a tab and messages will be saved as they arrive.</p>
+      <p id="recent-locked" class="muted small" hidden data-i18n="popup.locked">🔒 Saved messages are locked. Open them and enter your PIN.</p>
+    </section>
+
+    <footer class="bottom">
+      <button id="open-dashboard" class="btn primary" data-i18n="popup.open">Open saved messages</button>
+      <button id="open-settings" class="btn" data-i18n="popup.settings">Settings</button>
+    </footer>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

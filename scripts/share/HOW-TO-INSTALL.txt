@@ -1,0 +1,143 @@
+MESSENGER MESSAGE SAVER {{VERSION}} - HOW TO INSTALL
+(বাংলা নির্দেশনা নিচে আছে)
+
+What it is: a browser extension that keeps a private copy of your Messenger chats on THIS
+computer (so messages stay readable after the sender unsends them), can hide "Seen" and
+"typing...", downloads Facebook photos, videos and reels, and works in English or Bangla.
+Nothing is sent anywhere.
+
+Works in: Google Chrome, Microsoft Edge, Brave, Opera, Vivaldi (on a computer).
+Does not work in: Firefox, phones, tablets.
+
+============================================================
+STEP 1 - Put the folder in its permanent place
+============================================================
+1. Right-click the ZIP file -> "Extract All..." -> "Extract".
+2. Inside you will see a folder called  MessengerMessageSaver  and this file.
+3. Press the Windows key + R, type  %USERPROFILE%  and press Enter.
+   Your own user folder opens (for example C:\Users\YourName).
+4. Drag the  MessengerMessageSaver  folder into that window.
+   It is now at  C:\Users\YourName\MessengerMessageSaver
+   - Do not use Desktop, Documents or Downloads: OneDrive or a clean-up can move or delete it.
+   - Never move or rename this folder later. Chrome would treat it as a new extension and
+     your saved messages would seem to be gone.
+
+============================================================
+STEP 2 - Add it to the browser
+============================================================
+1. Open Chrome, type  chrome://extensions  in the address bar and press Enter.
+   (Edge: edge://extensions   Brave: brave://extensions   Opera: opera://extensions)
+2. Turn on "Developer mode" (top right in Chrome; in the left panel in Edge).
+3. Click "Load unpacked".
+4. Choose the  MessengerMessageSaver  folder from step 1 (the one that contains the file
+   manifest.json) and click "Select Folder".
+   If you see "Manifest file is missing", you chose the folder around it: go one folder deeper.
+5. Click the puzzle icon in the toolbar and pin "Messenger Message Saver".
+6. Reload (F5) any Facebook tab that was already open.
+
+If the browser warns about "developer mode extensions", choose to keep the extension.
+Work or school computers may block Developer mode.
+
+============================================================
+STEP 3 - First use
+============================================================
+- Language: the toolbar button's window has EN | বাং buttons (also Settings -> Language).
+- Unseen is on: test it once with a friend (they message you, you read it, ask if they see "Seen").
+- Encrypted chats: to stay unseen, read them at facebook.com/messages or messenger.com,
+  not in the small chat pop-ups on the news feed.
+- Downloads: point at a photo, video or reel and press the "⬇" button on it.
+- Optional PIN lock for the saved messages: Settings -> Privacy.
+
+============================================================
+UPDATING to a newer version
+============================================================
+1. Extract the new ZIP.
+2. Open its MessengerMessageSaver folder, select everything inside (Ctrl+A), copy (Ctrl+C),
+   open your existing C:\Users\YourName\MessengerMessageSaver folder, paste (Ctrl+V) and
+   choose "Replace the files in the destination".
+3. chrome://extensions -> press the round arrow on Messenger Message Saver. Saved messages stay.
+Never click "Remove": it deletes everything the extension saved (make a backup first:
+Settings -> Download backup).
+
+============================================================
+PRIVACY AND SAFETY
+============================================================
+- Messages are stored only on this computer, inside this browser. They are NOT encrypted:
+  anyone who can use this Windows account can read them. Keep the PC locked, and use the
+  PIN lock if other people use this computer.
+- The extension has no server, no ads and no tracking. It sends nothing anywhere.
+- Only install this ZIP from someone you trust, and do not change its files. An edited copy
+  could steal a Facebook login, because extensions like this run inside facebook.com.
+- Other people's unsent messages are their private messages. Keep them to yourself.
+- Download only photos and videos you have the right to keep.
+
+CHECK THE FINGERPRINT (optional): open PowerShell and type, with the real file location:
+   Get-FileHash "$env:USERPROFILE\Downloads\MessengerMessageSaver-v{{VERSION}}-share.zip"
+The long "Hash" code must be exactly the one the sender gave you.
+
+
+============================================================
+বাংলা: কীভাবে ইনস্টল করবেন
+============================================================
+এটা কী: একটি ব্রাউজার এক্সটেনশন, যা আপনার Messenger চ্যাটের একটি ব্যক্তিগত কপি শুধু এই
+কম্পিউটারে রাখে (তাই কেউ মেসেজ আনসেন্ড করলেও পড়া যায়), "Seen" আর "typing..." লুকাতে পারে,
+Facebook-এর ছবি, ভিডিও আর রিল ডাউনলোড করে, আর ইংরেজি বা বাংলায় চলে। কোথাও কিছু পাঠায় না।
+
+চলে: Google Chrome, Microsoft Edge, Brave, Opera, Vivaldi (কম্পিউটারে)।
+চলে না: Firefox, মোবাইল ফোন, ট্যাবলেট।
+
+ধাপ ১ - ফোল্ডারটি স্থায়ী জায়গায় রাখুন
+1. ZIP ফাইলে রাইট-ক্লিক করুন -> "Extract All..." -> "Extract"।
+2. ভেতরে  MessengerMessageSaver  নামের একটি ফোল্ডার আর এই ফাইলটি পাবেন।
+3. কিবোর্ডে Windows + R চাপুন,  %USERPROFILE%  লিখে Enter চাপুন।
+   আপনার নিজের ইউজার ফোল্ডার খুলবে (যেমন C:\Users\YourName)।
+4. MessengerMessageSaver ফোল্ডারটি টেনে ওই উইন্ডোতে রাখুন।
+   এখন এটি আছে  C:\Users\YourName\MessengerMessageSaver  -এ।
+   - Desktop, Documents বা Downloads-এ রাখবেন না: OneDrive বা ক্লিন-আপ সরিয়ে বা মুছে ফেলতে পারে।
+   - পরে কখনো এই ফোল্ডার সরাবেন না বা নাম বদলাবেন না। তাহলে Chrome এটাকে নতুন এক্সটেনশন
+     ভাববে, আর মনে হবে সেভ করা মেসেজ সব হারিয়ে গেছে।
+
+ধাপ ২ - ব্রাউজারে যোগ করুন
+1. Chrome খুলে অ্যাড্রেস বারে  chrome://extensions  লিখে Enter চাপুন।
+   (Edge: edge://extensions   Brave: brave://extensions   Opera: opera://extensions)
+2. "Developer mode" চালু করুন (Chrome-এ উপরে ডানে; Edge-এ বাঁ পাশের প্যানেলে)।
+3. "Load unpacked" চাপুন।
+4. ধাপ ১-এর  MessengerMessageSaver  ফোল্ডারটি বেছে নিন (যার ভেতরে manifest.json ফাইল আছে),
+   তারপর "Select Folder" চাপুন।
+   "Manifest file is missing" দেখালে বাইরের ফোল্ডার বেছেছেন: এক ধাপ ভেতরের ফোল্ডারে যান।
+5. টুলবারের পাজল আইকনে ক্লিক করে "Messenger Message Saver" পিন করুন।
+6. আগে থেকে খোলা Facebook ট্যাবগুলো রিলোড (F5) করুন।
+
+ব্রাউজার "developer mode extensions" নিয়ে সতর্ক করলে এক্সটেনশনটি রেখে দেওয়ার অপশন বেছে নিন।
+অফিস বা স্কুলের কম্পিউটারে Developer mode বন্ধ করা থাকতে পারে।
+
+ধাপ ৩ - প্রথমবার ব্যবহার
+- ভাষা: টুলবারের বাটনে ক্লিক করলে যে উইন্ডো খোলে সেখানে EN | বাং বাটন আছে (সেটিংস -> ভাষা থেকেও হয়)।
+- Unseen চালু আছে: একবার কোনো বন্ধুর সাথে পরীক্ষা করুন (সে মেসেজ দেবে, আপনি পড়বেন, জিজ্ঞেস করবেন "Seen" দেখছে কি না)।
+- এনক্রিপ্টেড চ্যাট: Unseen থাকতে facebook.com/messages বা messenger.com-এ পড়ুন,
+  নিউজ ফিডের ছোট চ্যাট পপ-আপে নয়।
+- ডাউনলোড: ছবি, ভিডিও বা রিলের ওপর মাউস রাখুন, তারপর "⬇" বাটন চাপুন।
+- সেভ করা মেসেজের জন্য পিন লক (ইচ্ছা হলে): সেটিংস -> প্রাইভেসি।
+
+নতুন সংস্করণে আপডেট
+1. নতুন ZIP এক্সট্র্যাক্ট করুন।
+2. তার MessengerMessageSaver ফোল্ডার খুলে ভেতরের সব সিলেক্ট (Ctrl+A) করে কপি (Ctrl+C) করুন,
+   আপনার পুরোনো C:\Users\YourName\MessengerMessageSaver ফোল্ডার খুলে পেস্ট (Ctrl+V) করুন,
+   আর "Replace the files in the destination" বেছে নিন।
+3. chrome://extensions -> Messenger Message Saver-এর গোল তীর চিহ্নে চাপুন। সেভ করা মেসেজ থেকে যাবে।
+কখনো "Remove" চাপবেন না: এতে এক্সটেনশনের সেভ করা সব মুছে যায় (আগে ব্যাকআপ নিন:
+সেটিংস -> ব্যাকআপ ডাউনলোড)।
+
+প্রাইভেসি ও নিরাপত্তা
+- মেসেজ শুধু এই কম্পিউটারে, এই ব্রাউজারের ভেতরে থাকে। এগুলো এনক্রিপ্ট করা নয়: এই Windows
+  অ্যাকাউন্ট যে ব্যবহার করতে পারে সে-ই পড়তে পারবে। পিসি লক রাখুন, আর অন্য কেউ এই কম্পিউটার
+  ব্যবহার করলে পিন লক চালু করুন।
+- এক্সটেনশনের কোনো সার্ভার, বিজ্ঞাপন বা ট্র্যাকিং নেই। কোথাও কিছু পাঠায় না।
+- শুধু বিশ্বাসযোগ্য মানুষের কাছ থেকে এই ZIP নিন, আর এর ফাইল বদলাবেন না। বদলানো কপি Facebook-এর
+  লগইন চুরি করতে পারে, কারণ এ ধরনের এক্সটেনশন facebook.com-এর ভেতরে চলে।
+- অন্যদের আনসেন্ড করা মেসেজ তাদের ব্যক্তিগত মেসেজ। নিজের কাছেই রাখুন।
+- শুধু সেই ছবি আর ভিডিও ডাউনলোড করুন যেগুলো রাখার অধিকার আপনার আছে।
+
+ফিঙ্গারপ্রিন্ট মিলিয়ে দেখুন (ইচ্ছা হলে): PowerShell খুলে আসল ফাইলের জায়গা দিয়ে লিখুন:
+   Get-FileHash "$env:USERPROFILE\Downloads\MessengerMessageSaver-v{{VERSION}}-share.zip"
+"Hash"-এর লম্বা কোডটি পাঠানো ব্যক্তির দেওয়া কোডের সাথে হুবহু মিলতে হবে।
